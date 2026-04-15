@@ -1,0 +1,36 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+.env
+.venv
+env/
+venv/
+
+.pytest_cache/
+.ruff_cache/
+
+# Generated proto stubs
+proto/*_pb2.py
+proto/*_pb2_grpc.py
+proto/*_pb2.pyi
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Model caches
+*.bin
+*.safetensors
+*.ckpt
