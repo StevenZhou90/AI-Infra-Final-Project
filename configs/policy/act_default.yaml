@@ -1,0 +1,4 @@
+policy:
+  pretrained_path: lerobot/act_aloha_sim_transfer_cube_human
+  device: cuda
+  use_amp: false

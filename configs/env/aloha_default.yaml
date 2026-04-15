@@ -1,0 +1,6 @@
+env:
+  task: AlohaTransferCube-v0
+  obs_type: pixels_agent_pos
+  max_episode_steps: 400
+  render_width: 640
+  render_height: 480

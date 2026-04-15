@@ -3,45 +3,35 @@ requires = ["setuptools>=69.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "vla-serving"
+name = "aloha-act-sim"
 version = "0.1.0"
-description = "GPU-agnostic multi-model serving platform for 7B VLA models with ACT-style action chunking"
+description = "ALOHA ACT policy evaluation in simulation — MVP for multi-model VLA serving platform"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10,<3.11"
 license = {text = "MIT"}
 
 dependencies = [
+    "lerobot>=0.4.0,<0.5.0",
+    "gym-aloha>=0.1.0",
     "torch>=2.2.0",
+    "imageio[ffmpeg]>=2.34.0",
+    "opencv-python-headless>=4.9.0",
+    "pyyaml>=6.0",
     "numpy>=1.26.0",
-    "pydantic>=2.5.0",
-    "grpcio>=1.60.0",
-    "grpcio-tools>=1.60.0",
-    "protobuf>=4.25.0",
-    "transformers>=4.38.0",
-    "accelerate>=0.27.0",
-    "Pillow>=10.2.0",
-    "av>=12.0.0",
-    "pynvml>=11.5.0",
-    "pyyaml>=6.0.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",
-    "pytest-asyncio>=0.23.0",
     "ruff>=0.2.0",
 ]
 
-[project.scripts]
-vla-serve = "server.main:main"
-
 [tool.setuptools.packages.find]
-include = ["server*", "client*", "common*", "proto*"]
+include = ["envs*", "policies*", "eval*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-asyncio_mode = "auto"
 
 [tool.ruff]
-target-version = "py311"
+target-version = "py310"
 line-length = 120
