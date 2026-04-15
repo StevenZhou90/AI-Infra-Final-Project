@@ -1,48 +1,44 @@
 # ALOHA ACT Sim MVP
 
-Run a pre-trained [ACT](https://tonyzhaozh.github.io/aloha/) policy in the ALOHA bimanual manipulation sim and watch rollout videos.
+Pre-trained [ACT](https://tonyzhaozh.github.io/aloha/) policy running in the ALOHA bimanual manipulation sim. Foundation for a multi-model VLA serving platform.
 
-This is the foundation for a multi-model VLA serving platform with priority queuing, speculative decoding, and KV cache management — that comes next once this pipeline works end-to-end.
+## Setup (fresh machine)
 
-## Quick Start
+Requires: Ubuntu with an NVIDIA GPU, and [uv](https://docs.astral.sh/uv/) installed.
 
 ```bash
-# One-time setup
-bash scripts/setup.sh
+# 1. Clone the repo
+git clone https://github.com/StevenZhou90/AI-Infra-Final-Project.git
+cd AI-Infra-Final-Project
 
-# Run 5 episodes with video recording
+# 2. Install system libs for headless rendering
+sudo apt-get update && sudo apt-get install -y libegl1 libopengl0 libgl1-mesa-glx
+
+# 3. Install Python 3.10 + all dependencies
+uv python install 3.10
+uv sync --python 3.10
+
+# 4. Run it (first run downloads the model from HuggingFace, ~200MB)
 uv run python -m eval.run_rollout
+```
 
-# Run more episodes, custom model, no video
-uv run python -m eval.run_rollout --episodes 50 --no-video --device cuda
+Videos are saved to `outputs/eval/`.
+
+## Options
+
+```bash
+uv run python -m eval.run_rollout --episodes 50         # more episodes
+uv run python -m eval.run_rollout --episodes 50 --no-video  # skip video recording (faster)
+uv run python -m eval.run_rollout --task AlohaInsertion-v0   # harder task
+uv run python -m eval.run_rollout --model lerobot/act_aloha_sim_insertion_human  # different model
 ```
 
 ## Project Structure
 
 ```
-envs/           Environment wrappers (gym-aloha today, Isaac Lab later)
-policies/       Policy loading and inference (ACT via LeRobot)
-eval/           Evaluation scripts and rollout runner
-configs/        YAML configs for environments and policies
-scripts/        Setup and utility scripts
+envs/       — Sim environment wrapper (gym-aloha / MuJoCo ALOHA robot)
+policies/   — ACT policy loader with normalization handling
+eval/       — Rollout runner and video recording
+configs/    — YAML defaults for environment and policy settings
+scripts/    — Setup helpers
 ```
-
-## Configuration
-
-Override defaults via CLI flags or YAML config:
-
-```bash
-uv run python -m eval.run_rollout \
-    --config configs/env/aloha_default.yaml \
-    --model lerobot/act_aloha_sim_transfer_cube_human \
-    --task AlohaTransferCube-v0 \
-    --episodes 10 \
-    --device cuda \
-    --output-dir outputs/eval
-```
-
-## Requirements
-
-- Python 3.10+
-- NVIDIA GPU with CUDA support
-- ~4 GB disk for model weights + MuJoCo assets
