@@ -2,16 +2,21 @@
 
 Usage:
     uv run python -m eval.run_rollout
-    uv run python -m eval.run_rollout --config configs/env/aloha_default.yaml
-    uv run python -m eval.run_rollout --episodes 10 --device cuda
+    uv run python -m eval.run_rollout --episodes 10
+    uv run python -m eval.run_rollout --episodes 50 --no-video
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+import os
 import time
 from pathlib import Path
+
+# Auto-set headless rendering for MuJoCo on servers without a display
+if "MUJOCO_GL" not in os.environ and not os.environ.get("DISPLAY"):
+    os.environ["MUJOCO_GL"] = "egl"
 
 import imageio
 import numpy as np
@@ -91,7 +96,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run ACT policy rollouts in ALOHA sim")
     parser.add_argument("--config", type=str, default=None, help="Path to YAML config")
     parser.add_argument("--episodes", type=int, default=5, help="Number of episodes")
-    parser.add_argument("--device", type=str, default="cuda", help="Torch device")
+    parser.add_argument("--device", type=str, default=None, help="Torch device (auto-detects CUDA)")
     parser.add_argument("--model", type=str, default=None, help="HuggingFace model path")
     parser.add_argument("--task", type=str, default=None, help="Gym task name")
     parser.add_argument("--output-dir", type=str, default="outputs/eval", help="Video output dir")
@@ -100,6 +105,9 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+
+    if args.device is None:
+        args.device = "cuda" if torch.cuda.is_available() else "cpu"
 
     env_cfg = AlohaEnvConfig(
         task=args.task or cfg.get("env", {}).get("task", "AlohaTransferCube-v0"),
