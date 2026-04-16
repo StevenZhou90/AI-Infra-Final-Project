@@ -1,6 +1,6 @@
 # VLA Serving Platform
 
-Multi-model inference serving platform for Vision-Language-Action (VLA) models. Currently running [ACT](https://tonyzhaozh.github.io/aloha/) policies in ALOHA sim, designed to scale to 7B VLA models on multi-GPU setups.
+Multi-model inference serving platform for Vision-Language-Action (VLA) models. Supports [ACT](https://tonyzhaozh.github.io/aloha/) (single-pass) and [OpenVLA](https://openvla.github.io/) 7B (autoregressive) policies with KV cache management and self-speculative decoding. Targeting GH200 for unified CPU/GPU memory.
 
 ## Setup (fresh machine)
 
@@ -42,15 +42,31 @@ uv run python -m serving.grpc_client --episodes 5
 
 The client runs the sim, encodes camera frames as JPEG, sends them to the server over gRPC, and receives actions back. Works on `localhost` for dev, or across machines in production.
 
-### Multi-model
+### Loading OpenVLA 7B (with KV cache + speculative decoding)
 
 ```bash
-# Load multiple models on the server via the client
+uv run python -c "
+from serving.grpc_client import InferenceClient
+c = InferenceClient()
+c.load_model(
+    'openvla-7b', 'openvla/openvla-7b',
+    model_type='openvla',
+    use_kv_cache=True,
+    use_speculative_decoding=True,
+)
+print(c.list_models())
+"
+```
+
+### Multi-model (ACT + OpenVLA)
+
+```bash
 uv run python -c "
 from serving.grpc_client import InferenceClient
 c = InferenceClient()
 c.load_model('act-cube', 'lerobot/act_aloha_sim_transfer_cube_human')
-c.load_model('act-insert', 'lerobot/act_aloha_sim_insertion_human')
+c.load_model('openvla-7b', 'openvla/openvla-7b', model_type='openvla',
+             use_kv_cache=True, use_speculative_decoding=True)
 print(c.list_models())
 "
 ```
@@ -59,9 +75,9 @@ print(c.list_models())
 
 ```
 envs/       — Sim environment wrappers (gym-aloha / MuJoCo)
-policies/   — Policy loading + inference (ACT via LeRobot)
+policies/   — Policy wrappers (ACT single-pass, OpenVLA 7B autoregressive)
 eval/       — Direct rollout runner (no server needed)
-serving/    — gRPC server, client, model registry
+serving/    — gRPC server, client, model registry, KV cache, speculative decoder
 proto/      — Protobuf service definitions + generated stubs
 configs/    — YAML defaults
 scripts/    — Setup helpers
@@ -70,26 +86,36 @@ scripts/    — Setup helpers
 ## Architecture
 
 ```
-Client (sim machine)              Server (GPU machine)
-┌─────────────────┐              ┌──────────────────────┐
-│  Isaac Sim /     │   gRPC      │  Model Registry      │
-│  MuJoCo          │────────────▶│  ┌─ GPU 0: Model A   │
-│                  │  JPEG imgs  │  ├─ GPU 1: Model B   │
-│  Video Encoder   │  + state    │  └─ GPU N: Model C   │
-│  Action Buffer   │◀────────────│                      │
-│                  │   actions   │  Priority Scheduler   │
-└─────────────────┘              └──────────────────────┘
+Client (sim machine)              Server (GPU machine / GH200)
+┌─────────────────┐              ┌──────────────────────────────┐
+│  Isaac Sim /     │   gRPC      │  Model Registry              │
+│  MuJoCo          │────────────▶│  ┌─ ACT (single-pass)       │
+│                  │  JPEG imgs  │  └─ OpenVLA 7B (autoregress) │
+│  Video Encoder   │  + state    │                              │
+│  Action Buffer   │  + instruct │  ┌─ KV Cache Manager ───┐   │
+│                  │◀────────────│  │  prefix reuse         │   │
+│                  │   actions   │  │  90% mem budget        │   │
+└─────────────────┘              │  │  sliding window        │   │
+                                 │  └───────────────────────┘   │
+                                 │  ┌─ Speculative Decoder ─┐   │
+                                 │  │  self-spec (layer skip)│   │
+                                 │  │  draft → verify loop   │   │
+                                 │  │  greedy acceptance     │   │
+                                 │  └───────────────────────┘   │
+                                 │  Priority Scheduler          │
+                                 └──────────────────────────────┘
 ```
 
 ## What's built
 
 - [x] ACT policy inference with normalization handling
+- [x] OpenVLA 7B policy wrapper (autoregressive action token generation)
+- [x] KV cache manager (90% utilization target, prefix reuse, sliding window, LRU eviction)
+- [x] Self-speculative decoding (layer-skip draft, greedy verification)
 - [x] ALOHA sim environment (TransferCube, Insertion)
 - [x] Video recording (mp4)
 - [x] gRPC serving layer (Predict, LoadModel, UnloadModel, ListModels, GetStatus)
 - [x] JPEG video encoding over gRPC
 - [x] Model registry with multi-model + GPU memory tracking
-- [ ] Priority scheduler (not FIFO)
-- [ ] KV cache manager (90% utilization, sliding window)
-- [ ] Speculative decoding
-- [ ] Client-side action buffer
+- [x] Priority scheduler
+- [x] Client-side action buffer
