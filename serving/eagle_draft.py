@@ -208,6 +208,7 @@ class EagleDraftHead(nn.Module):
         input_ids: torch.Tensor,
         position_ids: torch.Tensor | None = None,
         use_cache: bool = True,
+        train_embeddings: bool = False,
     ) -> torch.Tensor:
         """
         Args:
@@ -215,13 +216,17 @@ class EagleDraftHead(nn.Module):
                 second-to-last layer output.
             input_ids: [batch, seq] — token IDs for embedding lookup.
             position_ids: [batch, seq] — position indices for RoPE.
+            train_embeddings: if True, allow gradients through embed_tokens.
 
         Returns:
             output hidden states [batch, seq, hidden_size] (apply target's
             norm + lm_head externally to get logits).
         """
-        with torch.no_grad():
+        if train_embeddings:
             embeds = self.embed_tokens(input_ids).to(hidden_states.dtype)
+        else:
+            with torch.no_grad():
+                embeds = self.embed_tokens(input_ids).to(hidden_states.dtype)
 
         seq_len = hidden_states.shape[1]
 
@@ -286,6 +291,37 @@ class EagleDraftHead(nn.Module):
         total_params = sum(p.numel() for p in model.parameters()) / 1e6
         logger.info("EAGLE draft head loaded: %.1fM params on %s", total_params, device)
         return model
+
+
+    @classmethod
+    def from_config(
+        cls,
+        hidden_size: int = 4096,
+        num_attention_heads: int = 32,
+        num_key_value_heads: int = 32,
+        intermediate_size: int = 11008,
+        vocab_size: int = 32000,
+        num_hidden_layers: int = 1,
+        rms_norm_eps: float = 1e-6,
+        device: str | torch.device = "cpu",
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> "EagleDraftHead":
+        """Create a randomly-initialized EAGLE head for training from scratch."""
+        config = {
+            "hidden_size": hidden_size,
+            "num_attention_heads": num_attention_heads,
+            "num_key_value_heads": num_key_value_heads,
+            "intermediate_size": intermediate_size,
+            "vocab_size": vocab_size,
+            "num_hidden_layers": num_hidden_layers,
+            "rms_norm_eps": rms_norm_eps,
+            "bias": True,
+        }
+        model = cls(config)
+        model = model.to(dtype).to(device)
+        total_params = sum(p.numel() for p in model.parameters()) / 1e6
+        logger.info("EAGLE draft head created (random init): %.1fM params on %s", total_params, device)
+        return model, config
 
 
 def extract_hidden_states(model_output, target_model) -> torch.Tensor:

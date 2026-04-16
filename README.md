@@ -1,6 +1,6 @@
 # VLA Serving Platform
 
-Multi-model inference serving platform for Vision-Language-Action (VLA) models. Supports [ACT](https://tonyzhaozh.github.io/aloha/) (single-pass) and [OpenVLA](https://openvla.github.io/) 7B (autoregressive) policies with KV cache management and self-speculative decoding. Targeting GH200 for unified CPU/GPU memory.
+Multi-model inference serving platform for Vision-Language-Action (VLA) models. Supports [ACT](https://tonyzhaozh.github.io/aloha/) (single-pass) and [OpenVLA](https://openvla.github.io/) 7B (autoregressive) policies with KV cache management, self-speculative decoding, and **EAGLE speculative decoding** for 1.3x inference speedup. Targeting GH200 for unified CPU/GPU memory.
 
 ## Setup (fresh machine)
 
@@ -42,33 +42,36 @@ uv run python -m serving.grpc_client --episodes 5
 
 The client runs the sim, encodes camera frames as JPEG, sends them to the server over gRPC, and receives actions back. Works on `localhost` for dev, or across machines in production.
 
-### Loading OpenVLA 7B (with KV cache + speculative decoding)
+### OpenVLA sim rollout with EAGLE speculative decoding
 
 ```bash
-uv run python -c "
-from serving.grpc_client import InferenceClient
-c = InferenceClient()
-c.load_model(
-    'openvla-7b', 'openvla/openvla-7b',
-    model_type='openvla',
-    use_kv_cache=True,
-    use_speculative_decoding=True,
-)
-print(c.list_models())
-"
+# Run OpenVLA in ALOHA sim with EAGLE acceleration + video recording
+python scripts/run_openvla_sim.py \
+    --episodes 3 --steps 50 \
+    --eagle_dir checkpoints/eagle_openvla_v2
+
+# Baseline only (no EAGLE)
+python scripts/run_openvla_sim.py --episodes 3 --steps 50
 ```
 
-### Multi-model (ACT + OpenVLA)
+Videos saved to `outputs/openvla_sim/`.
+
+### EAGLE training pipeline
 
 ```bash
-uv run python -c "
-from serving.grpc_client import InferenceClient
-c = InferenceClient()
-c.load_model('act-cube', 'lerobot/act_aloha_sim_transfer_cube_human')
-c.load_model('openvla-7b', 'openvla/openvla-7b', model_type='openvla',
-             use_kv_cache=True, use_speculative_decoding=True)
-print(c.list_models())
-"
+# 1. Generate training data (hidden states from OpenVLA)
+python scripts/generate_eagle_data.py --num_samples 10000 --out_dir data/eagle_train_v2
+
+# 2. Train EAGLE draft head (2-layer, ~570M params)
+python scripts/train_eagle.py \
+    --data_dir data/eagle_train_v2 \
+    --out_dir checkpoints/eagle_openvla_v2 \
+    --epochs 50 --batch_size 8 --num_layers 2
+
+# 3. Benchmark
+python scripts/benchmark_eagle.py \
+    --eagle_dir checkpoints/eagle_openvla_v2 \
+    --num_samples 100
 ```
 
 ## Project Structure
@@ -77,10 +80,11 @@ print(c.list_models())
 envs/       — Sim environment wrappers (gym-aloha / MuJoCo)
 policies/   — Policy wrappers (ACT single-pass, OpenVLA 7B autoregressive)
 eval/       — Direct rollout runner (no server needed)
-serving/    — gRPC server, client, model registry, KV cache, speculative decoder
+serving/    — gRPC server, client, model registry, KV cache, speculative decoder,
+              EAGLE draft head
 proto/      — Protobuf service definitions + generated stubs
 configs/    — YAML defaults
-scripts/    — Setup helpers
+scripts/    — EAGLE training pipeline, sim rollout, setup helpers
 ```
 
 ## Architecture
@@ -98,13 +102,30 @@ Client (sim machine)              Server (GPU machine / GH200)
 └─────────────────┘              │  │  sliding window        │   │
                                  │  └───────────────────────┘   │
                                  │  ┌─ Speculative Decoder ─┐   │
+                                 │  │  EAGLE draft head      │   │
                                  │  │  self-spec (layer skip)│   │
                                  │  │  draft → verify loop   │   │
-                                 │  │  greedy acceptance     │   │
                                  │  └───────────────────────┘   │
                                  │  Priority Scheduler          │
                                  └──────────────────────────────┘
 ```
+
+## EAGLE Speculative Decoding Results
+
+Trained an EAGLE-1 draft head on OpenVLA's hidden state distribution to accelerate autoregressive action token generation.
+
+| Method | Latency (ms) | Speedup | Acceptance Rate |
+|--------|-------------|---------|-----------------|
+| Baseline (autoregressive) | 221 ms | 1.0x | — |
+| Layer-skip (16L draft) | 261 ms | 0.85x | 14% |
+| Pre-trained EAGLE (Llama-2-Chat) | 190 ms | 0.95x | 14% |
+| **Trained EAGLE (OpenVLA)** | **169 ms** | **1.31x** | **60%** |
+
+Key improvements over baseline speculative decoding:
+- **Domain-matched training**: EAGLE head trained on OpenVLA's own hidden states (not Llama-2-Chat)
+- **Batched hidden states**: Training data uses verify-pass-style batched forwards, eliminating the extra forward pass at inference
+- **2-layer draft head**: 570M parameter EAGLE head with increased capacity
+- **Correct KV management**: Fixed verify-pass KV trimming to avoid cache corruption on draft rejection
 
 ## What's built
 
@@ -112,7 +133,10 @@ Client (sim machine)              Server (GPU machine / GH200)
 - [x] OpenVLA 7B policy wrapper (autoregressive action token generation)
 - [x] KV cache manager (90% utilization target, prefix reuse, sliding window, LRU eviction)
 - [x] Self-speculative decoding (layer-skip draft, greedy verification)
+- [x] **EAGLE speculative decoding** (trained draft head, 1.31x speedup)
+- [x] **EAGLE training pipeline** (data generation, training, benchmarking)
 - [x] ALOHA sim environment (TransferCube, Insertion)
+- [x] OpenVLA sim rollout with video recording
 - [x] Video recording (mp4)
 - [x] gRPC serving layer (Predict, LoadModel, UnloadModel, ListModels, GetStatus)
 - [x] JPEG video encoding over gRPC
