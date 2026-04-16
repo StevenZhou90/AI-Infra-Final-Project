@@ -1,0 +1,123 @@
+syntax = "proto3";
+
+package vla_serving;
+
+// ---------------------------------------------------------------------------
+// Service
+// ---------------------------------------------------------------------------
+
+service InferenceService {
+  // Run inference: client sends observation, server returns actions
+  rpc Predict(PredictRequest) returns (PredictResponse);
+
+  // Model management
+  rpc LoadModel(LoadModelRequest) returns (LoadModelResponse);
+  rpc UnloadModel(UnloadModelRequest) returns (UnloadModelResponse);
+  rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
+
+  // Server status
+  rpc GetStatus(StatusRequest) returns (StatusResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Priority
+// ---------------------------------------------------------------------------
+
+enum Priority {
+  LOW = 0;
+  NORMAL = 1;
+  HIGH = 2;
+  CRITICAL = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Predict
+// ---------------------------------------------------------------------------
+
+message ImageFrame {
+  string camera_name = 1;       // e.g. "top", "wrist_left"
+  bytes data = 2;               // JPEG-encoded image bytes
+  int32 width = 3;
+  int32 height = 4;
+  string encoding = 5;          // "jpeg", "raw_rgb"
+}
+
+message PredictRequest {
+  string request_id = 1;
+  string model_id = 2;          // which loaded model to use
+  Priority priority = 3;
+  repeated ImageFrame images = 4;
+  repeated float state = 5;     // joint positions / robot state
+  int64 timestamp_ns = 6;       // client-side timestamp for latency tracking
+}
+
+message PredictResponse {
+  string request_id = 1;
+  repeated float actions = 2;   // flattened action array
+  int32 action_dim = 3;         // actions per step (e.g. 14 for ALOHA)
+  int32 chunk_size = 4;         // how many timesteps in this chunk
+  float inference_time_ms = 5;
+}
+
+// ---------------------------------------------------------------------------
+// Model management
+// ---------------------------------------------------------------------------
+
+message LoadModelRequest {
+  string model_id = 1;          // unique name for this model instance
+  string pretrained_path = 2;   // HuggingFace path or local dir
+  int32 gpu_id = 3;             // which GPU to load on (-1 = auto)
+}
+
+message LoadModelResponse {
+  bool success = 1;
+  string message = 2;
+  string model_id = 3;
+  int32 gpu_id = 4;
+  float memory_used_mb = 5;
+}
+
+message UnloadModelRequest {
+  string model_id = 1;
+}
+
+message UnloadModelResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message ListModelsRequest {}
+
+message ModelInfo {
+  string model_id = 1;
+  string pretrained_path = 2;
+  int32 gpu_id = 3;
+  float memory_used_mb = 4;
+  int64 total_requests = 5;
+}
+
+message ListModelsResponse {
+  repeated ModelInfo models = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Status
+// ---------------------------------------------------------------------------
+
+message StatusRequest {}
+
+message GpuStatus {
+  int32 gpu_id = 1;
+  string name = 2;
+  float total_memory_mb = 3;
+  float used_memory_mb = 4;
+  repeated string loaded_models = 5;
+}
+
+message StatusResponse {
+  int32 total_gpus = 1;
+  repeated GpuStatus gpus = 2;
+  int32 total_models = 3;
+  int64 total_requests_served = 4;
+  float uptime_seconds = 5;
+}

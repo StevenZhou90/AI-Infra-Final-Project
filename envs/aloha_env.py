@@ -1,4 +1,4 @@
-"""Thin wrapper around gym-aloha that normalizes observations for LeRobot policies."""
+"""Wraps gym-aloha and converts observations to the format LeRobot policies expect."""
 
 from __future__ import annotations
 
@@ -23,15 +23,12 @@ class AlohaEnvConfig:
 
 
 class AlohaEnv:
-    """Wraps a gym-aloha environment and converts observations to the dict[str, Tensor]
-    format expected by LeRobot policies.
-    """
 
     def __init__(self, config: AlohaEnvConfig, device: str = "cpu") -> None:
         self._config = config
         self._device = device
 
-        import gym_aloha  # noqa: F401 — registers envs
+        import gym_aloha  # noqa: F401
 
         self._env = gym.make(
             f"gym_aloha/{config.task}",
@@ -57,21 +54,16 @@ class AlohaEnv:
         return self._convert_obs(obs), float(reward), terminated, truncated, info
 
     def render(self) -> np.ndarray | None:
-        """Return an RGB frame for video recording."""
         return self._env.render()
 
     def close(self) -> None:
         self._env.close()
 
     def _convert_obs(self, obs: dict | np.ndarray) -> dict[str, torch.Tensor]:
-        """Convert gym observation to the dict[str, Tensor] format LeRobot expects.
+        """Convert gym obs to dict[str, Tensor].
 
-        gym-aloha with obs_type="pixels_agent_pos" returns a dict:
-            {"pixels": {"top": ndarray}, "agent_pos": ndarray}
-
-        LeRobot ACT expects keys like:
-            "observation.images.top": Tensor [C, H, W] float32 in [0,1]
-            "observation.state":     Tensor [D]
+        gym-aloha returns: {"pixels": {"top": ndarray}, "agent_pos": ndarray}
+        LeRobot expects: {"observation.images.top": Tensor[C,H,W], "observation.state": Tensor[D]}
         """
         if isinstance(obs, np.ndarray):
             return {"observation.state": torch.from_numpy(obs).float().to(self._device)}
@@ -82,7 +74,7 @@ class AlohaEnv:
             for cam_name, img in obs["pixels"].items():
                 t = torch.from_numpy(img).float()
                 if t.ndim == 3 and t.shape[-1] in (1, 3):
-                    t = t.permute(2, 0, 1)  # HWC -> CHW
+                    t = t.permute(2, 0, 1)
                 t = t / 255.0
                 converted[f"observation.images.{cam_name}"] = t.to(self._device)
 

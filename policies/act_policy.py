@@ -1,15 +1,9 @@
-"""Wrapper around LeRobot's ACT policy for clean inference interface.
-
-Handles a version mismatch where the pre-trained checkpoint stores normalization
-buffers (mean/std for images, state, actions) but the current LeRobot ACTPolicy
-class doesn't register them. We extract and apply normalization manually.
-"""
+"""ACT policy wrapper with manual normalization for LeRobot version compatibility."""
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from pathlib import Path
 
 import numpy as np
 import safetensors.torch
@@ -27,7 +21,6 @@ class ACTPolicyConfig:
 
 
 class _NormStats:
-    """Holds mean/std tensors for normalizing a single feature."""
 
     def __init__(self, mean: torch.Tensor, std: torch.Tensor, device: torch.device) -> None:
         self.mean = mean.to(device)
@@ -41,9 +34,7 @@ class _NormStats:
 
 
 class ACTPolicyWrapper:
-    """Loads a pre-trained ACT policy from HuggingFace Hub and provides a simple
-    predict(observation) -> action interface with proper normalization.
-    """
+    """Loads ACT from HuggingFace, handles normalization, provides predict() interface."""
 
     def __init__(self, config: ACTPolicyConfig) -> None:
         self._config = config
@@ -53,7 +44,6 @@ class ACTPolicyWrapper:
 
     def _load_policy(self, pretrained_path: str) -> torch.nn.Module:
         logger.info("Loading ACT policy from: %s", pretrained_path)
-
         try:
             from lerobot.common.policies.act.modeling_act import ACTPolicy
         except ImportError:
@@ -66,7 +56,7 @@ class ACTPolicyWrapper:
         return policy
 
     def _load_norm_stats(self, pretrained_path: str) -> dict[str, _NormStats]:
-        """Extract normalization stats from the safetensors checkpoint."""
+        """Extract normalization mean/std from the checkpoint's extra buffers."""
         safetensors_path = hf_hub_download(pretrained_path, "model.safetensors")
         state = safetensors.torch.load_file(safetensors_path)
 
@@ -90,7 +80,7 @@ class ACTPolicyWrapper:
         return stats
 
     def reset(self) -> None:
-        """Call at the start of each episode to clear internal state."""
+        """Clear internal state at the start of each episode."""
         if hasattr(self._policy, "reset"):
             self._policy.reset()
 
@@ -107,10 +97,8 @@ class ACTPolicyWrapper:
                 action = self._policy.select_action(batched_obs)
 
         action = action.squeeze(0)
-
         if "action" in self._norm_stats:
             action = self._norm_stats["action"].unnormalize(action)
-
         return action.cpu().numpy()
 
     def _normalize_obs(self, observation: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
