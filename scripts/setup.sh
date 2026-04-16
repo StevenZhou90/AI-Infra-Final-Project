@@ -21,4 +21,7 @@ uv python install 3.10
 uv sync --python 3.10
 
 echo ""
-echo "Done. Run with:  uv run python -m eval.run_rollout"
+echo "Done. Run options:"
+echo "  Direct eval:     uv run python -m eval.run_rollout"
+echo "  Start server:    uv run python -m serving.grpc_server"
+echo "  Run client:      uv run python -m serving.grpc_client --episodes 5"
