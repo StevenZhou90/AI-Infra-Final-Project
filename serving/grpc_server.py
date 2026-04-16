@@ -1,0 +1,177 @@
+"""gRPC inference server — receives observations, returns actions.
+
+Usage:
+    uv run python -m serving.grpc_server
+    uv run python -m serving.grpc_server --port 50051
+"""
+
+from __future__ import annotations
+
+import argparse
+import io
+import logging
+import time
+from concurrent import futures
+
+import grpc
+import numpy as np
+import torch
+from PIL import Image
+
+from proto import inference_pb2, inference_pb2_grpc
+from serving.model_registry import ModelRegistry
+
+logger = logging.getLogger(__name__)
+
+
+class InferenceServicer(inference_pb2_grpc.InferenceServiceServicer):
+
+    def __init__(self, registry: ModelRegistry) -> None:
+        self._registry = registry
+        self._start_time = time.time()
+        self._total_requests = 0
+        self._active_episodes: dict[str, str] = {}
+
+    def Predict(self, request, context):
+        self._total_requests += 1
+        model_id = request.model_id
+
+        try:
+            entry = self._registry.get_model(model_id)
+        except ValueError as e:
+            context.set_code(grpc.StatusCode.NOT_FOUND)
+            context.set_details(str(e))
+            return inference_pb2.PredictResponse()
+
+        episode_id = request.request_id.rsplit("-", 1)[0] if "-" in request.request_id else request.request_id
+        if self._active_episodes.get(model_id) != episode_id:
+            entry.policy.reset()
+            self._active_episodes[model_id] = episode_id
+
+        observation = self._decode_observation(request, entry.policy._device)
+        actions, inference_ms = self._registry.predict(model_id, observation)
+
+        action_dim = len(request.state) if request.state else 14
+        chunk_size = len(actions) // action_dim if action_dim > 0 else 1
+
+        return inference_pb2.PredictResponse(
+            request_id=request.request_id,
+            actions=actions,
+            action_dim=action_dim,
+            chunk_size=chunk_size,
+            inference_time_ms=inference_ms,
+        )
+
+    def LoadModel(self, request, context):
+        try:
+            entry = self._registry.load_model(
+                model_id=request.model_id,
+                pretrained_path=request.pretrained_path,
+                gpu_id=request.gpu_id,
+            )
+            return inference_pb2.LoadModelResponse(
+                success=True,
+                message=f"Loaded {request.model_id}",
+                model_id=entry.model_id,
+                gpu_id=entry.gpu_id,
+                memory_used_mb=entry.memory_mb,
+            )
+        except Exception as e:
+            return inference_pb2.LoadModelResponse(success=False, message=str(e))
+
+    def UnloadModel(self, request, context):
+        try:
+            self._registry.unload_model(request.model_id)
+            return inference_pb2.UnloadModelResponse(success=True, message=f"Unloaded {request.model_id}")
+        except ValueError as e:
+            return inference_pb2.UnloadModelResponse(success=False, message=str(e))
+
+    def ListModels(self, request, context):
+        models = self._registry.list_models()
+        return inference_pb2.ListModelsResponse(
+            models=[
+                inference_pb2.ModelInfo(
+                    model_id=m.model_id,
+                    pretrained_path=m.pretrained_path,
+                    gpu_id=m.gpu_id,
+                    memory_used_mb=m.memory_mb,
+                    total_requests=m.total_requests,
+                )
+                for m in models
+            ]
+        )
+
+    def GetStatus(self, request, context):
+        gpus = self._registry.gpu_status()
+        models = self._registry.list_models()
+        return inference_pb2.StatusResponse(
+            total_gpus=len(gpus),
+            gpus=[
+                inference_pb2.GpuStatus(
+                    gpu_id=g["gpu_id"],
+                    name=g["name"],
+                    total_memory_mb=g["total_memory_mb"],
+                    used_memory_mb=g["used_memory_mb"],
+                    loaded_models=g["loaded_models"],
+                )
+                for g in gpus
+            ],
+            total_models=len(models),
+            total_requests_served=self._total_requests,
+            uptime_seconds=time.time() - self._start_time,
+        )
+
+    def _decode_observation(self, request, device: torch.device) -> dict[str, torch.Tensor]:
+        """Decode a PredictRequest into the dict[str, Tensor] format policies expect."""
+        obs: dict[str, torch.Tensor] = {}
+
+        for img_frame in request.images:
+            if img_frame.encoding == "raw_rgb":
+                arr = np.frombuffer(img_frame.data, dtype=np.uint8).reshape(
+                    img_frame.height, img_frame.width, 3
+                ).astype(np.float32) / 255.0
+            else:
+                pil_img = Image.open(io.BytesIO(img_frame.data)).convert("RGB")
+                arr = np.array(pil_img, dtype=np.float32) / 255.0
+
+            tensor = torch.from_numpy(arr).permute(2, 0, 1).to(device)
+            obs[f"observation.images.{img_frame.camera_name}"] = tensor
+
+        if request.state:
+            obs["observation.state"] = torch.tensor(request.state, dtype=torch.float32, device=device)
+
+        return obs
+
+
+def serve(port: int = 50051, max_workers: int = 4) -> None:
+    registry = ModelRegistry()
+    server = grpc.server(
+        futures.ThreadPoolExecutor(max_workers=max_workers),
+        options=[
+            ("grpc.max_send_message_length", 64 * 1024 * 1024),
+            ("grpc.max_receive_message_length", 64 * 1024 * 1024),
+        ],
+    )
+    inference_pb2_grpc.add_InferenceServiceServicer_to_server(
+        InferenceServicer(registry), server
+    )
+    server.add_insecure_port(f"0.0.0.0:{port}")
+    server.start()
+    logger.info("gRPC server listening on port %d", port)
+    server.wait_for_termination()
+
+
+def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)-20s %(levelname)-5s %(message)s",
+    )
+    parser = argparse.ArgumentParser(description="VLA Inference Server")
+    parser.add_argument("--port", type=int, default=50051)
+    parser.add_argument("--workers", type=int, default=4)
+    args = parser.parse_args()
+    serve(port=args.port, max_workers=args.workers)
+
+
+if __name__ == "__main__":
+    main()
