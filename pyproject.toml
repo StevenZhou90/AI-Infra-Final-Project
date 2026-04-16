@@ -18,6 +18,9 @@ dependencies = [
     "opencv-python-headless>=4.9.0",
     "pyyaml>=6.0",
     "numpy>=1.26.0",
+    "grpcio>=1.60.0",
+    "grpcio-tools>=1.60.0",
+    "protobuf>=4.25.0",
 ]
 
 [project.optional-dependencies]
@@ -27,7 +30,7 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["envs*", "policies*", "eval*"]
+include = ["envs*", "policies*", "eval*", "serving*", "proto*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
