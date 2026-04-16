@@ -69,6 +69,9 @@ class InferenceServicer(inference_pb2_grpc.InferenceServiceServicer):
                 model_id=request.model_id,
                 pretrained_path=request.pretrained_path,
                 gpu_id=request.gpu_id,
+                model_type=request.model_type,
+                use_kv_cache=request.use_kv_cache,
+                use_speculative_decoding=request.use_speculative_decoding,
             )
             return inference_pb2.LoadModelResponse(
                 success=True, message=f"Loaded {request.model_id}",
@@ -160,7 +163,8 @@ def _inference_worker(
                 servicer._active_episodes[model_id] = episode_id
 
             observation = servicer._decode_observation(grpc_request, entry.policy._device)
-            actions, inference_ms = registry.predict(model_id, observation)
+            instruction = grpc_request.instruction if grpc_request.instruction else ""
+            actions, inference_ms = registry.predict(model_id, observation, instruction=instruction)
 
             action_dim = len(grpc_request.state) if grpc_request.state else 14
             chunk_size = len(actions) // action_dim if action_dim > 0 else 1

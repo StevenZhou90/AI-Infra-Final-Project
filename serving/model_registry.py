@@ -6,12 +6,28 @@ import logging
 import time
 from dataclasses import dataclass, field
 from threading import Lock
+from typing import Any
 
 import torch
 
 from policies.act_policy import ACTPolicyWrapper, ACTPolicyConfig
+from policies.openvla_policy import OpenVLAPolicyWrapper, OpenVLAPolicyConfig
 
 logger = logging.getLogger(__name__)
+
+MODEL_TYPE_ACT = "act"
+MODEL_TYPE_OPENVLA = "openvla"
+
+_OPENVLA_KEYWORDS = ("openvla", "vla-7b", "prismatic")
+
+
+def _detect_model_type(pretrained_path: str, model_type: str = "") -> str:
+    if model_type:
+        return model_type.lower()
+    lower = pretrained_path.lower()
+    if any(kw in lower for kw in _OPENVLA_KEYWORDS):
+        return MODEL_TYPE_OPENVLA
+    return MODEL_TYPE_ACT
 
 
 @dataclass
@@ -19,8 +35,9 @@ class LoadedModel:
     model_id: str
     pretrained_path: str
     gpu_id: int
-    policy: ACTPolicyWrapper
+    policy: Any  # ACTPolicyWrapper | OpenVLAPolicyWrapper
     memory_mb: float
+    model_type: str = MODEL_TYPE_ACT
     loaded_at: float = field(default_factory=time.time)
     total_requests: int = 0
 
@@ -32,7 +49,15 @@ class ModelRegistry:
         self._models: dict[str, LoadedModel] = {}
         self._lock = Lock()
 
-    def load_model(self, model_id: str, pretrained_path: str, gpu_id: int = -1) -> LoadedModel:
+    def load_model(
+        self,
+        model_id: str,
+        pretrained_path: str,
+        gpu_id: int = -1,
+        model_type: str = "",
+        use_kv_cache: bool = True,
+        use_speculative_decoding: bool = False,
+    ) -> LoadedModel:
         with self._lock:
             if model_id in self._models:
                 raise ValueError(f"Model '{model_id}' is already loaded")
@@ -43,8 +68,19 @@ class ModelRegistry:
         device = f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu"
         mem_before = torch.cuda.memory_allocated(gpu_id) if torch.cuda.is_available() else 0
 
-        config = ACTPolicyConfig(pretrained_path=pretrained_path, device=device)
-        policy = ACTPolicyWrapper(config)
+        mtype = _detect_model_type(pretrained_path, model_type)
+
+        if mtype == MODEL_TYPE_OPENVLA:
+            config = OpenVLAPolicyConfig(
+                pretrained_path=pretrained_path,
+                device=device,
+                use_kv_cache=use_kv_cache,
+                use_speculative_decoding=use_speculative_decoding,
+            )
+            policy = OpenVLAPolicyWrapper(config)
+        else:
+            config = ACTPolicyConfig(pretrained_path=pretrained_path, device=device)
+            policy = ACTPolicyWrapper(config)
 
         mem_after = torch.cuda.memory_allocated(gpu_id) if torch.cuda.is_available() else 0
         memory_mb = (mem_after - mem_before) / (1 << 20)
@@ -52,12 +88,16 @@ class ModelRegistry:
         entry = LoadedModel(
             model_id=model_id, pretrained_path=pretrained_path,
             gpu_id=gpu_id, policy=policy, memory_mb=memory_mb,
+            model_type=mtype,
         )
 
         with self._lock:
             self._models[model_id] = entry
 
-        logger.info("Loaded model '%s' from %s on GPU %d (%.1f MB)", model_id, pretrained_path, gpu_id, memory_mb)
+        logger.info(
+            "Loaded %s model '%s' from %s on GPU %d (%.1f MB)",
+            mtype, model_id, pretrained_path, gpu_id, memory_mb,
+        )
         return entry
 
     def unload_model(self, model_id: str) -> None:
@@ -81,11 +121,19 @@ class ModelRegistry:
         with self._lock:
             return list(self._models.values())
 
-    def predict(self, model_id: str, observation: dict[str, torch.Tensor]) -> tuple[list[float], float]:
+    def predict(
+        self,
+        model_id: str,
+        observation: dict[str, torch.Tensor],
+        instruction: str = "",
+    ) -> tuple[list[float], float]:
         """Run inference on a loaded model. Returns (actions_list, inference_time_ms)."""
         entry = self.get_model(model_id)
         t0 = time.perf_counter()
-        action = entry.policy.predict(observation)
+        if entry.model_type == MODEL_TYPE_OPENVLA and instruction:
+            action = entry.policy.predict(observation, instruction=instruction)
+        else:
+            action = entry.policy.predict(observation)
         elapsed_ms = (time.perf_counter() - t0) * 1000
         with self._lock:
             entry.total_requests += 1
