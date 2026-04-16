@@ -127,6 +127,8 @@ def run_client_loop(
 
     logger.info("Server status: %s", client.status())
 
+    from serving.action_buffer import ActionBuffer
+
     env_cfg = AlohaEnvConfig(task=task)
     env = AlohaEnv(env_cfg, device="cpu")
 
@@ -136,25 +138,31 @@ def run_client_loop(
         logger.info("Episode %d/%d  seed=%d", ep + 1, episodes, seed)
 
         obs_dict = env.reset(seed=seed)
+        buffer = ActionBuffer(action_dim=env.action_dim)
         frames: list[np.ndarray] = []
         total_reward = 0.0
         steps = 0
         success = False
         done = False
+        inf_ms = 0.0
 
         while not done:
-            images = {}
-            state = np.zeros(14, dtype=np.float32)
-            for key, val in obs_dict.items():
-                if "images" in key:
-                    cam_name = key.split(".")[-1]
-                    img_np = (val.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-                    images[cam_name] = img_np
-                elif "state" in key:
-                    state = val.cpu().numpy()
+            if buffer.size() == 0:
+                images = {}
+                state = np.zeros(env.action_dim, dtype=np.float32)
+                for key, val in obs_dict.items():
+                    if "images" in key:
+                        cam_name = key.split(".")[-1]
+                        img_np = (val.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                        images[cam_name] = img_np
+                    elif "state" in key:
+                        state = val.cpu().numpy()
 
-            actions, inf_ms = client.predict(model_id, images, state, episode_id=episode_id)
-            obs_dict, reward, terminated, truncated, info = env.step(actions)
+                actions, inf_ms = client.predict(model_id, images, state, episode_id=episode_id)
+                buffer.push(actions.reshape(-1, env.action_dim) if actions.size > env.action_dim else actions.reshape(1, -1))
+
+            action = buffer.pop()
+            obs_dict, reward, terminated, truncated, info = env.step(action)
 
             total_reward += reward
             steps += 1
@@ -168,8 +176,8 @@ def run_client_loop(
                     frames.append(frame)
 
         logger.info(
-            "  reward=%.2f  steps=%d  success=%s  inf_time=%.1fms/step",
-            total_reward, steps, success, inf_ms,
+            "  reward=%.2f  steps=%d  success=%s  buf_size=%d  inf_time=%.1fms",
+            total_reward, steps, success, buffer.size(), inf_ms,
         )
 
         if not no_video and frames:
