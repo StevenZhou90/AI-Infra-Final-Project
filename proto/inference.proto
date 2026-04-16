@@ -49,6 +49,7 @@ message PredictRequest {
   repeated ImageFrame images = 4;
   repeated float state = 5;     // joint positions / robot state
   int64 timestamp_ns = 6;       // client-side timestamp for latency tracking
+  string instruction = 7;       // language instruction for VLA models (e.g. "pick up the cube")
 }
 
 message PredictResponse {
@@ -67,6 +68,9 @@ message LoadModelRequest {
   string model_id = 1;          // unique name for this model instance
   string pretrained_path = 2;   // HuggingFace path or local dir
   int32 gpu_id = 3;             // which GPU to load on (-1 = auto)
+  string model_type = 4;        // "act" or "openvla" (auto-detected if empty)
+  bool use_kv_cache = 5;        // enable KV cache manager (default true for VLA)
+  bool use_speculative_decoding = 6; // enable self-speculative decoding
 }
 
 message LoadModelResponse {
