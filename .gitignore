@@ -10,3 +10,7 @@ outputs/
 wandb/
 .pytest_cache/
 *.lock
+data/
+checkpoints/
+*.pt
+*.bin

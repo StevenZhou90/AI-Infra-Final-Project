@@ -41,9 +41,20 @@ class InferenceClient:
         self._stub = inference_pb2_grpc.InferenceServiceStub(self._channel)
         logger.info("Connected to server at %s", server_addr)
 
-    def load_model(self, model_id: str, pretrained_path: str, gpu_id: int = -1) -> dict:
+    def load_model(
+        self,
+        model_id: str,
+        pretrained_path: str,
+        gpu_id: int = -1,
+        model_type: str = "",
+        use_kv_cache: bool = True,
+        use_speculative_decoding: bool = False,
+    ) -> dict:
         resp = self._stub.LoadModel(inference_pb2.LoadModelRequest(
             model_id=model_id, pretrained_path=pretrained_path, gpu_id=gpu_id,
+            model_type=model_type,
+            use_kv_cache=use_kv_cache,
+            use_speculative_decoding=use_speculative_decoding,
         ))
         return {"success": resp.success, "message": resp.message, "gpu_id": resp.gpu_id, "memory_mb": resp.memory_used_mb}
 
@@ -74,6 +85,7 @@ class InferenceClient:
         state: np.ndarray,
         priority: int = 1,
         episode_id: str | None = None,
+        instruction: str = "",
     ) -> tuple[np.ndarray, float]:
         """Send observation to server, return (actions, inference_time_ms)."""
         ep_id = episode_id or str(uuid.uuid4())
@@ -92,6 +104,7 @@ class InferenceClient:
             model_id=model_id, priority=priority,
             images=image_frames, state=state.tolist(),
             timestamp_ns=time.time_ns(),
+            instruction=instruction,
         )
 
         resp = self._stub.Predict(request)

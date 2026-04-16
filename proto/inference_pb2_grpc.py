@@ -3,7 +3,7 @@
 import grpc
 import warnings
 
-from proto import inference_pb2 as inference__pb2
+from proto import inference_pb2 as proto_dot_inference__pb2
 
 GRPC_GENERATED_VERSION = '1.80.0'
 GRPC_VERSION = grpc.__version__
@@ -18,7 +18,7 @@ except ImportError:
 if _version_not_supported:
     raise RuntimeError(
         f'The grpc package installed is at version {GRPC_VERSION},'
-        + ' but the generated code in inference_pb2_grpc.py depends on'
+        + ' but the generated code in proto/inference_pb2_grpc.py depends on'
         + f' grpcio>={GRPC_GENERATED_VERSION}.'
         + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
         + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
@@ -40,28 +40,28 @@ class InferenceServiceStub(object):
         """
         self.Predict = channel.unary_unary(
                 '/vla_serving.InferenceService/Predict',
-                request_serializer=inference__pb2.PredictRequest.SerializeToString,
-                response_deserializer=inference__pb2.PredictResponse.FromString,
+                request_serializer=proto_dot_inference__pb2.PredictRequest.SerializeToString,
+                response_deserializer=proto_dot_inference__pb2.PredictResponse.FromString,
                 _registered_method=True)
         self.LoadModel = channel.unary_unary(
                 '/vla_serving.InferenceService/LoadModel',
-                request_serializer=inference__pb2.LoadModelRequest.SerializeToString,
-                response_deserializer=inference__pb2.LoadModelResponse.FromString,
+                request_serializer=proto_dot_inference__pb2.LoadModelRequest.SerializeToString,
+                response_deserializer=proto_dot_inference__pb2.LoadModelResponse.FromString,
                 _registered_method=True)
         self.UnloadModel = channel.unary_unary(
                 '/vla_serving.InferenceService/UnloadModel',
-                request_serializer=inference__pb2.UnloadModelRequest.SerializeToString,
-                response_deserializer=inference__pb2.UnloadModelResponse.FromString,
+                request_serializer=proto_dot_inference__pb2.UnloadModelRequest.SerializeToString,
+                response_deserializer=proto_dot_inference__pb2.UnloadModelResponse.FromString,
                 _registered_method=True)
         self.ListModels = channel.unary_unary(
                 '/vla_serving.InferenceService/ListModels',
-                request_serializer=inference__pb2.ListModelsRequest.SerializeToString,
-                response_deserializer=inference__pb2.ListModelsResponse.FromString,
+                request_serializer=proto_dot_inference__pb2.ListModelsRequest.SerializeToString,
+                response_deserializer=proto_dot_inference__pb2.ListModelsResponse.FromString,
                 _registered_method=True)
         self.GetStatus = channel.unary_unary(
                 '/vla_serving.InferenceService/GetStatus',
-                request_serializer=inference__pb2.StatusRequest.SerializeToString,
-                response_deserializer=inference__pb2.StatusResponse.FromString,
+                request_serializer=proto_dot_inference__pb2.StatusRequest.SerializeToString,
+                response_deserializer=proto_dot_inference__pb2.StatusResponse.FromString,
                 _registered_method=True)
 
 
@@ -110,28 +110,28 @@ def add_InferenceServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
             'Predict': grpc.unary_unary_rpc_method_handler(
                     servicer.Predict,
-                    request_deserializer=inference__pb2.PredictRequest.FromString,
-                    response_serializer=inference__pb2.PredictResponse.SerializeToString,
+                    request_deserializer=proto_dot_inference__pb2.PredictRequest.FromString,
+                    response_serializer=proto_dot_inference__pb2.PredictResponse.SerializeToString,
             ),
             'LoadModel': grpc.unary_unary_rpc_method_handler(
                     servicer.LoadModel,
-                    request_deserializer=inference__pb2.LoadModelRequest.FromString,
-                    response_serializer=inference__pb2.LoadModelResponse.SerializeToString,
+                    request_deserializer=proto_dot_inference__pb2.LoadModelRequest.FromString,
+                    response_serializer=proto_dot_inference__pb2.LoadModelResponse.SerializeToString,
             ),
             'UnloadModel': grpc.unary_unary_rpc_method_handler(
                     servicer.UnloadModel,
-                    request_deserializer=inference__pb2.UnloadModelRequest.FromString,
-                    response_serializer=inference__pb2.UnloadModelResponse.SerializeToString,
+                    request_deserializer=proto_dot_inference__pb2.UnloadModelRequest.FromString,
+                    response_serializer=proto_dot_inference__pb2.UnloadModelResponse.SerializeToString,
             ),
             'ListModels': grpc.unary_unary_rpc_method_handler(
                     servicer.ListModels,
-                    request_deserializer=inference__pb2.ListModelsRequest.FromString,
-                    response_serializer=inference__pb2.ListModelsResponse.SerializeToString,
+                    request_deserializer=proto_dot_inference__pb2.ListModelsRequest.FromString,
+                    response_serializer=proto_dot_inference__pb2.ListModelsResponse.SerializeToString,
             ),
             'GetStatus': grpc.unary_unary_rpc_method_handler(
                     servicer.GetStatus,
-                    request_deserializer=inference__pb2.StatusRequest.FromString,
-                    response_serializer=inference__pb2.StatusResponse.SerializeToString,
+                    request_deserializer=proto_dot_inference__pb2.StatusRequest.FromString,
+                    response_serializer=proto_dot_inference__pb2.StatusResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -163,8 +163,8 @@ class InferenceService(object):
             request,
             target,
             '/vla_serving.InferenceService/Predict',
-            inference__pb2.PredictRequest.SerializeToString,
-            inference__pb2.PredictResponse.FromString,
+            proto_dot_inference__pb2.PredictRequest.SerializeToString,
+            proto_dot_inference__pb2.PredictResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -190,8 +190,8 @@ class InferenceService(object):
             request,
             target,
             '/vla_serving.InferenceService/LoadModel',
-            inference__pb2.LoadModelRequest.SerializeToString,
-            inference__pb2.LoadModelResponse.FromString,
+            proto_dot_inference__pb2.LoadModelRequest.SerializeToString,
+            proto_dot_inference__pb2.LoadModelResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -217,8 +217,8 @@ class InferenceService(object):
             request,
             target,
             '/vla_serving.InferenceService/UnloadModel',
-            inference__pb2.UnloadModelRequest.SerializeToString,
-            inference__pb2.UnloadModelResponse.FromString,
+            proto_dot_inference__pb2.UnloadModelRequest.SerializeToString,
+            proto_dot_inference__pb2.UnloadModelResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -244,8 +244,8 @@ class InferenceService(object):
             request,
             target,
             '/vla_serving.InferenceService/ListModels',
-            inference__pb2.ListModelsRequest.SerializeToString,
-            inference__pb2.ListModelsResponse.FromString,
+            proto_dot_inference__pb2.ListModelsRequest.SerializeToString,
+            proto_dot_inference__pb2.ListModelsResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -271,8 +271,8 @@ class InferenceService(object):
             request,
             target,
             '/vla_serving.InferenceService/GetStatus',
-            inference__pb2.StatusRequest.SerializeToString,
-            inference__pb2.StatusResponse.FromString,
+            proto_dot_inference__pb2.StatusRequest.SerializeToString,
+            proto_dot_inference__pb2.StatusResponse.FromString,
             options,
             channel_credentials,
             insecure,
