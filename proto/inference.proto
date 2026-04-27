@@ -49,13 +49,13 @@ message PredictRequest {
   repeated ImageFrame images = 4;
   repeated float state = 5;     // joint positions / robot state
   int64 timestamp_ns = 6;       // client-side timestamp for latency tracking
-  string instruction = 7;       // language instruction for VLA models (e.g. "pick up the cube")
+  string instruction = 7;       // language instruction for VLA models (e.g. "pick up the coke can")
 }
 
 message PredictResponse {
   string request_id = 1;
   repeated float actions = 2;   // flattened action array
-  int32 action_dim = 3;         // actions per step (e.g. 14 for ALOHA)
+  int32 action_dim = 3;         // actions per step (e.g. 7 for SimplerEnv/OpenVLA)
   int32 chunk_size = 4;         // how many timesteps in this chunk
   float inference_time_ms = 5;
 }

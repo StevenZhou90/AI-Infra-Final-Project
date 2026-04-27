@@ -129,7 +129,7 @@ def run_client_loop(
     output_dir: str,
     no_video: bool,
 ) -> None:
-    from envs.aloha_env import AlohaEnv, AlohaEnvConfig
+    from envs.simpler_env import SimplerEnv, SimplerEnvConfig
 
     client = InferenceClient(server_addr)
 
@@ -142,8 +142,7 @@ def run_client_loop(
 
     from serving.action_buffer import ActionBuffer
 
-    env_cfg = AlohaEnvConfig(task=task)
-    env = AlohaEnv(env_cfg, device="cpu")
+    env = SimplerEnv(SimplerEnvConfig(task=task), device="cpu")
 
     for ep in range(episodes):
         seed = 42 + ep
@@ -171,7 +170,10 @@ def run_client_loop(
                     elif "state" in key:
                         state = val.cpu().numpy()
 
-                actions, inf_ms = client.predict(model_id, images, state, episode_id=episode_id)
+                instruction = env.get_language_instruction()
+                actions, inf_ms = client.predict(
+                    model_id, images, state, episode_id=episode_id, instruction=instruction,
+                )
                 buffer.push(actions.reshape(-1, env.action_dim) if actions.size > env.action_dim else actions.reshape(1, -1))
 
             action = buffer.pop()
@@ -210,9 +212,9 @@ def main() -> None:
     )
     parser = argparse.ArgumentParser(description="VLA Inference Client")
     parser.add_argument("--server", type=str, default="localhost:50051")
-    parser.add_argument("--model-id", type=str, default="act-transfer-cube")
-    parser.add_argument("--model-path", type=str, default="lerobot/act_aloha_sim_transfer_cube_human")
-    parser.add_argument("--task", type=str, default="AlohaTransferCube-v0")
+    parser.add_argument("--model-id", type=str, default="openvla-7b")
+    parser.add_argument("--model-path", type=str, default="openvla/openvla-7b")
+    parser.add_argument("--task", type=str, default="google_robot_pick_coke_can")
     parser.add_argument("--episodes", type=int, default=5)
     parser.add_argument("--output-dir", type=str, default="outputs/client_eval")
     parser.add_argument("--no-video", action="store_true")

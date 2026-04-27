@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run OpenVLA in ALOHA sim with optional EAGLE speculative decoding.
+"""Run OpenVLA in SimplerEnv with optional EAGLE speculative decoding.
 
 Produces side-by-side video output comparing baseline vs EAGLE inference,
 with per-step timing overlay.
@@ -7,6 +7,7 @@ with per-step timing overlay.
 Usage:
     python scripts/run_openvla_sim.py --episodes 3 --steps 50
     python scripts/run_openvla_sim.py --episodes 3 --steps 50 --eagle_dir checkpoints/eagle_openvla_v2
+    python scripts/run_openvla_sim.py --task widowx_spoon_on_towel --unnorm_key bridge_orig
 """
 
 from __future__ import annotations
@@ -57,14 +58,23 @@ def load_eagle(eagle_dir: str, device: str, dtype: torch.dtype):
     return head
 
 
-def create_env():
-    from envs.aloha_env import AlohaEnv, AlohaEnvConfig
-    cfg = AlohaEnvConfig(
-        task="AlohaTransferCube-v0",
-        obs_type="pixels_agent_pos",
-        max_episode_steps=400,
-    )
-    return AlohaEnv(cfg, device="cpu")
+def create_env(task: str, max_episode_steps: int | None):
+    from envs.simpler_env import SimplerEnv, SimplerEnvConfig
+
+    return SimplerEnv(SimplerEnvConfig(task=task, max_episode_steps=max_episode_steps), device="cpu")
+
+
+def default_unnorm_key(task: str) -> str:
+    if task.startswith("google_robot"):
+        return "fractal20220817_data"
+    if task.startswith("widowx"):
+        return "bridge_orig"
+    raise ValueError(f"Cannot infer OpenVLA unnorm_key for SimplerEnv task: {task}")
+
+
+def sync_if_cuda(device: str) -> None:
+    if device.startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize()
 
 
 def obs_to_pil(obs: dict) -> "Image.Image":
@@ -80,14 +90,13 @@ def obs_to_pil(obs: dict) -> "Image.Image":
     raise ValueError(f"No image key in obs: {list(obs.keys())}")
 
 
-def predict_baseline(processor, model, obs, instruction, device, dtype):
+def predict_baseline(processor, model, obs, instruction, unnorm_key, device, dtype):
     """Standard autoregressive inference — returns (action_7dof, elapsed_ms)."""
-    from PIL import Image
     pil_image = obs_to_pil(obs)
     prompt = f"In: What action should the robot take to {instruction}?\nOut:"
     inputs = processor(prompt, pil_image).to(device, dtype=dtype)
 
-    torch.cuda.synchronize()
+    sync_if_cuda(device)
     t0 = time.perf_counter()
     with torch.no_grad():
         out = model.generate(
@@ -98,15 +107,15 @@ def predict_baseline(processor, model, obs, instruction, device, dtype):
             do_sample=False,
             use_cache=True,
         )
-    torch.cuda.synchronize()
+    sync_if_cuda(device)
     elapsed_ms = (time.perf_counter() - t0) * 1000
 
     action_ids = out[0, inputs["input_ids"].shape[1]:]
-    action = decode_action_tokens(processor, action_ids)
+    action = decode_action_tokens(processor, model, action_ids, unnorm_key)
     return action, elapsed_ms
 
 
-def predict_eagle(processor, model, eagle_head, obs, instruction, device, dtype, lookahead=1):
+def predict_eagle(processor, model, eagle_head, obs, instruction, unnorm_key, device, dtype, lookahead=1):
     """EAGLE speculative decoding — returns (action_7dof, elapsed_ms)."""
     from serving.kv_cache_manager import trim_kv, kv_seq_len
 
@@ -123,7 +132,7 @@ def predict_eagle(processor, model, eagle_head, obs, instruction, device, dtype,
         lambda m, inp, out: captured.update({"h": (out[0] if isinstance(out, tuple) else out).detach()})
     )
 
-    torch.cuda.synchronize()
+    sync_if_cuda(device)
     t0 = time.perf_counter()
 
     with torch.no_grad():
@@ -192,17 +201,17 @@ def predict_eagle(processor, model, eagle_head, obs, instruction, device, dtype,
                 prev_logits = verify_logits[:, n_accepted - 1:n_accepted, :]
                 prev_hidden = verify_hidden[:, n_accepted - 1:n_accepted, :]
 
-    torch.cuda.synchronize()
+    sync_if_cuda(device)
     elapsed_ms = (time.perf_counter() - t0) * 1000
     handle.remove()
 
     gen_ids = torch.cat(generated[:max_new], dim=1)
     action_ids = gen_ids[0]
-    action = decode_action_tokens(processor, action_ids)
+    action = decode_action_tokens(processor, model, action_ids, unnorm_key)
     return action, elapsed_ms
 
 
-def decode_action_tokens(processor, action_ids):
+def decode_action_tokens(processor, model, action_ids, unnorm_key):
     strs = processor.batch_decode(
         action_ids.unsqueeze(1) if action_ids.dim() == 1 else action_ids,
         skip_special_tokens=True,
@@ -218,12 +227,15 @@ def decode_action_tokens(processor, action_ids):
     while len(discrete) < 7:
         discrete.append(128)
     raw = np.array(discrete[:7], dtype=np.float32)
+
+    if hasattr(model, "norm_stats") and unnorm_key in model.norm_stats:
+        stats = model.norm_stats[unnorm_key]["action"]
+        lo = np.array(stats.get("q01", stats.get("min", [0] * 7)), dtype=np.float32)
+        hi = np.array(stats.get("q99", stats.get("max", [1] * 7)), dtype=np.float32)
+        return lo + (raw / 255.0) * (hi - lo)
+
+    logger.warning("Missing norm_stats[%s]; falling back to [-1, 1] action bins", unnorm_key)
     return (raw / 255.0) * 2 - 1
-
-
-def pad_action_14dof(action_7dof: np.ndarray) -> np.ndarray:
-    """Pad 7-DOF OpenVLA output to 14-DOF for ALOHA (duplicate to both arms)."""
-    return np.concatenate([action_7dof, action_7dof])
 
 
 def add_text_overlay(frame: np.ndarray, text: str) -> np.ndarray:
@@ -239,7 +251,7 @@ def add_text_overlay(frame: np.ndarray, text: str) -> np.ndarray:
 
 
 def run_episode(
-    env, processor, model, eagle_head, seed, steps, instruction, device, dtype, lookahead,
+    env, processor, model, eagle_head, seed, steps, instruction_override, unnorm_key, device, dtype, lookahead,
 ):
     obs = env.reset(seed=seed)
     frames_baseline = []
@@ -248,12 +260,13 @@ def run_episode(
     times_eagle = []
 
     for step in range(steps):
-        action_bl, ms_bl = predict_baseline(processor, model, obs, instruction, device, dtype)
+        instruction = instruction_override or env.get_language_instruction()
+        action_bl, ms_bl = predict_baseline(processor, model, obs, instruction, unnorm_key, device, dtype)
         times_baseline.append(ms_bl)
 
         if eagle_head is not None:
             action_ea, ms_ea = predict_eagle(
-                processor, model, eagle_head, obs, instruction, device, dtype, lookahead,
+                processor, model, eagle_head, obs, instruction, unnorm_key, device, dtype, lookahead,
             )
             times_eagle.append(ms_ea)
 
@@ -263,8 +276,7 @@ def run_episode(
             if eagle_head is not None:
                 frames_eagle.append(frame.copy())
 
-        action_14 = pad_action_14dof(action_bl)
-        obs, reward, terminated, truncated, info = env.step(action_14)
+        obs, reward, terminated, truncated, info = env.step(action_bl)
 
         if step % 10 == 0:
             eagle_str = f"  EAGLE: {times_eagle[-1]:.0f}ms" if times_eagle else ""
@@ -288,12 +300,14 @@ def save_video(frames, path, fps=50):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run OpenVLA in ALOHA sim")
+    parser = argparse.ArgumentParser(description="Run OpenVLA in SimplerEnv")
     parser.add_argument("--pretrained", default="openvla/openvla-7b")
     parser.add_argument("--eagle_dir", default=None, help="Path to trained EAGLE checkpoint")
+    parser.add_argument("--task", default="google_robot_pick_coke_can")
     parser.add_argument("--episodes", type=int, default=3)
     parser.add_argument("--steps", type=int, default=50)
-    parser.add_argument("--instruction", default="pick up the cube")
+    parser.add_argument("--instruction", default=None, help="Override SimplerEnv's task instruction")
+    parser.add_argument("--unnorm_key", default=None, help="OpenVLA action unnormalization key")
     parser.add_argument("--output_dir", default="outputs/openvla_sim")
     parser.add_argument("--lookahead", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
@@ -302,13 +316,16 @@ def main():
     args = parser.parse_args()
 
     dtype = getattr(torch, args.dtype)
+    unnorm_key = args.unnorm_key or default_unnorm_key(args.task)
+    logger.info("Task: %s  unnorm_key: %s", args.task, unnorm_key)
+
     processor, model = load_openvla(args.pretrained, args.device, dtype)
 
     eagle_head = None
     if args.eagle_dir:
         eagle_head = load_eagle(args.eagle_dir, args.device, dtype)
 
-    env = create_env()
+    env = create_env(args.task, args.steps)
     out_dir = Path(args.output_dir)
 
     all_bl_times = []
@@ -320,7 +337,7 @@ def main():
 
         frames_bl, frames_ea, times_bl, times_ea = run_episode(
             env, processor, model, eagle_head, seed, args.steps,
-            args.instruction, args.device, dtype, args.lookahead,
+            args.instruction, unnorm_key, args.device, dtype, args.lookahead,
         )
 
         save_video(frames_bl, out_dir / f"episode_{ep:02d}_baseline.mp4", fps=env.fps)

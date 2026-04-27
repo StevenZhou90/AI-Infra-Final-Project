@@ -1,3 +1,3 @@
-from envs.aloha_env import AlohaEnv
+from envs.simpler_env import SimplerEnv, SimplerEnvConfig
 
-__all__ = ["AlohaEnv"]
+__all__ = ["SimplerEnv", "SimplerEnvConfig"]

@@ -1,6 +1,6 @@
 # VLA Serving Platform
 
-Multi-model inference serving platform for Vision-Language-Action (VLA) models. Supports [ACT](https://tonyzhaozh.github.io/aloha/) (single-pass) and [OpenVLA](https://openvla.github.io/) 7B (autoregressive) policies with KV cache management, self-speculative decoding, and **EAGLE speculative decoding** for 1.3x inference speedup. Targeting GH200 for unified CPU/GPU memory.
+Multi-model inference serving platform for Vision-Language-Action (VLA) models. Supports [OpenVLA](https://openvla.github.io/) 7B on [SimplerEnv](https://github.com/simpler-env/SimplerEnv) tasks, plus legacy [ACT](https://tonyzhaozh.github.io/aloha/) ALOHA evaluation. Includes KV cache management, self-speculative decoding, and **EAGLE speculative decoding** for 1.3x inference speedup. Targeting GH200 for unified CPU/GPU memory.
 
 ## Setup (fresh machine)
 
@@ -11,17 +11,41 @@ Requires: Ubuntu with an NVIDIA GPU, and [uv](https://docs.astral.sh/uv/) instal
 git clone https://github.com/StevenZhou90/AI-Infra-Final-Project.git
 cd AI-Infra-Final-Project
 
-# 2. System libs for headless rendering
-sudo apt-get update && sudo apt-get install -y libegl1 libopengl0 libgl1-mesa-glx
+# 2. System libs for headless SimplerEnv/SAPIEN rendering
+sudo apt-get update && sudo apt-get install -y libegl1 libopengl0 libgl1-mesa-glx libvulkan1 libglvnd-dev
 
 # 3. Python 3.10 + dependencies
 uv python install 3.10
 uv sync --python 3.10
+
+# 4. SimplerEnv + ManiSkill2 real-to-sim
+git clone https://github.com/simpler-env/SimplerEnv.git --recurse-submodules --depth 1 external/SimplerEnv
+uv pip install -e external/SimplerEnv/ManiSkill2_real2sim
+uv pip install -e external/SimplerEnv
 ```
 
 ## Running
 
-### Direct evaluation (no server)
+### OpenVLA SimplerEnv rollout
+
+```bash
+uv run python scripts/run_openvla_sim.py --episodes 3 --steps 50
+uv run python scripts/run_openvla_sim.py --task widowx_spoon_on_towel --episodes 3 --steps 50
+```
+
+Primary zero-shot SimplerEnv tasks:
+- `google_robot_pick_coke_can`
+- `google_robot_pick_object`
+- `google_robot_move_near`
+- `google_robot_open_drawer`
+- `google_robot_close_drawer`
+- `google_robot_place_in_closed_drawer`
+- `widowx_spoon_on_towel`
+- `widowx_carrot_on_plate`
+- `widowx_stack_cube`
+- `widowx_put_eggplant_in_basket`
+
+### Legacy ACT ALOHA eval
 
 ```bash
 uv run python -m eval.run_rollout
@@ -42,12 +66,12 @@ uv run python -m serving.grpc_client --episodes 5
 
 The client runs the sim, encodes camera frames as JPEG, sends them to the server over gRPC, and receives actions back. Works on `localhost` for dev, or across machines in production.
 
-### OpenVLA sim rollout with EAGLE speculative decoding
+### OpenVLA SimplerEnv rollout with EAGLE speculative decoding
 
 ```bash
-# Run OpenVLA in ALOHA sim with EAGLE acceleration + video recording
+# Run OpenVLA in SimplerEnv with EAGLE acceleration + video recording
 python scripts/run_openvla_sim.py \
-    --episodes 3 --steps 50 \
+    --task google_robot_pick_coke_can --episodes 3 --steps 50 \
     --eagle_dir checkpoints/eagle_openvla_v2
 
 # Baseline only (no EAGLE)
@@ -77,7 +101,7 @@ python scripts/benchmark_eagle.py \
 ## Project Structure
 
 ```
-envs/       — Sim environment wrappers (gym-aloha / MuJoCo)
+envs/       — Sim environment wrappers (SimplerEnv primary, gym-aloha legacy)
 policies/   — Policy wrappers (ACT single-pass, OpenVLA 7B autoregressive)
 eval/       — Direct rollout runner (no server needed)
 serving/    — gRPC server, client, model registry, KV cache, speculative decoder,
@@ -92,7 +116,7 @@ scripts/    — EAGLE training pipeline, sim rollout, setup helpers
 ```
 Client (sim machine)              Server (GPU machine / GH200)
 ┌─────────────────┐              ┌──────────────────────────────┐
-│  Isaac Sim /     │   gRPC      │  Model Registry              │
+│  SimplerEnv /    │   gRPC      │  Model Registry              │
 │  MuJoCo          │────────────▶│  ┌─ ACT (single-pass)       │
 │                  │  JPEG imgs  │  └─ OpenVLA 7B (autoregress) │
 │  Video Encoder   │  + state    │                              │
@@ -135,8 +159,9 @@ Key improvements over baseline speculative decoding:
 - [x] Self-speculative decoding (layer-skip draft, greedy verification)
 - [x] **EAGLE speculative decoding** (trained draft head, 1.31x speedup)
 - [x] **EAGLE training pipeline** (data generation, training, benchmarking)
-- [x] ALOHA sim environment (TransferCube, Insertion)
-- [x] OpenVLA sim rollout with video recording
+- [x] SimplerEnv environment adapter for OpenVLA-compatible 7-DOF tasks
+- [x] Legacy ALOHA sim environment (TransferCube, Insertion)
+- [x] OpenVLA SimplerEnv rollout with video recording
 - [x] Video recording (mp4)
 - [x] gRPC serving layer (Predict, LoadModel, UnloadModel, ListModels, GetStatus)
 - [x] JPEG video encoding over gRPC

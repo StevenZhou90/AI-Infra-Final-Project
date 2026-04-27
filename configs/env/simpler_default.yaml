@@ -1,0 +1,3 @@
+env:
+  task: google_robot_pick_coke_can
+  max_episode_steps: null
