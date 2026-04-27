@@ -3,16 +3,14 @@ requires = ["setuptools>=69.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "aloha-act-sim"
+name = "vla-serving-platform"
 version = "0.1.0"
-description = "ALOHA ACT policy evaluation in simulation — MVP for multi-model VLA serving platform"
+description = "Multi-model VLA serving platform with SimplerEnv/OpenVLA evaluation"
 readme = "README.md"
 requires-python = ">=3.10,<3.11"
 license = {text = "MIT"}
 
 dependencies = [
-    "lerobot>=0.4.0,<0.5.0",
-    "gym-aloha>=0.1.0",
     "torch>=2.2.0",
     "transformers>=4.40.0,<5.0.0",
     "accelerate>=0.27.0",
@@ -20,7 +18,7 @@ dependencies = [
     "imageio[ffmpeg]>=2.34.0",
     "opencv-python-headless>=4.9.0",
     "pyyaml>=6.0",
-    "numpy>=1.26.0",
+    "numpy>=1.24.0,<2.0.0",
     "grpcio>=1.60.0",
     "grpcio-tools>=1.60.0",
     "protobuf>=4.25.0",

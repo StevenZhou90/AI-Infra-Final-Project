@@ -4,7 +4,7 @@ Usage (standalone):
     from policies.openvla_policy import OpenVLAPolicyWrapper, OpenVLAPolicyConfig
     cfg = OpenVLAPolicyConfig(pretrained_path="openvla/openvla-7b")
     policy = OpenVLAPolicyWrapper(cfg)
-    action = policy.predict(observation, instruction="pick up the cube")
+    action = policy.predict(observation, instruction="pick up the coke can")
 """
 
 from __future__ import annotations
@@ -35,8 +35,8 @@ class OpenVLAPolicyConfig:
     speculative_lookahead: int = 7
     draft_layers_fraction: float = 0.5
     # Task
-    instruction: str = "pick up the object"
-    unnorm_key: str | None = None
+    instruction: str = "pick up the coke can"
+    unnorm_key: str | None = "fractal20220817_data"
 
 
 class OpenVLAPolicyWrapper:
