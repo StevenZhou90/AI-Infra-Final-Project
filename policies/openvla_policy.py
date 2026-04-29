@@ -96,6 +96,7 @@ class OpenVLAPolicyWrapper:
         model = AutoModelForVision2Seq.from_pretrained(
             config.pretrained_path,
             torch_dtype=self._dtype,
+            attn_implementation="eager",
             low_cpu_mem_usage=True,
             trust_remote_code=True,
         ).to(self._device)
@@ -139,8 +140,9 @@ class OpenVLAPolicyWrapper:
         image_tensor = self._get_image_tensor(observation)
         pil_image = self._tensor_to_pil(image_tensor)
 
-        prompt = f"In: What action should the robot take to {instruction}?\nOut:"
+        prompt = f"In: What action should the robot take to {instruction.lower()}?\nOut:"
         inputs = self._processor(prompt, pil_image).to(self._device, dtype=self._dtype)
+        inputs = self._ensure_action_prompt_token(inputs)
 
         input_ids = inputs["input_ids"]
         attention_mask = inputs.get("attention_mask")
@@ -169,15 +171,23 @@ class OpenVLAPolicyWrapper:
                     max_new_tokens=self.ACTION_DIM,
                     prefill_kwargs=prefill_kwargs,
                 )
+                action = self._decode_actions(generated_ids, input_ids)
             else:
-                generated_ids, final_kv = self._generate_with_kv_cache(
-                    input_ids, prefill_kwargs,
+                # Use OpenVLA's remote-code action decoder for correctness.
+                # It inserts the training-time empty token when needed, maps
+                # action token IDs through vocab_size-token_id, applies masks,
+                # and unnormalizes with the selected dataset statistics.
+                action = self._model.predict_action(
+                    **inputs,
+                    unnorm_key=self._config.unnorm_key,
+                    do_sample=False,
+                    use_cache=self._config.use_kv_cache,
                 )
+                final_kv = None
 
         if self._config.use_kv_cache and final_kv is not None:
             self._kv_mgr.put("latest", final_kv, prefix_hash=prefix_hash)
 
-        action = self._decode_actions(generated_ids, input_ids)
         return action
 
     def _generate_with_kv_cache(
@@ -210,43 +220,26 @@ class OpenVLAPolicyWrapper:
         generated_ids: torch.Tensor,
         input_ids: torch.Tensor,
     ) -> np.ndarray:
-        """Convert generated token IDs into continuous action values."""
+        """Convert generated OpenVLA action token IDs into continuous values."""
         action_ids = generated_ids[0, input_ids.shape[1]:]
-        action_strs = self._processor.batch_decode(
-            action_ids.unsqueeze(1) if action_ids.dim() == 1 else action_ids,
-            skip_special_tokens=True,
+        predicted_action_token_ids = action_ids.detach().cpu().numpy()
+        discretized_actions = self._model.vocab_size - predicted_action_token_ids
+        discretized_actions = np.clip(
+            discretized_actions - 1,
+            a_min=0,
+            a_max=self._model.bin_centers.shape[0] - 1,
         )
+        normalized_actions = self._model.bin_centers[discretized_actions]
 
-        discrete: list[int] = []
-        for s in action_strs:
-            s = s.strip()
-            if s.isdigit():
-                discrete.append(min(int(s), 255))
-            else:
-                # Fallback: try to extract a number
-                nums = [c for c in s if c.isdigit()]
-                discrete.append(int("".join(nums)) if nums else 128)
-
-        while len(discrete) < self.ACTION_DIM:
-            discrete.append(128)  # neutral default (mid-bin)
-
-        discrete = discrete[: self.ACTION_DIM]
-        raw = np.array(discrete, dtype=np.float32)
-
-        # If the model exposes per-dataset unnormalization, use it
-        if (
-            self._config.unnorm_key
-            and hasattr(self._model, "norm_stats")
-            and self._config.unnorm_key in self._model.norm_stats
-        ):
-            stats = self._model.norm_stats[self._config.unnorm_key]["action"]
-            lo = np.array(stats.get("q01", stats.get("min", [0] * self.ACTION_DIM)), dtype=np.float32)
-            hi = np.array(stats.get("q99", stats.get("max", [1] * self.ACTION_DIM)), dtype=np.float32)
-            actions = lo + (raw / 255.0) * (hi - lo)
-        else:
-            actions = (raw / 255.0) * 2 - 1  # default: map [0,255] → [-1, 1]
-
-        return actions
+        action_norm_stats = self._model.get_action_stats(self._config.unnorm_key)
+        mask = action_norm_stats.get("mask", np.ones_like(action_norm_stats["q01"], dtype=bool))
+        action_high = np.array(action_norm_stats["q99"], dtype=np.float32)
+        action_low = np.array(action_norm_stats["q01"], dtype=np.float32)
+        return np.where(
+            mask,
+            0.5 * (normalized_actions + 1) * (action_high - action_low) + action_low,
+            normalized_actions,
+        )
 
     # ------------------------------------------------------------------
     # Helpers
@@ -258,6 +251,20 @@ class OpenVLAPolicyWrapper:
             if "image" in key:
                 return observation[key]
         raise ValueError(f"No image key in observation: {list(observation.keys())}")
+
+    def _ensure_action_prompt_token(self, inputs):
+        if torch.all(inputs["input_ids"][:, -1] == 29871):
+            return inputs
+        token = torch.tensor([[29871]], dtype=inputs["input_ids"].dtype, device=self._device)
+        inputs["input_ids"] = torch.cat([inputs["input_ids"], token], dim=1)
+        if "attention_mask" in inputs:
+            mask_token = torch.ones(
+                (inputs["attention_mask"].shape[0], 1),
+                dtype=inputs["attention_mask"].dtype,
+                device=self._device,
+            )
+            inputs["attention_mask"] = torch.cat([inputs["attention_mask"], mask_token], dim=1)
+        return inputs
 
     @staticmethod
     def _tensor_to_pil(tensor: torch.Tensor) -> Image.Image:
