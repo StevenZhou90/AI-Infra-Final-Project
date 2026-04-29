@@ -20,6 +20,18 @@ logger = logging.getLogger(__name__)
 class SimplerEnvConfig:
     task: str = "google_robot_pick_coke_can"
     max_episode_steps: int | None = None
+    use_published_eval_setup: bool = False
+    env_name: str | None = None
+    scene_name: str = "google_pick_coke_can_1_v4"
+    robot: str = "google_robot_static"
+    control_freq: int = 3
+    sim_freq: int = 513
+    obj_init_x: float | None = None
+    obj_init_y: float | None = None
+    robot_init_x: float = 0.35
+    robot_init_y: float = 0.20
+    robot_init_rot_quat: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0)
+    additional_env_build_kwargs: dict[str, Any] | None = None
 
 
 class SimplerEnv:
@@ -31,11 +43,10 @@ class SimplerEnv:
         self._steps = 0
         self._last_image: np.ndarray | None = None
 
-        import simpler_env
         from simpler_env.utils.env.observation_utils import get_image_from_maniskill2_obs_dict
 
         self._image_from_obs = get_image_from_maniskill2_obs_dict
-        self._env = simpler_env.make(config.task)
+        self._env = self._make_env(config)
         logger.info("Created SimplerEnv task: %s", config.task)
 
     @property
@@ -52,6 +63,10 @@ class SimplerEnv:
 
     def reset(self, seed: int | None = None) -> dict[str, torch.Tensor]:
         self._steps = 0
+        if self._config.use_published_eval_setup:
+            obs, _info = self._env.reset(options=self._reset_options())
+            return self._convert_obs(obs)
+
         try:
             obs, _info = self._env.reset(seed=seed)
         except TypeError:
@@ -74,6 +89,51 @@ class SimplerEnv:
 
     def close(self) -> None:
         self._env.close()
+
+    def _make_env(self, config: SimplerEnvConfig):
+        if not config.use_published_eval_setup:
+            import simpler_env
+
+            return simpler_env.make(config.task)
+
+        from simpler_env.utils.env.env_builder import build_maniskill2_env, get_robot_control_mode
+
+        env_name = config.env_name or self._published_env_name(config.task)
+        control_mode = get_robot_control_mode(config.robot, None)
+        kwargs = {
+            "obs_mode": "rgbd",
+            "robot": config.robot,
+            "sim_freq": config.sim_freq,
+            "control_mode": control_mode,
+            "control_freq": config.control_freq,
+            "max_episode_steps": config.max_episode_steps or 80,
+            "scene_name": config.scene_name,
+            "camera_cfgs": {"add_segmentation": True},
+            "rgb_overlay_path": None,
+        }
+        additional = config.additional_env_build_kwargs or {}
+        return build_maniskill2_env(env_name, **additional, **kwargs)
+
+    @staticmethod
+    def _published_env_name(task: str) -> str:
+        if task.startswith("google_robot_pick"):
+            return "GraspSingleOpenedCokeCanInScene-v0"
+        raise ValueError(f"No published eval env_name mapping for task: {task}")
+
+    def _reset_options(self) -> dict[str, Any]:
+        options: dict[str, Any] = {
+            "robot_init_options": {
+                "init_xy": np.array([self._config.robot_init_x, self._config.robot_init_y]),
+                "init_rot_quat": np.array(self._config.robot_init_rot_quat),
+            },
+        }
+        if self._config.obj_init_x is not None:
+            if self._config.obj_init_y is None:
+                raise ValueError("obj_init_y must be provided when obj_init_x is set")
+            options["obj_init_options"] = {
+                "init_xy": np.array([self._config.obj_init_x, self._config.obj_init_y]),
+            }
+        return options
 
     def _convert_obs(self, obs: dict[str, Any]) -> dict[str, torch.Tensor]:
         image = self._image_from_obs(self._env, obs)
