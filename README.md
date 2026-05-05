@@ -89,6 +89,14 @@ This script regenerates:
 
 ## Weights
 
+The reproduced DAgger r2 trajectory-head weights are hosted at
+[`StevenZhou90/openvla-traj-head-dagger-r2`](https://huggingface.co/StevenZhou90/openvla-traj-head-dagger-r2).
+
+```bash
+huggingface-cli download StevenZhou90/openvla-traj-head-dagger-r2 best.pt \
+  --local-dir checkpoints/traj_head_dagger_r2
+```
+
 ```bash
 # Reuse the saved DAgger r2 head once it has been downloaded or regenerated.
 uv run python scripts/run_openvla_sim.py \
