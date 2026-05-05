@@ -1,0 +1,82 @@
+workspace_root: /home/ubuntu/AI-Infra-Final-Project
+specvla_repo_path: /home/ubuntu/AI-Infra-Final-Project/.tmp_specvla
+output_root: /home/ubuntu/AI-Infra-Final-Project/outputs/libero_specvla_distributed
+artifacts_root: /home/ubuntu/AI-Infra-Final-Project/artifacts
+hf_upload:
+  enabled: true
+  repo_id: StevenZhou90/ai-infra-final
+
+benchmark:
+  suites:
+    - libero_goal
+    - libero_object
+    - libero_spatial
+    - libero_10
+  tasks_per_suite: 10
+  trials_per_task: 50
+  num_steps_wait: 10
+  seed: 7
+  progress_log_seconds: 3600
+
+smoke:
+  tasks_per_suite: 1
+  trials_per_task: 5
+
+gate:
+  speedup_gt: 1.0
+  max_success_drop: 0.0
+
+inputs:
+  model_family: openvla
+  pretrained_checkpoint: openvla/openvla-7b-finetuned-libero-goal
+  load_in_8bit: false
+  load_in_4bit: false
+  center_crop: true
+  parallel_draft: false
+  spec_checkpoint_by_suite:
+    libero_goal: /path/to/your/spec_checkpoint_goal
+    libero_object: /path/to/your/spec_checkpoint_object
+    libero_spatial: /path/to/your/spec_checkpoint_spatial
+    libero_10: /path/to/your/spec_checkpoint_long
+  accept_threshold_by_suite:
+    libero_goal: 9
+    libero_object: 9
+    libero_spatial: 9
+    libero_10: 5
+
+head_training:
+  suites:
+    - libero_goal
+    - libero_object
+    - libero_spatial
+    - libero_10
+  dagger_rounds: 1
+  pretrained_by_suite:
+    libero_goal: openvla/openvla-7b-finetuned-libero-goal
+    libero_object: openvla/openvla-7b-finetuned-libero-object
+    libero_spatial: openvla/openvla-7b-finetuned-libero-spatial
+    libero_10: openvla/openvla-7b-finetuned-libero-10
+  sweep_by_suite:
+    libero_goal: mini
+    libero_object: mini
+    libero_spatial: mini
+    libero_10: mini
+  command_templates:
+    # Replace these commands with your suite-aware data pipeline.
+    generate_data: >-
+      python scripts/generate_trajectory_head_data.py
+      --sweep {sweep}
+      --out-dir {artifact_root}/data/{suite}/r{round}
+      --pretrained {pretrained}
+    train: >-
+      python scripts/train_trajectory_head.py
+      --data-dir {artifact_root}/data/{suite}/r{round}
+      --out-dir {suite_ckpt_root}/r{round}
+      --device cuda
+    dagger_generate_data: >-
+      python scripts/generate_trajectory_head_dagger_data.py
+      --policy-head-checkpoint {suite_ckpt_root}/r{prev_round}/best.pt
+      --sweep {sweep}
+      --out-dir {artifact_root}/data/{suite}/r{round}
+      --pretrained {pretrained}
+      --device cuda
