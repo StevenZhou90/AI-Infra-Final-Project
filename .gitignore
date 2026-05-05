@@ -4,10 +4,12 @@ __pycache__/
 dist/
 build/
 .venv/
+.cache/
 *.mp4
 *.avi
 outputs/
 wandb/
+artifacts/logs/readme_repro_*/
 external/
 .pytest_cache/
 *.lock

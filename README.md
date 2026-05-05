@@ -52,7 +52,7 @@ This uses the learned trajectory head in fast mode with confidence gating.
 ```bash
 uv run python scripts/run_openvla_sim.py \
   --decoder trajectory-spec \
-  --trajectory-head-checkpoint checkpoints/traj_head_dagger_r1/best.pt \
+  --trajectory-head-checkpoint checkpoints/traj_head_dagger_r2/best.pt \
   --trajectory-fast-draft-only \
   --trajectory-head-threshold 0.2 \
   --trajectory-fast-min-confident-tokens 5 \
@@ -66,53 +66,117 @@ Gate interpretation:
 - Lower gate (for example 4): more aggressive, faster, less reliable
 - Higher gate (for example 6): more conservative, slower, often more reliable
 
+The benchmark below uses task-adaptive gates: **vertical=5, horizontal=6, standing=6**.
+
 ## DAgger data + training loop
 
+The training recipe follows standard DAgger: every round, collect new rollouts with
+the current fast policy, label them with teacher OpenVLA actions, and retrain on the
+**aggregated** dataset (supervised + every prior DAgger round).
+
 ```bash
-# Collect DAgger data from current fast policy
+# Round 0: collect supervised teacher data and train r1
+uv run python scripts/generate_trajectory_head_data.py \
+  --sweep mini --steps 80 \
+  --out-dir data/trajectory_head_mini_r1 \
+  --device cuda --dtype bfloat16
+
+uv run python scripts/train_trajectory_head.py \
+  --data-dir data/trajectory_head_mini_r1 \
+  --out-dir checkpoints/traj_head_r1 \
+  --epochs 80 --batch-size 128 \
+  --hidden-dim 1024 --embed-dim 128 --hidden-fusion-dim 512 --num-layers 3 \
+  --lr 2e-4 --dim-weights 1,1,1.5,2,2,2,5 \
+  --change-weight 2.0 --gripper-change-weight 8.0 \
+  --late-timestep 20 --late-weight 1.5 \
+  --device cuda
+
+# Round 1: DAgger rollouts under the supervised head
+uv run python scripts/generate_trajectory_head_dagger_data.py \
+  --policy-head-checkpoint checkpoints/traj_head_r1/best.pt \
+  --sweep mini --steps 80 \
+  --out-dir data/trajectory_head_dagger_mini_r1 \
+  --head-threshold 0.2 --fast-min-confident-tokens 5 \
+  --device cuda --dtype bfloat16
+
+uv run python scripts/aggregate_trajectory_head_data.py \
+  --inputs data/trajectory_head_mini_r1 data/trajectory_head_dagger_mini_r1 \
+  --out-dir data/trajectory_head_dagger_aggr_r1
+
+uv run python scripts/train_trajectory_head.py \
+  --data-dir data/trajectory_head_dagger_aggr_r1 \
+  --out-dir checkpoints/traj_head_dagger_r1 \
+  --epochs 80 --batch-size 128 \
+  --hidden-dim 1024 --embed-dim 128 --hidden-fusion-dim 512 --num-layers 3 \
+  --lr 2e-4 --dim-weights 1,1,1.5,2,2,2,5 \
+  --change-weight 2.0 --gripper-change-weight 8.0 \
+  --late-timestep 20 --late-weight 1.5 \
+  --device cuda
+
+# Round 2: DAgger rollouts under the previous DAgger head, aggregate, retrain
 uv run python scripts/generate_trajectory_head_dagger_data.py \
   --policy-head-checkpoint checkpoints/traj_head_dagger_r1/best.pt \
-  --sweep mini \
-  --steps 80 \
+  --sweep mini --steps 80 \
   --out-dir data/trajectory_head_dagger_mini_r2 \
-  --head-threshold 0.2 \
-  --fast-min-confident-tokens 5 \
-  --device cuda \
-  --dtype bfloat16
+  --head-threshold 0.2 --fast-min-confident-tokens 5 \
+  --device cuda --dtype bfloat16
 
-# Train next head
+uv run python scripts/aggregate_trajectory_head_data.py \
+  --inputs \
+    data/trajectory_head_mini_r1 \
+    data/trajectory_head_dagger_mini_r1 \
+    data/trajectory_head_dagger_mini_r2 \
+  --out-dir data/trajectory_head_dagger_aggr_r2
+
 uv run python scripts/train_trajectory_head.py \
-  --data-dir data/trajectory_head_dagger_mini_r2 \
+  --data-dir data/trajectory_head_dagger_aggr_r2 \
   --out-dir checkpoints/traj_head_dagger_r2 \
-  --epochs 80 \
-  --batch-size 128 \
-  --hidden-dim 1024 \
-  --embed-dim 128 \
-  --hidden-fusion-dim 512 \
-  --num-layers 3 \
-  --lr 2e-4 \
-  --dim-weights 1,1,1.5,2,2,2,5 \
-  --change-weight 2.0 \
-  --gripper-change-weight 8.0 \
-  --late-timestep 20 \
-  --late-weight 1.5 \
+  --epochs 80 --batch-size 128 \
+  --hidden-dim 1024 --embed-dim 128 --hidden-fusion-dim 512 --num-layers 3 \
+  --lr 2e-4 --dim-weights 1,1,1.5,2,2,2,5 \
+  --change-weight 2.0 --gripper-change-weight 8.0 \
+  --late-timestep 20 --late-weight 1.5 \
   --device cuda
+```
+
+End-to-end one-shot reproduction (supervised + DAgger r1 + DAgger r2 + benchmark):
+
+```bash
+./scripts/reproduce_readme_speedup_local.sh
 ```
 
 ## Verified benchmark snapshot
 
 Matched benchmark matrix:
 - tasks: vertical/horizontal/standing coke-can
-- x positions: `-0.3500`, `-0.2925`, `-0.2350`
+- x positions: `-0.3500`, `-0.2925`, `-0.2350` (`obj_init_y = -0.02`)
 - 3 episodes per setting (27 episodes total)
+- hardware: 1x A100-SXM4-40GB, bfloat16
 
-Comparison:
-- Baseline OpenVLA: **14/27 success, 302.5 ms/step**
-- Adaptive fast policy (vertical gate5, horizontal gate6, standing gate6):
-  **14/27 success, 145.1 ms/step**
+Reproduced results (`checkpoints/traj_head_dagger_r2/best.pt`):
 
-That is approximately **52% lower latency** at the same total success count in this
-evaluation slice.
+| Decoder | Success | Avg ms/step | Speedup |
+|---|---|---|---|
+| Baseline OpenVLA | 14/27 (51.9%) | 295.2 | 1.00x |
+| Adaptive fast policy (gate v=5, h=6, s=6) | **16/27 (59.3%)** | **105.0** | **2.81x** |
+
+Per-task success for the adaptive fast policy:
+- vertical: 3/9 (one full success cell at x=-0.2925)
+- horizontal: 8/9
+- standing: 5/9
+
+Reproduce only the benchmark stage (with checkpoints already present):
+
+```bash
+sudo env HF_HOME=$PWD/.cache/huggingface MUJOCO_GL=osmesa \
+  ./.venv/bin/python scripts/run_readme_speedup_matrix.py \
+  --checkpoint checkpoints/traj_head_dagger_r2/best.pt \
+  --output-dir outputs/benchmarks/readme_repro \
+  --vertical-gate 5 --horizontal-gate 6 --standing-gate 6 \
+  --head-threshold 0.2 \
+  --steps 80 --episodes 3 \
+  --device cuda --dtype bfloat16
+```
 
 ## Useful scripts
 
