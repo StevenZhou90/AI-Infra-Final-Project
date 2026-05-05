@@ -1,14 +1,16 @@
-"""Spatial token reuse utilities.
+"""Spatial token reuse and model-aware video compression utilities.
 
 The classes here target robotics/video inference streams where adjacent frames
 are mostly stable.  They operate at the patch level:
 
 - ``PatchChangeDetector`` marks image patches that changed enough to refresh.
 - ``SpatialKVCache`` keeps per-patch keys/values and reuses unchanged patches.
+- ``VideoPatchCompressor`` estimates how much patch traffic would be sent after
+  motion-based compression.
 
-These utilities are intentionally model-agnostic. A caller supplies fresh
-per-patch K/V tensors from its vision/attention stack, and the cache merges them
-with cached tensors for patches that did not change.
+These utilities are intentionally model-agnostic.  A caller supplies fresh
+per-patch K/V tensors from its vision/attention stack, and the cache merges
+them with cached tensors for patches that did not change.
 """
 
 from __future__ import annotations
@@ -80,6 +82,27 @@ class SpatialCacheStats:
         if total == 0:
             return 0.0
         return self.cache_hits / total
+
+
+@dataclass
+class CompressionStats:
+    frames: int = 0
+    raw_bytes: int = 0
+    compressed_bytes: int = 0
+    changed_patches: int = 0
+    total_patches: int = 0
+
+    @property
+    def compression_ratio(self) -> float:
+        if self.compressed_bytes == 0:
+            return 0.0
+        return self.raw_bytes / self.compressed_bytes
+
+    @property
+    def changed_ratio(self) -> float:
+        if self.total_patches == 0:
+            return 0.0
+        return self.changed_patches / self.total_patches
 
 
 def patchify(frames: torch.Tensor, grid: PatchGrid) -> torch.Tensor:
@@ -208,3 +231,35 @@ class SpatialKVCache:
             raise ValueError("fresh_value must have the same shape as fresh_key")
         if tuple(changed_mask.shape) != expected:
             raise ValueError(f"changed_mask must be {expected}, got {tuple(changed_mask.shape)}")
+
+
+class VideoPatchCompressor:
+    """Estimate model-side video compression by sending only changed patches."""
+
+    def __init__(
+        self,
+        grid: PatchGrid,
+        threshold: float = 0.03,
+        patch_header_bytes: int = 8,
+    ) -> None:
+        self.grid = grid
+        self.detector = PatchChangeDetector(grid, threshold)
+        self.patch_header_bytes = patch_header_bytes
+        self.stats = CompressionStats()
+
+    def reset(self) -> None:
+        self.detector.reset()
+        self.stats = CompressionStats()
+
+    def update(self, frame: torch.Tensor) -> tuple[torch.Tensor, PatchChangeStats]:
+        changed_mask, change_stats = self.detector.update(frame)
+        raw_bytes = int(frame.nelement() * frame.element_size())
+        bytes_per_patch = raw_bytes // self.grid.num_patches
+        compressed_bytes = change_stats.changed_patches * (bytes_per_patch + self.patch_header_bytes)
+
+        self.stats.frames += 1
+        self.stats.raw_bytes += raw_bytes
+        self.stats.compressed_bytes += compressed_bytes
+        self.stats.changed_patches += change_stats.changed_patches
+        self.stats.total_patches += change_stats.total_patches
+        return changed_mask, change_stats

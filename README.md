@@ -117,6 +117,7 @@ evaluation slice.
 ## Useful scripts
 
 - `scripts/run_openvla_sim.py`: main rollout + benchmark runner
+- `scripts/benchmark_spatial_cache_compression.py`: synthetic benchmark for spatial K/V reuse and video patch compression
 - `scripts/run_published_sweep.py`: published-eval-style batch sweeps
 - `scripts/run_libero_specvla_mirror.py`: paper-mirrored SpecVLA LIBERO AR-vs-Spec benchmark
 - `scripts/run_libero_specvla_distributed.py`: multi-rank/multi-GPU sharded benchmark runner
@@ -129,6 +130,38 @@ evaluation slice.
 - `scripts/train_trajectory_head.py`: draft head training
 - `scripts/check_spec_exactness.py`: speculative exactness checks
 - `scripts/debug_depth2_verify.py`: debug utility for depth>1 verification mismatch
+
+## Spatial K/V + video compression benchmark
+
+This benchmark isolates two non-speculative inference optimizations for video or
+robot-camera streams:
+
+- spatial K/V reuse: refresh only changed visual patches and reuse cached K/V for unchanged patches
+- model-aware video compression: account for bandwidth when sending only changed patches
+
+```bash
+python scripts/benchmark_spatial_cache_compression.py \
+  --frames 120 \
+  --image-size 224 \
+  --patch-size 16 \
+  --hidden-dim 768 \
+  --threshold 0.02 \
+  --device cuda
+```
+
+Key outputs:
+- `speedup`: full patch recomputation time divided by cached patch-refresh time
+- `spatial_cache_reuse_ratio`: fraction of visual patches served from cache
+- `video_compression_ratio`: raw frame bytes divided by changed-patch bytes
+- `max_output_error`: output drift from stale cached patches, useful for threshold tuning
+
+H200 synthetic benchmark snapshot with `--hidden-dim 4096`:
+- baseline: `0.984 ms/frame`
+- cached patch refresh: `0.688 ms/frame`
+- speedup: `1.43x`
+- spatial cache reuse: `94.4%`
+- video compression ratio: `17.8x`
+- max output error: `0.000147`
 
 ## SpecVLA-mirrored LIBERO benchmark
 
