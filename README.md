@@ -70,80 +70,41 @@ The benchmark below uses task-adaptive gates: **vertical=5, horizontal=6, standi
 
 ## DAgger data + training loop
 
-The training recipe follows standard DAgger: every round, collect new rollouts with
-the current fast policy, label them with teacher OpenVLA actions, and retrain on the
-**aggregated** dataset (supervised + every prior DAgger round).
-
-```bash
-# Round 0: collect supervised teacher data and train r1
-uv run python scripts/generate_trajectory_head_data.py \
-  --sweep mini --steps 80 \
-  --out-dir data/trajectory_head_mini_r1 \
-  --device cuda --dtype bfloat16
-
-uv run python scripts/train_trajectory_head.py \
-  --data-dir data/trajectory_head_mini_r1 \
-  --out-dir checkpoints/traj_head_r1 \
-  --epochs 80 --batch-size 128 \
-  --hidden-dim 1024 --embed-dim 128 --hidden-fusion-dim 512 --num-layers 3 \
-  --lr 2e-4 --dim-weights 1,1,1.5,2,2,2,5 \
-  --change-weight 2.0 --gripper-change-weight 8.0 \
-  --late-timestep 20 --late-weight 1.5 \
-  --device cuda
-
-# Round 1: DAgger rollouts under the supervised head
-uv run python scripts/generate_trajectory_head_dagger_data.py \
-  --policy-head-checkpoint checkpoints/traj_head_r1/best.pt \
-  --sweep mini --steps 80 \
-  --out-dir data/trajectory_head_dagger_mini_r1 \
-  --head-threshold 0.2 --fast-min-confident-tokens 5 \
-  --device cuda --dtype bfloat16
-
-uv run python scripts/aggregate_trajectory_head_data.py \
-  --inputs data/trajectory_head_mini_r1 data/trajectory_head_dagger_mini_r1 \
-  --out-dir data/trajectory_head_dagger_aggr_r1
-
-uv run python scripts/train_trajectory_head.py \
-  --data-dir data/trajectory_head_dagger_aggr_r1 \
-  --out-dir checkpoints/traj_head_dagger_r1 \
-  --epochs 80 --batch-size 128 \
-  --hidden-dim 1024 --embed-dim 128 --hidden-fusion-dim 512 --num-layers 3 \
-  --lr 2e-4 --dim-weights 1,1,1.5,2,2,2,5 \
-  --change-weight 2.0 --gripper-change-weight 8.0 \
-  --late-timestep 20 --late-weight 1.5 \
-  --device cuda
-
-# Round 2: DAgger rollouts under the previous DAgger head, aggregate, retrain
-uv run python scripts/generate_trajectory_head_dagger_data.py \
-  --policy-head-checkpoint checkpoints/traj_head_dagger_r1/best.pt \
-  --sweep mini --steps 80 \
-  --out-dir data/trajectory_head_dagger_mini_r2 \
-  --head-threshold 0.2 --fast-min-confident-tokens 5 \
-  --device cuda --dtype bfloat16
-
-uv run python scripts/aggregate_trajectory_head_data.py \
-  --inputs \
-    data/trajectory_head_mini_r1 \
-    data/trajectory_head_dagger_mini_r1 \
-    data/trajectory_head_dagger_mini_r2 \
-  --out-dir data/trajectory_head_dagger_aggr_r2
-
-uv run python scripts/train_trajectory_head.py \
-  --data-dir data/trajectory_head_dagger_aggr_r2 \
-  --out-dir checkpoints/traj_head_dagger_r2 \
-  --epochs 80 --batch-size 128 \
-  --hidden-dim 1024 --embed-dim 128 --hidden-fusion-dim 512 --num-layers 3 \
-  --lr 2e-4 --dim-weights 1,1,1.5,2,2,2,5 \
-  --change-weight 2.0 --gripper-change-weight 8.0 \
-  --late-timestep 20 --late-weight 1.5 \
-  --device cuda
-```
-
-End-to-end one-shot reproduction (supervised + DAgger r1 + DAgger r2 + benchmark):
+The trajectory head uses standard DAgger. Each round rolls out the current fast
+policy, labels those visited states with teacher OpenVLA actions, then retrains on
+the aggregated dataset from all rounds. Aggregation matters because training only
+on the newest rollout set overfits and forgets earlier teacher behavior.
 
 ```bash
 ./scripts/reproduce_readme_speedup_local.sh
 ```
+
+This script regenerates:
+- `data/trajectory_head_mini_r1`
+- `data/trajectory_head_dagger_mini_r1`
+- `data/trajectory_head_dagger_mini_r2`
+- `data/trajectory_head_dagger_aggr_r2`
+- `checkpoints/traj_head_dagger_r2/best.pt`
+- `outputs/benchmarks/readme_speedup_<run_id>/summary.json`
+
+## Weights
+
+```bash
+# Reuse the saved DAgger r2 head once it has been downloaded or regenerated.
+uv run python scripts/run_openvla_sim.py \
+  --decoder trajectory-spec \
+  --trajectory-head-checkpoint checkpoints/traj_head_dagger_r2/best.pt \
+  --trajectory-fast-draft-only \
+  --trajectory-head-threshold 0.2 \
+  --trajectory-fast-min-confident-tokens 5 \
+  --task google_robot_pick_vertical_coke_can \
+  --published-eval-setup \
+  --episodes 3 \
+  --steps 80
+```
+
+Upload target should include `best.pt`, `metrics.json`, and a short model card with
+the benchmark matrix below. Keep tokens out of committed files and shell history.
 
 ## Verified benchmark snapshot
 
@@ -181,19 +142,14 @@ sudo env HF_HOME=$PWD/.cache/huggingface MUJOCO_GL=osmesa \
 ## Useful scripts
 
 - `scripts/run_openvla_sim.py`: main rollout + benchmark runner
-- `scripts/benchmark_spatial_cache_compression.py`: synthetic benchmark for spatial K/V reuse and video patch compression
 - `scripts/run_published_sweep.py`: published-eval-style batch sweeps
-- `scripts/run_libero_specvla_mirror.py`: paper-mirrored SpecVLA LIBERO AR-vs-Spec benchmark
-- `scripts/run_libero_specvla_distributed.py`: multi-rank/multi-GPU sharded benchmark runner
-- `scripts/summarize_libero_mirror.py`: summary/gate report for mirrored LIBERO runs
-- `scripts/train_trajectory_heads_all_suites.py`: suite-wise head training orchestration + checkpoint index
-- `scripts/train_spec_head_goal.sh`: one-command `libero_goal` head training
-- `scripts/train_spec_heads_all.sh`: one-command all-suite head training
 - `scripts/generate_trajectory_head_data.py`: teacher rollout dataset generation
 - `scripts/generate_trajectory_head_dagger_data.py`: DAgger rollout data collection
+- `scripts/aggregate_trajectory_head_data.py`: DAgger dataset aggregation
 - `scripts/train_trajectory_head.py`: draft head training
+- `scripts/reproduce_readme_speedup_local.sh`: end-to-end reproduction script
+- `scripts/run_readme_speedup_matrix.py`: benchmark matrix used for the README numbers
 - `scripts/check_spec_exactness.py`: speculative exactness checks
-- `scripts/debug_depth2_verify.py`: debug utility for depth>1 verification mismatch
 
 ## Spatial K/V + video compression benchmark
 
