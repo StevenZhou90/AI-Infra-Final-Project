@@ -33,7 +33,7 @@ inputs:
   trajectory_head_threshold: 0.2
   trajectory_head_top_k: 3
   spec_checkpoint_by_suite:
-    libero_goal: /home/ubuntu/AI-Infra-Final-Project/artifacts/checkpoints/libero_goal/libero_r1_fullish/best.pt
+    libero_goal: /home/ubuntu/AI-Infra-Final-Project/artifacts/checkpoints/libero_goal/libero_r2_dagger_fullish/best.pt
   accept_threshold_by_suite:
     libero_goal: 9
     libero_object: 9

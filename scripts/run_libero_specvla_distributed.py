@@ -186,6 +186,51 @@ def build_model_cfg(suite_name: str, cfg: dict[str, Any], decoder_mode: str) -> 
     )
 
 
+def suite_value(raw: Any, suite_name: str, default: Any) -> Any:
+    if isinstance(raw, dict):
+        return raw.get(suite_name, default)
+    if raw is None:
+        return default
+    return raw
+
+
+def center_crop_openvla_image(image, *, enabled: bool):
+    if not enabled:
+        return image
+    from PIL import Image
+    import numpy as np
+    import tensorflow as tf
+    from experiments.robot.openvla_utils import crop_and_resize  # type: ignore
+
+    batch_size = 1
+    crop_scale = 0.9
+    tensor = tf.convert_to_tensor(np.array(image))
+    orig_dtype = tensor.dtype
+    tensor = tf.image.convert_image_dtype(tensor, tf.float32)
+    tensor = crop_and_resize(tensor, crop_scale, batch_size)
+    tensor = tf.clip_by_value(tensor, 0, 1)
+    tensor = tf.image.convert_image_dtype(tensor, orig_dtype, saturate=True)
+    return Image.fromarray(tensor.numpy()).convert("RGB")
+
+
+def ensure_openvla_action_prompt_token(inputs, device: str):
+    """Match OpenVLA predict_action() prompt-token handling for custom decode."""
+    import torch
+
+    input_ids = inputs["input_ids"]
+    if torch.all(input_ids[:, -1] == 29871):
+        return inputs
+    extra = torch.full((input_ids.shape[0], 1), 29871, dtype=input_ids.dtype, device=device)
+    inputs["input_ids"] = torch.cat([input_ids, extra], dim=1)
+    if "attention_mask" in inputs and inputs["attention_mask"] is not None:
+        mask = inputs["attention_mask"]
+        inputs["attention_mask"] = torch.cat(
+            [mask, torch.ones((mask.shape[0], 1), dtype=mask.dtype, device=device)],
+            dim=1,
+        )
+    return inputs
+
+
 def build_work_items(cfg: dict[str, Any], mode: str) -> list[tuple[str, str, int, int]]:
     if mode == "smoke":
         task_limit = int(cfg["smoke"]["tasks_per_suite"])
@@ -231,13 +276,49 @@ def run_suite_decoder_real(
         set_seed_everywhere,
     )
     from experiments.robot.openvla_utils import get_processor  # type: ignore
+    from PIL import Image
     import numpy as np
+    import torch
+
+    from serving.trajectory_draft_head import TinyTrajectoryHead
+    from serving.trajectory_speculative_decoder import TrajectorySpeculativeDecoder
 
     model_cfg = build_model_cfg(suite_name=suite_name, cfg=cfg, decoder_mode=decoder_mode)
     set_seed_everywhere(model_cfg.seed)
     model = get_model(model_cfg)
     processor = get_processor(model_cfg)
     resize_size = get_image_resize_size(model_cfg)
+    spec_decoder: TrajectorySpeculativeDecoder | None = None
+    if decoder_mode == "spec":
+        draft_head = TinyTrajectoryHead.load(model_cfg.spec_checkpoint, device="cuda")
+        fast_min_confident_tokens = int(
+            suite_value(
+                cfg["inputs"].get("trajectory_fast_min_confident_tokens_by_suite"),
+                suite_name,
+                cfg["inputs"].get("trajectory_fast_min_confident_tokens", 5),
+            )
+        )
+        fast_max_draft_calls_cfg = cfg["inputs"].get("trajectory_fast_max_draft_calls")
+        fast_max_draft_calls = None if fast_max_draft_calls_cfg is None else int(fast_max_draft_calls_cfg)
+        fast_max_action_step_cfg = cfg["inputs"].get("trajectory_fast_max_action_step")
+        fast_max_action_step = None if fast_max_action_step_cfg is None else int(fast_max_action_step_cfg)
+        stationary_patience_cfg = cfg["inputs"].get("trajectory_fast_stationary_patience")
+        stationary_patience = None if stationary_patience_cfg is None else int(stationary_patience_cfg)
+        spec_decoder = TrajectorySpeculativeDecoder(
+            model=model,
+            device="cuda",
+            draft_head=draft_head,
+            fast_draft_only=bool(cfg["inputs"].get("trajectory_fast_draft_only", True)),
+            fast_min_confident_tokens=fast_min_confident_tokens,
+            fast_max_draft_calls=fast_max_draft_calls,
+            fast_max_action_step=fast_max_action_step,
+            fast_stop_after_gripper_change=bool(cfg["inputs"].get("trajectory_fast_stop_after_gripper_change", False)),
+            fast_stationary_token_delta=float(cfg["inputs"].get("trajectory_fast_stationary_token_delta", 2.0)),
+            fast_stationary_patience=stationary_patience,
+            use_draft_prefill_hidden=bool(cfg["inputs"].get("trajectory_use_draft_prefill_hidden", True)),
+            head_threshold=float(cfg["inputs"].get("trajectory_head_threshold", 0.2)),
+            head_top_k=int(cfg["inputs"].get("trajectory_head_top_k", 3)),
+        )
     max_steps = SUITE_STEP_CAPS[suite_name]
     num_steps_wait = int(cfg["benchmark"]["num_steps_wait"])
 
@@ -248,6 +329,8 @@ def run_suite_decoder_real(
         initial_states = task_suite.get_task_init_states(task_id)
         env, task_description = get_libero_env(task, model_cfg.model_family, resolution=256)
         for episode_idx in sorted(trials):
+            if spec_decoder is not None:
+                spec_decoder.reset()
             env.reset()
             obs = env.set_init_state(initial_states[episode_idx])
             done = False
@@ -266,14 +349,26 @@ def run_suite_decoder_real(
                     ),
                 }
                 tic = time.perf_counter()
-                action = get_action(
-                    model_cfg,
-                    model,
-                    observation,
-                    task_description,
-                    processor=processor,
-                    generate_mode=("AR" if decoder_mode == "ar" else "speculative"),
-                )
+                if decoder_mode == "ar":
+                    action = get_action(
+                        model_cfg,
+                        model,
+                        observation,
+                        task_description,
+                        processor=processor,
+                    )
+                else:
+                    assert spec_decoder is not None
+                    prompt = f"In: What action should the robot take to {task_description.lower()}?\nOut:"
+                    image = Image.fromarray(img).convert("RGB")
+                    image = center_crop_openvla_image(image, enabled=bool(model_cfg.center_crop))
+                    inputs = processor(prompt, image).to("cuda", dtype=torch.bfloat16)
+                    inputs = ensure_openvla_action_prompt_token(inputs, "cuda")
+                    action = spec_decoder.predict_action(
+                        inputs,
+                        unnorm_key=model_cfg.unnorm_key,
+                        max_new_tokens=model.get_action_dim(model_cfg.unnorm_key),
+                    )
                 infer_ms += (time.perf_counter() - tic) * 1000.0
                 action = normalize_gripper_action(action, binarize=True)
                 if model_cfg.model_family == "openvla":
@@ -291,6 +386,7 @@ def run_suite_decoder_real(
                     "success": bool(done),
                     "steps": max(t - num_steps_wait, 0),
                     "inference_ms_total": infer_ms,
+                    "spec_stats": spec_decoder.stats.summary() if spec_decoder is not None else None,
                 }
             )
         env.close()

@@ -4,12 +4,16 @@ __pycache__/
 dist/
 build/
 .venv/
+.venv_user/
 .cache/
+.libero/
 *.mp4
 *.avi
 outputs/
 wandb/
 artifacts/logs/readme_repro_*/
+artifacts/logs/*.log
+artifacts/specvla_checkpoints/
 artifacts/hf_upload/
 external/
 .pytest_cache/

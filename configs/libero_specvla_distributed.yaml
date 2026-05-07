@@ -33,8 +33,17 @@ inputs:
   load_in_4bit: false
   center_crop: true
   parallel_draft: false
+  trajectory_fast_draft_only: true
+  trajectory_use_draft_prefill_hidden: false
+  trajectory_fast_min_confident_tokens_by_suite:
+    libero_goal: 5
+    libero_object: 5
+    libero_spatial: 5
+    libero_10: 5
+  trajectory_head_threshold: 0.2
+  trajectory_head_top_k: 3
   spec_checkpoint_by_suite:
-    libero_goal: /path/to/your/spec_checkpoint_goal
+    libero_goal: /home/ubuntu/AI-Infra-Final-Project/artifacts/checkpoints/libero_goal/r2/best.pt
     libero_object: /path/to/your/spec_checkpoint_object
     libero_spatial: /path/to/your/spec_checkpoint_spatial
     libero_10: /path/to/your/spec_checkpoint_long

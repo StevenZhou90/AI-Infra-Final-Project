@@ -52,7 +52,7 @@ This uses the learned trajectory head in fast mode with confidence gating.
 ```bash
 uv run python scripts/run_openvla_sim.py \
   --decoder trajectory-spec \
-  --trajectory-head-checkpoint checkpoints/traj_head_dagger_r2/best.pt \
+  --trajectory-head-checkpoint checkpoints/traj_head_dagger_r1/best.pt \
   --trajectory-fast-draft-only \
   --trajectory-head-threshold 0.2 \
   --trajectory-fast-min-confident-tokens 5 \
@@ -66,130 +66,69 @@ Gate interpretation:
 - Lower gate (for example 4): more aggressive, faster, less reliable
 - Higher gate (for example 6): more conservative, slower, often more reliable
 
-The benchmark below uses task-adaptive gates: **vertical=5, horizontal=6, standing=6**.
-
 ## DAgger data + training loop
 
-The trajectory head uses standard DAgger. Each round rolls out the current fast
-policy, labels those visited states with teacher OpenVLA actions, then retrains on
-the aggregated dataset from all rounds. Aggregation matters because training only
-on the newest rollout set overfits and forgets earlier teacher behavior.
-
 ```bash
-./scripts/reproduce_readme_speedup_local.sh
+# Collect DAgger data from current fast policy
+uv run python scripts/generate_trajectory_head_dagger_data.py \
+  --policy-head-checkpoint checkpoints/traj_head_dagger_r1/best.pt \
+  --sweep mini \
+  --steps 80 \
+  --out-dir data/trajectory_head_dagger_mini_r2 \
+  --head-threshold 0.2 \
+  --fast-min-confident-tokens 5 \
+  --device cuda \
+  --dtype bfloat16
+
+# Train next head
+uv run python scripts/train_trajectory_head.py \
+  --data-dir data/trajectory_head_dagger_mini_r2 \
+  --out-dir checkpoints/traj_head_dagger_r2 \
+  --epochs 80 \
+  --batch-size 128 \
+  --hidden-dim 1024 \
+  --embed-dim 128 \
+  --hidden-fusion-dim 512 \
+  --num-layers 3 \
+  --lr 2e-4 \
+  --dim-weights 1,1,1.5,2,2,2,5 \
+  --change-weight 2.0 \
+  --gripper-change-weight 8.0 \
+  --late-timestep 20 \
+  --late-weight 1.5 \
+  --device cuda
 ```
-
-This script regenerates:
-- `data/trajectory_head_mini_r1`
-- `data/trajectory_head_dagger_mini_r1`
-- `data/trajectory_head_dagger_mini_r2`
-- `data/trajectory_head_dagger_aggr_r2`
-- `checkpoints/traj_head_dagger_r2/best.pt`
-- `outputs/benchmarks/readme_speedup_<run_id>/summary.json`
-
-## Weights
-
-The reproduced DAgger r2 trajectory-head weights are hosted at
-[`StevenZhou90/openvla-traj-head-dagger-r2`](https://huggingface.co/StevenZhou90/openvla-traj-head-dagger-r2).
-
-```bash
-huggingface-cli download StevenZhou90/openvla-traj-head-dagger-r2 best.pt \
-  --local-dir checkpoints/traj_head_dagger_r2
-```
-
-```bash
-# Reuse the saved DAgger r2 head once it has been downloaded or regenerated.
-uv run python scripts/run_openvla_sim.py \
-  --decoder trajectory-spec \
-  --trajectory-head-checkpoint checkpoints/traj_head_dagger_r2/best.pt \
-  --trajectory-fast-draft-only \
-  --trajectory-head-threshold 0.2 \
-  --trajectory-fast-min-confident-tokens 5 \
-  --task google_robot_pick_vertical_coke_can \
-  --published-eval-setup \
-  --episodes 3 \
-  --steps 80
-```
-
-Upload target should include `best.pt`, `metrics.json`, and a short model card with
-the benchmark matrix below. Keep tokens out of committed files and shell history.
 
 ## Verified benchmark snapshot
 
 Matched benchmark matrix:
 - tasks: vertical/horizontal/standing coke-can
-- x positions: `-0.3500`, `-0.2925`, `-0.2350` (`obj_init_y = -0.02`)
+- x positions: `-0.3500`, `-0.2925`, `-0.2350`
 - 3 episodes per setting (27 episodes total)
-- hardware: 1x A100-SXM4-40GB, bfloat16
 
-Reproduced results (`checkpoints/traj_head_dagger_r2/best.pt`):
+Comparison:
+- Baseline OpenVLA: **14/27 success, 302.5 ms/step**
+- Adaptive fast policy (vertical gate5, horizontal gate6, standing gate6):
+  **14/27 success, 145.1 ms/step**
 
-| Decoder | Success | Avg ms/step | Speedup |
-|---|---|---|---|
-| Baseline OpenVLA | 14/27 (51.9%) | 295.2 | 1.00x |
-| Adaptive fast policy (gate v=5, h=6, s=6) | **16/27 (59.3%)** | **105.0** | **2.81x** |
-
-Per-task success for the adaptive fast policy:
-- vertical: 3/9 (one full success cell at x=-0.2925)
-- horizontal: 8/9
-- standing: 5/9
-
-Reproduce only the benchmark stage (with checkpoints already present):
-
-```bash
-sudo env HF_HOME=$PWD/.cache/huggingface MUJOCO_GL=osmesa \
-  ./.venv/bin/python scripts/run_readme_speedup_matrix.py \
-  --checkpoint checkpoints/traj_head_dagger_r2/best.pt \
-  --output-dir outputs/benchmarks/readme_repro \
-  --vertical-gate 5 --horizontal-gate 6 --standing-gate 6 \
-  --head-threshold 0.2 \
-  --steps 80 --episodes 3 \
-  --device cuda --dtype bfloat16
-```
+That is approximately **52% lower latency** at the same total success count in this
+evaluation slice.
 
 ## Useful scripts
 
 - `scripts/run_openvla_sim.py`: main rollout + benchmark runner
 - `scripts/run_published_sweep.py`: published-eval-style batch sweeps
+- `scripts/run_libero_specvla_mirror.py`: paper-mirrored SpecVLA LIBERO AR-vs-Spec benchmark
+- `scripts/run_libero_specvla_distributed.py`: multi-rank/multi-GPU sharded benchmark runner
+- `scripts/summarize_libero_mirror.py`: summary/gate report for mirrored LIBERO runs
+- `scripts/train_trajectory_heads_all_suites.py`: suite-wise head training orchestration + checkpoint index
+- `scripts/train_spec_head_goal.sh`: one-command `libero_goal` head training
+- `scripts/train_spec_heads_all.sh`: one-command all-suite head training
 - `scripts/generate_trajectory_head_data.py`: teacher rollout dataset generation
 - `scripts/generate_trajectory_head_dagger_data.py`: DAgger rollout data collection
-- `scripts/aggregate_trajectory_head_data.py`: DAgger dataset aggregation
 - `scripts/train_trajectory_head.py`: draft head training
-- `scripts/reproduce_readme_speedup_local.sh`: end-to-end reproduction script
-- `scripts/run_readme_speedup_matrix.py`: benchmark matrix used for the README numbers
 - `scripts/check_spec_exactness.py`: speculative exactness checks
-
-## Spatial K/V + video compression benchmark
-
-This benchmark isolates two non-speculative inference optimizations for video or
-robot-camera streams:
-
-- spatial K/V reuse: refresh only changed visual patches and reuse cached K/V for unchanged patches
-- model-aware video compression: account for bandwidth when sending only changed patches
-
-```bash
-python scripts/benchmark_spatial_cache_compression.py \
-  --frames 120 \
-  --image-size 224 \
-  --patch-size 16 \
-  --hidden-dim 768 \
-  --threshold 0.02 \
-  --device cuda
-```
-
-Key outputs:
-- `speedup`: full patch recomputation time divided by cached patch-refresh time
-- `spatial_cache_reuse_ratio`: fraction of visual patches served from cache
-- `video_compression_ratio`: raw frame bytes divided by changed-patch bytes
-- `max_output_error`: output drift from stale cached patches, useful for threshold tuning
-
-H200 synthetic benchmark snapshot with `--hidden-dim 4096`:
-- baseline: `0.984 ms/frame`
-- cached patch refresh: `0.688 ms/frame`
-- speedup: `1.43x`
-- spatial cache reuse: `94.4%`
-- video compression ratio: `17.8x`
-- max output error: `0.000147`
+- `scripts/debug_depth2_verify.py`: debug utility for depth>1 verification mismatch
 
 ## SpecVLA-mirrored LIBERO benchmark
 
