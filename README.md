@@ -99,6 +99,26 @@ uv run python scripts/train_trajectory_head.py \
   --device cuda
 ```
 
+## feat/video-compression-spatial-kv Branch
+
+This branch implements spatial K/V cache reuse with model-aware video compression for non-speculative inference optimization. The key optimization detects which visual patches changed between frames and only recomputes K/V for those patches, while reusing cached K/V for unchanged regions.
+
+# Coke-can benchmark with all decoder configs
+uv run python scripts/run_openvla_sim.py \
+  --task google_robot_pick_vertical_coke_can \
+  --episodes 3 \
+  --steps 40 \
+  --decoder trajectory-spec \
+  --trajectory-head-checkpoint checkpoints/traj_head_dagger_r2/best.pt \
+  --trajectory-head-threshold 0.2 \
+  --trajectory-fast-min-confident-tokens 5
+
+# Synthetic benchmark (from this branch)
+uv run python scripts/benchmark_spatial_cache_compression.py \
+  --frames 120 --image-size 224 --patch-size 16 --hidden-dim 4096 --device cuda
+
+
+
 ## Verified benchmark snapshot
 
 Matched benchmark matrix:
