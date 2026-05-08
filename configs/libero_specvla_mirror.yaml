@@ -1,0 +1,40 @@
+specvla_repo_path: /home/ubuntu/AI-Infra-Final-Project/.tmp_specvla
+output_root: /home/ubuntu/AI-Infra-Final-Project/outputs/libero_specvla_mirror
+
+benchmark:
+  suites:
+    - libero_goal
+    - libero_object
+    - libero_spatial
+    - libero_10
+  tasks_per_suite: 10
+  trials_per_task: 50
+  num_steps_wait: 10
+  seed: 7
+  progress_log_seconds: 3600
+
+smoke:
+  tasks_per_suite: 1
+  trials_per_task: 5
+
+gate:
+  speedup_gt: 1.0
+  max_success_drop: 0.0
+
+inputs:
+  model_family: openvla
+  pretrained_checkpoint: /path/to/your/openvla_verifier_checkpoint
+  load_in_8bit: false
+  load_in_4bit: false
+  center_crop: true
+  parallel_draft: false
+  spec_checkpoint_by_suite:
+    libero_goal: /path/to/your/spec_checkpoint_goal
+    libero_object: /path/to/your/spec_checkpoint_object
+    libero_spatial: /path/to/your/spec_checkpoint_spatial
+    libero_10: /path/to/your/spec_checkpoint_long
+  accept_threshold_by_suite:
+    libero_goal: 9
+    libero_object: 9
+    libero_spatial: 9
+    libero_10: 5
