@@ -1,0 +1,59 @@
+specvla_repo_path: /home/ubuntu/AI-Infra-Final-Project/.tmp_specvla
+output_root: /home/ubuntu/AI-Infra-Final-Project/outputs/libero_goal_selected_spec100
+
+benchmark:
+  suites:
+    - libero_goal
+  decoder_modes:
+    - spec
+  task_ids_by_suite:
+    libero_goal: [0, 1, 3, 5, 7, 9]
+  tasks_per_suite: 6
+  trials_per_task: 5
+  num_steps_wait: 10
+  seed: 7
+  progress_log_seconds: 300
+
+smoke:
+  tasks_per_suite: 6
+  trials_per_task: 5
+
+gate:
+  speedup_gt: 1.0
+  max_success_drop: 0.05
+
+inputs:
+  model_family: openvla
+  pretrained_checkpoint: openvla/openvla-7b-finetuned-libero-goal
+  load_in_8bit: false
+  load_in_4bit: false
+  center_crop: true
+  parallel_draft: false
+  trajectory_decoder_mode: trajectory-two-head-spec
+  trajectory_allow_missing_head: true
+  trajectory_fast_draft_only: true
+  trajectory_use_draft_prefill_hidden: true
+  trajectory_retrieval_top_k: 4
+  trajectory_retrieval_min_confidence: 0.55
+  trajectory_kinematic_threshold: 4.0
+  trajectory_smooth_phase_curvature: 6.0
+  trajectory_smooth_phase_acceleration: 8.0
+  trajectory_smooth_phase_min_displacement: 1.5
+  trajectory_relaxed_tolerance: 2.0
+  trajectory_hybrid_max_draft_length: 7
+  trajectory_fast_max_draft_calls: 100
+  trajectory_fast_min_confident_tokens_by_suite:
+    libero_goal: 5
+  trajectory_head_threshold: 0.2
+  trajectory_head_top_k: 3
+  spec_checkpoint_by_suite:
+    libero_goal: ""
+  smooth_spec_checkpoint_by_suite:
+    libero_goal: /home/ubuntu/AI-Infra-Final-Project/artifacts/checkpoints/libero_goal/two_head_useful_6task_5trial_160/smooth/best.pt
+  complex_spec_checkpoint_by_suite:
+    libero_goal: /home/ubuntu/AI-Infra-Final-Project/artifacts/checkpoints/libero_goal/two_head_useful_6task_5trial_160/complex/best.pt
+  accept_threshold_by_suite:
+    libero_goal: 9
+    libero_object: 9
+    libero_spatial: 9
+    libero_10: 5

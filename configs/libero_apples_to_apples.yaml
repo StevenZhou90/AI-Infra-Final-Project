@@ -1,0 +1,22 @@
+# Orchestrates paper-aligned LIBERO jobs through scripts/run_libero_apples_to_apples.py.
+#
+# Each job config is a normal run_libero_specvla_distributed.py config. The
+# distributed runner always evaluates AR and spec for that config, then this
+# wrapper summarizes speedup/success deltas into one frontier table.
+
+output_root: outputs/libero_apples_to_apples
+mode: smoke
+nproc_per_node: 1
+
+jobs:
+  - name: specvla_relaxed_paper_thresholds
+    config: libero_specvla_relaxed.yaml
+    mode: smoke
+    enabled: true
+    nproc_per_node: 1
+
+  - name: specvla_strict_threshold_0
+    config: libero_specvla_strict.yaml
+    mode: smoke
+    enabled: true
+    nproc_per_node: 1

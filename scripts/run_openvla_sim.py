@@ -71,13 +71,28 @@ def load_trajectory_decoder(
     fast_draft_only: bool,
     fast_min_confident_tokens: int,
     head_checkpoint: str | None,
+    smooth_head_checkpoint: str | None,
+    complex_head_checkpoint: str | None,
     head_threshold: float,
     head_top_k: int,
+    decoder_mode: str,
+    retrieval_top_k: int,
+    retrieval_min_confidence: float,
+    kinematic_threshold: float,
+    relaxed_tolerance: float,
+    hybrid_max_draft_length: int,
+    chunk_smooth_len: int,
+    chunk_complex_len: int,
+    chunk_heartbeat: int,
+    chunk_min_confident_tokens: int,
+    chunk_max_token_delta: float,
 ):
     from serving.trajectory_speculative_decoder import TrajectorySpeculativeDecoder
     from serving.trajectory_draft_head import TinyTrajectoryHead
 
     draft_head = TinyTrajectoryHead.load(head_checkpoint, device=device) if head_checkpoint else None
+    smooth_head = TinyTrajectoryHead.load(smooth_head_checkpoint, device=device) if smooth_head_checkpoint else None
+    complex_head = TinyTrajectoryHead.load(complex_head_checkpoint, device=device) if complex_head_checkpoint else None
 
     return TrajectorySpeculativeDecoder(
         model=model,
@@ -90,8 +105,21 @@ def load_trajectory_decoder(
         fast_draft_only=fast_draft_only,
         fast_min_confident_tokens=fast_min_confident_tokens,
         draft_head=draft_head,
+        smooth_draft_head=smooth_head,
+        complex_draft_head=complex_head,
         head_threshold=head_threshold,
         head_top_k=head_top_k,
+        decoder_mode=decoder_mode,
+        retrieval_top_k=retrieval_top_k,
+        retrieval_min_confidence=retrieval_min_confidence,
+        kinematic_threshold=kinematic_threshold,
+        relaxed_tolerance=relaxed_tolerance,
+        hybrid_max_draft_length=hybrid_max_draft_length,
+        chunk_smooth_len=chunk_smooth_len,
+        chunk_complex_len=chunk_complex_len,
+        chunk_heartbeat=chunk_heartbeat,
+        chunk_min_confident_tokens=chunk_min_confident_tokens,
+        chunk_max_token_delta=chunk_max_token_delta,
     )
 
 
@@ -264,7 +292,7 @@ def predict_trajectory_spec(spec_decoder, processor, obs, instruction, unnorm_ke
     sync_if_cuda(device)
     t0 = time.perf_counter()
     with torch.no_grad():
-        action = spec_decoder.predict_action(inputs, unnorm_key=unnorm_key)
+        action = spec_decoder.predict_action(inputs, unnorm_key=unnorm_key, task_key=instruction)
     sync_if_cuda(device)
     elapsed_ms = (time.perf_counter() - t0) * 1000
     return action, elapsed_ms
@@ -439,7 +467,7 @@ def run_episode(
 
     for step in range(steps):
         instruction = instruction_override or env.get_language_instruction()
-        if decoder == "trajectory-spec":
+        if decoder in {"trajectory-spec", "trajectory-hybrid-spec"}:
             raw_action_bl, ms_bl = predict_trajectory_spec(
                 trajectory_decoder,
                 processor,
@@ -515,7 +543,11 @@ def main():
     parser = argparse.ArgumentParser(description="Run OpenVLA in SimplerEnv")
     parser.add_argument("--pretrained", default="openvla/openvla-7b")
     parser.add_argument("--eagle_dir", default=None, help="Path to trained EAGLE checkpoint")
-    parser.add_argument("--decoder", choices=["baseline", "trajectory-spec"], default="baseline")
+    parser.add_argument(
+        "--decoder",
+        choices=["baseline", "trajectory-spec", "trajectory-hybrid-spec", "trajectory-two-head-spec", "trajectory-chunk-spec"],
+        default="baseline",
+    )
     parser.add_argument("--trajectory-band-radius", type=int, default=2)
     parser.add_argument("--trajectory-max-residual-bins", type=float, default=8.0)
     parser.add_argument("--trajectory-tree-width", type=int, default=8)
@@ -532,8 +564,20 @@ def main():
     )
     parser.add_argument("--trajectory-fast-min-confident-tokens", type=int, default=7)
     parser.add_argument("--trajectory-head-checkpoint", default=None)
+    parser.add_argument("--trajectory-smooth-head-checkpoint", default=None)
+    parser.add_argument("--trajectory-complex-head-checkpoint", default=None)
     parser.add_argument("--trajectory-head-threshold", type=float, default=0.5)
     parser.add_argument("--trajectory-head-top-k", type=int, default=3)
+    parser.add_argument("--trajectory-retrieval-top-k", type=int, default=4)
+    parser.add_argument("--trajectory-retrieval-min-confidence", type=float, default=0.55)
+    parser.add_argument("--trajectory-kinematic-threshold", type=float, default=4.0)
+    parser.add_argument("--trajectory-relaxed-tolerance", type=float, default=2.0)
+    parser.add_argument("--trajectory-hybrid-max-draft-length", type=int, default=7)
+    parser.add_argument("--trajectory-chunk-smooth-len", type=int, default=4)
+    parser.add_argument("--trajectory-chunk-complex-len", type=int, default=2)
+    parser.add_argument("--trajectory-chunk-heartbeat", type=int, default=6)
+    parser.add_argument("--trajectory-chunk-min-confident-tokens", type=int, default=6)
+    parser.add_argument("--trajectory-chunk-max-token-delta", type=float, default=32.0)
     parser.add_argument("--task", default="google_robot_pick_coke_can")
     parser.add_argument("--episodes", type=int, default=3)
     parser.add_argument("--steps", type=int, default=50)
@@ -572,10 +616,23 @@ def main():
             args.trajectory_fast_draft_only,
             args.trajectory_fast_min_confident_tokens,
             args.trajectory_head_checkpoint,
+            args.trajectory_smooth_head_checkpoint,
+            args.trajectory_complex_head_checkpoint,
             args.trajectory_head_threshold,
             args.trajectory_head_top_k,
+            args.decoder,
+            args.trajectory_retrieval_top_k,
+            args.trajectory_retrieval_min_confidence,
+            args.trajectory_kinematic_threshold,
+            args.trajectory_relaxed_tolerance,
+            args.trajectory_hybrid_max_draft_length,
+            args.trajectory_chunk_smooth_len,
+            args.trajectory_chunk_complex_len,
+            args.trajectory_chunk_heartbeat,
+            args.trajectory_chunk_min_confident_tokens,
+            args.trajectory_chunk_max_token_delta,
         )
-        if args.decoder == "trajectory-spec"
+        if args.decoder in {"trajectory-spec", "trajectory-hybrid-spec", "trajectory-two-head-spec", "trajectory-chunk-spec"}
         else None
     )
 
