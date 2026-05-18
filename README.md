@@ -176,6 +176,66 @@ Long-run progress checkpoints:
 - Interval is controlled by `benchmark.progress_log_seconds` in
   `configs/libero_specvla_mirror.yaml` (default `3600` seconds).
 
+### Selected LIBERO Goal speculative-decoding results
+
+Current selected-slice protocol:
+- suite: `libero_goal`
+- task ids: `0, 1, 3, 5, 7, 9`
+- trials per task: `5`
+- total episodes: `30`
+- base policy: `openvla/openvla-7b-finetuned-libero-goal`
+
+Best clean two-head result:
+
+| Decoder | Success | Avg ms/step | Speedup vs AR |
+| --- | ---: | ---: | ---: |
+| AR OpenVLA | `22/30` | `317.6` | `1.00x` |
+| SpecVLA-style tuned chunk | `23/30` | `280.7` | `1.13x` |
+| Adaptive direct K=2 | `21/30` | `202.7` | `1.57x` |
+| Two-head direct K=3/K=2, strict smooth | `22/30` | `213.5` | `1.49x` |
+| Two-head direct K=3/K=2, loose smooth | `23/30` | `202.0` | `1.57x` |
+
+The current best no-task-router result is the loose-smooth two-head direct chunk
+decoder. It uses:
+- smooth direct chunk head: K=3
+- complex direct chunk head: K=2
+- relaxed smooth phase thresholds to expose more free-space examples during
+  smooth-head training
+
+Reproduce the best run:
+
+```bash
+uv run python scripts/run_libero_specvla_mirror.py \
+  --config configs/libero_goal_selected_direct_twohead_k3k2_loose_smooth.yaml \
+  --mode full
+```
+
+The corresponding result artifact from the current run is:
+
+```text
+outputs/libero_goal_selected_direct_twohead_k3k2_loose_smooth/libero_mirror_full_20260518_025044/full/summary.json
+```
+
+Train the smooth K=3 head with looser smooth labels:
+
+```bash
+uv run python scripts/train_trajectory_head.py \
+  --data-dir artifacts/data/libero_goal/useful_6task_5trial_160 \
+  --out-dir artifacts/checkpoints/libero_goal/direct_chunk_smooth_k3_loose \
+  --epochs 80 \
+  --batch-size 128 \
+  --lr 4e-4 \
+  --hidden-dim 768 \
+  --num-layers 3 \
+  --action-horizon 3 \
+  --phase-filter smooth \
+  --no-prefill-hidden \
+  --recompute-phase-labels \
+  --smooth-phase-curvature 18.0 \
+  --smooth-phase-acceleration 24.0 \
+  --smooth-phase-min-displacement 0.5
+```
+
 ## Distributed single-node benchmark (8xH200-ready)
 
 Config:
