@@ -132,7 +132,8 @@ def main() -> None:
             "pretrained": pretrained_by_suite.get(suite, "openvla/openvla-7b"),
             "sweep": sweep_by_suite.get(suite, "mini"),
         }
-        for stage in ("generate_data", "train"):
+        train_stages = [stage for stage in ("train", "train_smooth", "train_complex") if stage in cmd_tpls]
+        for stage in ("generate_data", *train_stages):
             cmd = cmd_tpls[stage].format(**fmt)
             rc, out = run_command(cmd, workspace, args.dry_run)
             suite_log.write_text((suite_log.read_text() if suite_log.exists() else "") + out)
@@ -150,7 +151,7 @@ def main() -> None:
             )
             if rc != 0:
                 raise SystemExit(f"Stage failed for suite={suite} stage={stage}\nCommand: {cmd}")
-            if stage == "train" and hf_enabled:
+            if stage in train_stages and hf_enabled:
                 ok, msg = maybe_upload_checkpoint(
                     enabled=hf_enabled,
                     repo_id=hf_repo_id,
@@ -186,7 +187,8 @@ def main() -> None:
                 "pretrained": pretrained_by_suite.get(suite, "openvla/openvla-7b"),
                 "sweep": sweep_by_suite.get(suite, "mini"),
             }
-            for stage in ("dagger_generate_data", "train"):
+            train_stages = [stage for stage in ("train", "train_smooth", "train_complex") if stage in cmd_tpls]
+            for stage in ("dagger_generate_data", *train_stages):
                 template_key = stage
                 if template_key not in cmd_tpls:
                     continue
@@ -207,7 +209,7 @@ def main() -> None:
                 )
                 if rc != 0:
                     raise SystemExit(f"Stage failed for suite={suite} stage={stage}\nCommand: {cmd}")
-                if stage == "train" and hf_enabled:
+                if stage in train_stages and hf_enabled:
                     ok, msg = maybe_upload_checkpoint(
                         enabled=hf_enabled,
                         repo_id=hf_repo_id,

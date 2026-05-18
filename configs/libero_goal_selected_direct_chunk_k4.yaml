@@ -1,0 +1,55 @@
+specvla_repo_path: /home/ubuntu/AI-Infra-Final-Project/.tmp_specvla
+output_root: /home/ubuntu/AI-Infra-Final-Project/outputs/libero_goal_selected_direct_chunk_k4
+
+benchmark:
+  suites:
+    - libero_goal
+  decoder_modes:
+    - spec
+  task_ids_by_suite:
+    libero_goal: [0, 1, 3, 5, 7, 9]
+  tasks_per_suite: 6
+  trials_per_task: 5
+  num_steps_wait: 10
+  seed: 7
+  progress_log_seconds: 300
+
+smoke:
+  tasks_per_suite: 6
+  trials_per_task: 2
+
+gate:
+  speedup_gt: 1.0
+  max_success_drop: 0.05
+
+inputs:
+  model_family: openvla
+  pretrained_checkpoint: openvla/openvla-7b-finetuned-libero-goal
+  load_in_8bit: false
+  load_in_4bit: false
+  center_crop: true
+  parallel_draft: false
+  trajectory_decoder_mode: trajectory-direct-chunk-spec
+  trajectory_allow_missing_head: true
+  trajectory_fast_draft_only: false
+  trajectory_use_draft_prefill_hidden: false
+  trajectory_smooth_phase_curvature: 6.0
+  trajectory_smooth_phase_acceleration: 8.0
+  trajectory_smooth_phase_min_displacement: 1.5
+  trajectory_head_threshold: 0.2
+  trajectory_head_top_k: 3
+  trajectory_chunk_smooth_len: 5
+  trajectory_chunk_complex_len: 5
+  trajectory_chunk_heartbeat: 8
+  trajectory_chunk_min_confident_tokens: 5
+  trajectory_chunk_max_token_delta: 32.0
+  spec_checkpoint_by_suite:
+    libero_goal: ""
+  smooth_spec_checkpoint_by_suite:
+    libero_goal: ""
+  complex_spec_checkpoint_by_suite:
+    libero_goal: ""
+  chunk_spec_checkpoint_by_suite:
+    libero_goal: /home/ubuntu/AI-Infra-Final-Project/artifacts/checkpoints/libero_goal/direct_chunk_k4/best.pt
+  accept_threshold_by_suite:
+    libero_goal: 9

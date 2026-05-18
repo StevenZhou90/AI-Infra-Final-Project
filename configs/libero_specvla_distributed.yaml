@@ -3,7 +3,7 @@ specvla_repo_path: /home/ubuntu/AI-Infra-Final-Project/.tmp_specvla
 output_root: /home/ubuntu/AI-Infra-Final-Project/outputs/libero_specvla_distributed
 artifacts_root: /home/ubuntu/AI-Infra-Final-Project/artifacts
 hf_upload:
-  enabled: true
+  enabled: false
   repo_id: StevenZhou90/ai-infra-final
 
 benchmark:
@@ -33,8 +33,18 @@ inputs:
   load_in_4bit: false
   center_crop: true
   parallel_draft: false
+  trajectory_decoder_mode: trajectory-two-head-spec
+  trajectory_allow_missing_head: true
   trajectory_fast_draft_only: true
   trajectory_use_draft_prefill_hidden: false
+  trajectory_retrieval_top_k: 4
+  trajectory_retrieval_min_confidence: 0.55
+  trajectory_kinematic_threshold: 4.0
+  trajectory_smooth_phase_curvature: 6.0
+  trajectory_smooth_phase_acceleration: 8.0
+  trajectory_smooth_phase_min_displacement: 1.5
+  trajectory_relaxed_tolerance: 2.0
+  trajectory_hybrid_max_draft_length: 7
   trajectory_fast_min_confident_tokens_by_suite:
     libero_goal: 5
     libero_object: 5
@@ -43,10 +53,20 @@ inputs:
   trajectory_head_threshold: 0.2
   trajectory_head_top_k: 3
   spec_checkpoint_by_suite:
-    libero_goal: /home/ubuntu/AI-Infra-Final-Project/artifacts/checkpoints/libero_goal/r2/best.pt
-    libero_object: /path/to/your/spec_checkpoint_object
-    libero_spatial: /path/to/your/spec_checkpoint_spatial
-    libero_10: /path/to/your/spec_checkpoint_long
+    libero_goal: ""
+    libero_object: ""
+    libero_spatial: ""
+    libero_10: ""
+  smooth_spec_checkpoint_by_suite:
+    libero_goal: /home/ubuntu/AI-Infra-Final-Project/artifacts/checkpoints/libero_goal/two_head_useful_6task_5trial_160/smooth/best.pt
+    libero_object: /home/ubuntu/AI-Infra-Final-Project/artifacts/checkpoints/libero_object/two_head_r1/smooth/best.pt
+    libero_spatial: /home/ubuntu/AI-Infra-Final-Project/artifacts/checkpoints/libero_spatial/two_head_r1/smooth/best.pt
+    libero_10: /home/ubuntu/AI-Infra-Final-Project/artifacts/checkpoints/libero_10/two_head_r1/smooth/best.pt
+  complex_spec_checkpoint_by_suite:
+    libero_goal: /home/ubuntu/AI-Infra-Final-Project/artifacts/checkpoints/libero_goal/two_head_useful_6task_5trial_160/complex/best.pt
+    libero_object: /home/ubuntu/AI-Infra-Final-Project/artifacts/checkpoints/libero_object/two_head_r1/complex/best.pt
+    libero_spatial: /home/ubuntu/AI-Infra-Final-Project/artifacts/checkpoints/libero_spatial/two_head_r1/complex/best.pt
+    libero_10: /home/ubuntu/AI-Infra-Final-Project/artifacts/checkpoints/libero_10/two_head_r1/complex/best.pt
   accept_threshold_by_suite:
     libero_goal: 9
     libero_object: 9
@@ -59,7 +79,7 @@ head_training:
     - libero_object
     - libero_spatial
     - libero_10
-  dagger_rounds: 1
+  dagger_rounds: 0
   pretrained_by_suite:
     libero_goal: openvla/openvla-7b-finetuned-libero-goal
     libero_object: openvla/openvla-7b-finetuned-libero-object
@@ -71,16 +91,27 @@ head_training:
     libero_spatial: mini
     libero_10: mini
   command_templates:
-    # Replace these commands with your suite-aware data pipeline.
     generate_data: >-
-      python scripts/generate_trajectory_head_data.py
-      --sweep {sweep}
+      python scripts/generate_libero_trajectory_head_data.py
+      --suite {suite}
+      --task-ids 0,1,3,5,7,9
+      --trials-per-task 1
+      --max-steps 80
       --out-dir {artifact_root}/data/{suite}/r{round}
       --pretrained {pretrained}
-    train: >-
+    train_smooth: >-
       python scripts/train_trajectory_head.py
       --data-dir {artifact_root}/data/{suite}/r{round}
-      --out-dir {suite_ckpt_root}/r{round}
+      --out-dir {suite_ckpt_root}/two_head_r{round}/smooth
+      --phase-filter smooth
+      --epochs 20
+      --device cuda
+    train_complex: >-
+      python scripts/train_trajectory_head.py
+      --data-dir {artifact_root}/data/{suite}/r{round}
+      --out-dir {suite_ckpt_root}/two_head_r{round}/complex
+      --phase-filter complex
+      --epochs 20
       --device cuda
     dagger_generate_data: >-
       python scripts/generate_trajectory_head_dagger_data.py

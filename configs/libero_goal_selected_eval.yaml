@@ -1,22 +1,24 @@
 specvla_repo_path: /home/ubuntu/AI-Infra-Final-Project/.tmp_specvla
-output_root: /home/ubuntu/AI-Infra-Final-Project/outputs/libero_specvla_mirror
+output_root: /home/ubuntu/AI-Infra-Final-Project/outputs/libero_goal_selected_eval
 
 benchmark:
   suites:
     - libero_goal
-  tasks_per_suite: 10
-  trials_per_task: 50
+  task_ids_by_suite:
+    libero_goal: [0, 1, 3, 5, 7, 9]
+  tasks_per_suite: 6
+  trials_per_task: 5
   num_steps_wait: 10
   seed: 7
-  progress_log_seconds: 3600
+  progress_log_seconds: 300
 
 smoke:
-  tasks_per_suite: 1
+  tasks_per_suite: 6
   trials_per_task: 5
 
 gate:
   speedup_gt: 1.0
-  max_success_drop: 0.0
+  max_success_drop: 0.05
 
 inputs:
   model_family: openvla

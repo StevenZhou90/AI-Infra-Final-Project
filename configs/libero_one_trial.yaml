@@ -1,23 +1,19 @@
 specvla_repo_path: /home/ubuntu/AI-Infra-Final-Project/.tmp_specvla
-output_root: /home/ubuntu/AI-Infra-Final-Project/outputs/libero_specvla_mirror
-
+output_root: /home/ubuntu/AI-Infra-Final-Project/outputs/libero_one_trial
 benchmark:
   suites:
-    - libero_goal
+  - libero_goal
   tasks_per_suite: 10
   trials_per_task: 50
   num_steps_wait: 10
   seed: 7
   progress_log_seconds: 3600
-
 smoke:
   tasks_per_suite: 1
-  trials_per_task: 5
-
+  trials_per_task: 1
 gate:
   speedup_gt: 1.0
   max_success_drop: 0.0
-
 inputs:
   model_family: openvla
   pretrained_checkpoint: openvla/openvla-7b-finetuned-libero-goal
@@ -43,7 +39,7 @@ inputs:
   trajectory_head_threshold: 0.2
   trajectory_head_top_k: 3
   spec_checkpoint_by_suite:
-    libero_goal: ""
+    libero_goal: ''
   smooth_spec_checkpoint_by_suite:
     libero_goal: /home/ubuntu/AI-Infra-Final-Project/artifacts/checkpoints/libero_goal/two_head_useful_6task_5trial_160/smooth/best.pt
   complex_spec_checkpoint_by_suite:
