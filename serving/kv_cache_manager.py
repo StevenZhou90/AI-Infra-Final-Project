@@ -29,7 +29,10 @@ PastKV = Any  # tuple[tuple[Tensor, Tensor], ...] or transformers.DynamicCache
 # ---------------------------------------------------------------------------
 
 def is_dynamic_cache(kv: PastKV) -> bool:
-    return hasattr(kv, "key_cache") and hasattr(kv, "value_cache")
+    return (
+        hasattr(kv, "key_cache")
+        and hasattr(kv, "value_cache")
+    ) or (hasattr(kv, "get_seq_length") and hasattr(kv, "crop"))
 
 
 def kv_seq_len(kv: PastKV) -> int:
@@ -52,6 +55,16 @@ def measure_kv_bytes(kv: PastKV) -> int:
     if kv is None:
         return 0
     if is_dynamic_cache(kv):
+        if not hasattr(kv, "key_cache") and hasattr(kv, "layers"):
+            total = 0
+            for layer in kv.layers:
+                keys = getattr(layer, "keys", None)
+                values = getattr(layer, "values", None)
+                if keys is not None:
+                    total += keys.nelement() * keys.element_size()
+                if values is not None:
+                    total += values.nelement() * values.element_size()
+            return total
         total = sum(k.nelement() * k.element_size() for k in kv.key_cache)
         total += sum(v.nelement() * v.element_size() for v in kv.value_cache)
         return total
@@ -66,6 +79,9 @@ def trim_kv(kv: PastKV, max_len: int) -> PastKV:
     if kv is None:
         return None
     if is_dynamic_cache(kv):
+        if not hasattr(kv, "key_cache") and hasattr(kv, "crop"):
+            kv.crop(max_len)
+            return kv
         for i in range(len(kv.key_cache)):
             kv.key_cache[i] = kv.key_cache[i][:, :, :max_len, :].contiguous()
             kv.value_cache[i] = kv.value_cache[i][:, :, :max_len, :].contiguous()
@@ -95,6 +111,20 @@ def clone_kv(kv: PastKV) -> PastKV:
         return None
     if is_dynamic_cache(kv):
         from transformers import DynamicCache
+
+        if not hasattr(kv, "key_cache") and hasattr(kv, "layers"):
+            cache_data = []
+            for layer in kv.layers:
+                keys = getattr(layer, "keys", None)
+                values = getattr(layer, "values", None)
+                sliding = getattr(layer, "_sliding_window_tensor", None)
+                if keys is None or values is None:
+                    continue
+                if sliding is None:
+                    cache_data.append((keys.clone(), values.clone()))
+                else:
+                    cache_data.append((keys.clone(), values.clone(), sliding.clone()))
+            return DynamicCache(cache_data)
 
         new = DynamicCache()
         new.key_cache = [k.clone() for k in kv.key_cache]
