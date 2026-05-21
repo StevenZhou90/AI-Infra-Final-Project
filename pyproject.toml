@@ -31,6 +31,10 @@ dev = [
     "pytest>=8.0.0",
     "ruff>=0.2.0",
 ]
+pi = [
+    "lerobot[pi] @ git+https://github.com/huggingface/lerobot.git@v0.4.4",
+    "hf-libero>=0.1.3,<0.2.0",
+]
 
 [tool.setuptools.packages.find]
 include = ["envs*", "policies*", "eval*", "serving*", "proto*"]
