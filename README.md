@@ -138,11 +138,54 @@ evaluation slice.
 
 - `scripts/run_openvla_sim.py`: main rollout + benchmark runner
 - `scripts/run_published_sweep.py`: published-eval-style batch sweeps
+- `scripts/run_pi0fast_chunk_eval.py`: π0-FAST LIBERO chunk-execution experiments
 - `scripts/generate_trajectory_head_data.py`: teacher rollout dataset generation
 - `scripts/generate_trajectory_head_dagger_data.py`: DAgger rollout data collection
 - `scripts/train_trajectory_head.py`: draft head training
 - `scripts/check_spec_exactness.py`: speculative exactness checks
 - `scripts/debug_depth2_verify.py`: debug utility for depth>1 verification mismatch
+
+## π0-FAST chunk testing
+
+This branch adds a parallel research path for robot-aware chunk execution with
+public π0-FAST weights in LeRobot/LIBERO.
+The LeRobot π0-FAST checkpoint depends on Google's gated PaliGemma tokenizer,
+so Hugging Face auth with accepted `google/paligemma-3b-pt-224` access is
+required before model loading.
+
+```bash
+python -m venv --system-site-packages .venv-pi
+.venv-pi/bin/python -m pip install -U pip setuptools wheel
+.venv-pi/bin/python -m pip install -e . --no-deps
+.venv-pi/bin/python -m pip install "lerobot[pi] @ git+https://github.com/huggingface/lerobot.git@v0.4.4"
+.venv-pi/bin/python -m pip install hf-libero==0.1.3 --no-deps
+.venv-pi/bin/python -m pip install hydra-core robomimic==0.2.0 robosuite==1.4.0 bddl==1.0.1 easydict thop mujoco tensorboardX imageio-ffmpeg egl_probe numba jupytext pytest
+.venv-pi/bin/python -m pip install "numpy<2" "opencv-python<4.12" "opencv-python-headless<4.12" "matplotlib>=3.5.3" hf-egl-probe
+
+HF_HOME=.hf_cache MPLCONFIGDIR=/tmp/matplotlib-cache MUJOCO_GL=egl \
+.venv-pi/bin/python scripts/run_pi0fast_chunk_eval.py \
+  --policy lerobot/pi0fast-libero \
+  --task libero_object \
+  --task-id 0 \
+  --episodes 3 \
+  --steps 300 \
+  --modes baseline,chunk_m3,chunk_m5_smooth,relaxed_chunk_retrieval_m3,exact_fast_sd_retrieval \
+  --device cuda \
+  --dtype bfloat16 \
+  --enable-fast-token-hooks \
+  --output-dir outputs/pi0fast_chunk/libero_object_task0
+```
+
+The runner reports success, model calls per control step, average
+milliseconds/control step, accepted execution windows, FAST token counts when
+available, fallback/guard reasons, and speedup versus baseline.
+With `--enable-fast-token-hooks`, the runner mirrors LeRobot's π0-FAST decode
+path to capture generated FAST token IDs and logits. `exact_fast_sd_retrieval`
+then verifies retrieved FAST-token drafts against target greedy logits and
+records exact token acceptance. Without that flag, exact-token modes fall back
+to target chunk execution and mark `exact_fast_token_hooks_unavailable`.
+The exact FAST action-end early-stop reproduction is in
+`docs/pi0fast_target_eos.md`.
 
 ## Project layout
 
