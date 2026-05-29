@@ -106,7 +106,15 @@ def preflight_validate(cfg: dict[str, Any], dry_run: bool) -> list[str]:
         direct_ckpt = inputs.get("chunk_spec_checkpoint_by_suite", {}).get(suite_name, "")
         smooth_direct_ckpt = inputs.get("smooth_chunk_spec_checkpoint_by_suite", {}).get(suite_name, "")
         complex_direct_ckpt = inputs.get("complex_chunk_spec_checkpoint_by_suite", {}).get(suite_name, "")
-        for phase_ckpt in (smooth_ckpt, complex_ckpt, direct_ckpt, smooth_direct_ckpt, complex_direct_ckpt):
+        accept_length_gate_ckpt = inputs.get("accept_length_gate_checkpoint_by_suite", {}).get(suite_name, "")
+        for phase_ckpt in (
+            smooth_ckpt,
+            complex_ckpt,
+            direct_ckpt,
+            smooth_direct_ckpt,
+            complex_direct_ckpt,
+            accept_length_gate_ckpt,
+        ):
             if phase_ckpt or not allow_missing_head:
                 paths.append(Path(phase_ckpt))
 
@@ -150,6 +158,7 @@ def build_model_cfg(
         chunk_spec_checkpoint=inputs.get("chunk_spec_checkpoint_by_suite", {}).get(suite_name, ""),
         smooth_chunk_spec_checkpoint=inputs.get("smooth_chunk_spec_checkpoint_by_suite", {}).get(suite_name, ""),
         complex_chunk_spec_checkpoint=inputs.get("complex_chunk_spec_checkpoint_by_suite", {}).get(suite_name, ""),
+        accept_length_gate_checkpoint=inputs.get("accept_length_gate_checkpoint_by_suite", {}).get(suite_name, ""),
         task_suite_name=suite_name,
         num_steps_wait=int(cfg["benchmark"]["num_steps_wait"]),
         num_trials_per_task=0,  # managed externally
@@ -335,6 +344,7 @@ def run_suite_mode(
     from serving.trajectory_draft_head import TinyTrajectoryHead
     from serving.trajectory_phase import PhaseThresholds
     from serving.trajectory_speculative_decoder import TrajectorySpeculativeDecoder
+    from serving.accept_length_gate import AcceptLengthGate
 
     model_cfg = build_model_cfg(suite_name=suite_name, cfg=cfg, mode=mode)
     set_seed_everywhere(model_cfg.seed)
@@ -373,6 +383,11 @@ def run_suite_mode(
             if model_cfg.complex_chunk_spec_checkpoint and Path(model_cfg.complex_chunk_spec_checkpoint).exists()
             else None
         )
+        accept_length_gate = (
+            AcceptLengthGate.load(model_cfg.accept_length_gate_checkpoint, device="cuda")
+            if model_cfg.accept_length_gate_checkpoint and Path(model_cfg.accept_length_gate_checkpoint).exists()
+            else None
+        )
         fast_min_confident_tokens = int(
             suite_value(
                 cfg["inputs"].get("trajectory_fast_min_confident_tokens_by_suite"),
@@ -395,7 +410,15 @@ def run_suite_mode(
             direct_chunk_head=direct_chunk_head,
             smooth_direct_chunk_head=smooth_direct_chunk_head,
             complex_direct_chunk_head=complex_direct_chunk_head,
+            accept_length_gate=accept_length_gate,
+            accept_length_min=int(cfg["inputs"].get("trajectory_accept_length_min", 0)),
+            accept_length_max=cfg["inputs"].get("trajectory_accept_length_max"),
             decoder_mode=str(cfg["inputs"].get("trajectory_decoder_mode", "trajectory-spec")),
+            band_radius=int(cfg["inputs"].get("trajectory_band_radius", 2)),
+            max_residual_bins=float(cfg["inputs"].get("trajectory_max_residual_bins", 8.0)),
+            tree_width=int(cfg["inputs"].get("trajectory_tree_width", 8)),
+            max_tree_depth=int(cfg["inputs"].get("trajectory_max_tree_depth", 1)),
+            allow_approx_tree=bool(cfg["inputs"].get("trajectory_allow_approx_tree", False)),
             fast_draft_only=bool(cfg["inputs"].get("trajectory_fast_draft_only", True)),
             fast_min_confident_tokens=fast_min_confident_tokens,
             fast_max_draft_calls=fast_max_draft_calls,
@@ -419,6 +442,35 @@ def run_suite_mode(
             chunk_heartbeat=int(cfg["inputs"].get("trajectory_chunk_heartbeat", 6)),
             chunk_min_confident_tokens=int(cfg["inputs"].get("trajectory_chunk_min_confident_tokens", 6)),
             chunk_max_token_delta=float(cfg["inputs"].get("trajectory_chunk_max_token_delta", 32.0)),
+            chunk_allow_phase_switch=bool(cfg["inputs"].get("trajectory_chunk_allow_phase_switch", False)),
+            chunk_max_kinematic_curvature=(
+                None
+                if cfg["inputs"].get("trajectory_chunk_max_kinematic_curvature") is None
+                else float(cfg["inputs"].get("trajectory_chunk_max_kinematic_curvature"))
+            ),
+            chunk_kinematic_blend=float(cfg["inputs"].get("trajectory_chunk_kinematic_blend", 0.0)),
+            chunk_max_rectification_bins=float(cfg["inputs"].get("trajectory_chunk_max_rectification_bins", 12.0)),
+            chunk_dynamic_accept=bool(cfg["inputs"].get("trajectory_chunk_dynamic_accept", False)),
+            chunk_late_head_threshold=float(cfg["inputs"].get("trajectory_chunk_late_head_threshold", 0.45)),
+            chunk_late_min_confident_tokens=int(cfg["inputs"].get("trajectory_chunk_late_min_confident_tokens", 6)),
+            chunk_late_max_token_delta=float(cfg["inputs"].get("trajectory_chunk_late_max_token_delta", 24.0)),
+            chunk_late_max_kinematic_curvature=(
+                None
+                if cfg["inputs"].get("trajectory_chunk_late_max_kinematic_curvature") is None
+                else float(cfg["inputs"].get("trajectory_chunk_late_max_kinematic_curvature"))
+            ),
+            chunk_len_after_step=cfg["inputs"].get("trajectory_chunk_len_after_step"),
+            chunk_smooth_len_late=cfg["inputs"].get("trajectory_chunk_smooth_len_late"),
+            chunk_complex_len_late=cfg["inputs"].get("trajectory_chunk_complex_len_late"),
+            chunk_allow_phase_switch_after_step=cfg["inputs"].get("trajectory_chunk_allow_phase_switch_after_step"),
+            chunk_gripper_cooldown_steps=int(cfg["inputs"].get("trajectory_chunk_gripper_cooldown_steps", 0)),
+            chunk_precision_guard_after_step=cfg["inputs"].get("trajectory_chunk_precision_guard_after_step"),
+            chunk_precision_guard_token_delta=float(
+                cfg["inputs"].get("trajectory_chunk_precision_guard_token_delta", 0.0)
+            ),
+            chunk_precision_guard_history_delta=float(
+                cfg["inputs"].get("trajectory_chunk_precision_guard_history_delta", 0.0)
+            ),
         )
 
     task_suite = benchmark.get_benchmark_dict()[suite_name]()
@@ -426,6 +478,10 @@ def run_suite_mode(
     task_ids = task_ids_for_suite(cfg, suite_name, n_tasks)
     max_steps = SUITE_STEP_CAPS[suite_name]
     num_steps_wait = int(cfg["benchmark"]["num_steps_wait"])
+    log_chunk_decisions = bool(cfg["inputs"].get("trajectory_log_chunk_decisions", False))
+    chunk_decision_path = run_dir / f"{mode}_{suite_name}_chunk_decisions.jsonl"
+    log_action_trace = bool(cfg["inputs"].get("trajectory_log_action_trace", False))
+    action_trace_path = run_dir / f"{mode}_{suite_name}_action_trace.jsonl"
 
     for task_id in task_ids:
         task = task_suite.get_task(task_id)
@@ -464,6 +520,35 @@ def run_suite_mode(
                         cfg["inputs"].get("trajectory_chunk_complex_len", spec_decoder.chunk_complex_len),
                     )
                 )
+                spec_decoder.chunk_dynamic_accept = bool(
+                    task_value(
+                        cfg["inputs"].get("trajectory_chunk_dynamic_accept_by_task"),
+                        suite_name,
+                        task_id,
+                        cfg["inputs"].get("trajectory_chunk_dynamic_accept", spec_decoder.chunk_dynamic_accept),
+                    )
+                )
+                len_after_step = task_value(
+                    cfg["inputs"].get("trajectory_chunk_len_after_step_by_task"),
+                    suite_name,
+                    task_id,
+                    cfg["inputs"].get("trajectory_chunk_len_after_step", spec_decoder.chunk_len_after_step),
+                )
+                spec_decoder.chunk_len_after_step = None if len_after_step is None else int(len_after_step)
+                smooth_len_late = task_value(
+                    cfg["inputs"].get("trajectory_chunk_smooth_len_late_by_task"),
+                    suite_name,
+                    task_id,
+                    cfg["inputs"].get("trajectory_chunk_smooth_len_late", spec_decoder.chunk_smooth_len_late),
+                )
+                spec_decoder.chunk_smooth_len_late = None if smooth_len_late is None else int(smooth_len_late)
+                complex_len_late = task_value(
+                    cfg["inputs"].get("trajectory_chunk_complex_len_late_by_task"),
+                    suite_name,
+                    task_id,
+                    cfg["inputs"].get("trajectory_chunk_complex_len_late", spec_decoder.chunk_complex_len_late),
+                )
+                spec_decoder.chunk_complex_len_late = None if complex_len_late is None else int(complex_len_late)
                 spec_decoder.chunk_heartbeat = int(
                     task_value(
                         cfg["inputs"].get("trajectory_chunk_heartbeat_by_task"),
@@ -487,6 +572,102 @@ def run_suite_mode(
                         task_id,
                         cfg["inputs"].get("trajectory_chunk_max_token_delta", spec_decoder.chunk_max_token_delta),
                     )
+                )
+                spec_decoder.chunk_allow_phase_switch = bool(
+                    task_value(
+                        cfg["inputs"].get("trajectory_chunk_allow_phase_switch_by_task"),
+                        suite_name,
+                        task_id,
+                        cfg["inputs"].get("trajectory_chunk_allow_phase_switch", spec_decoder.chunk_allow_phase_switch),
+                    )
+                )
+                allow_phase_after = task_value(
+                    cfg["inputs"].get("trajectory_chunk_allow_phase_switch_after_step_by_task"),
+                    suite_name,
+                    task_id,
+                    cfg["inputs"].get(
+                        "trajectory_chunk_allow_phase_switch_after_step",
+                        spec_decoder.chunk_allow_phase_switch_after_step,
+                    ),
+                )
+                spec_decoder.chunk_allow_phase_switch_after_step = (
+                    None if allow_phase_after is None else int(allow_phase_after)
+                )
+                curvature_cfg = task_value(
+                    cfg["inputs"].get("trajectory_chunk_max_kinematic_curvature_by_task"),
+                    suite_name,
+                    task_id,
+                    cfg["inputs"].get(
+                        "trajectory_chunk_max_kinematic_curvature",
+                        spec_decoder.chunk_max_kinematic_curvature,
+                    ),
+                )
+                spec_decoder.chunk_max_kinematic_curvature = None if curvature_cfg is None else float(curvature_cfg)
+                spec_decoder.chunk_kinematic_blend = float(
+                    task_value(
+                        cfg["inputs"].get("trajectory_chunk_kinematic_blend_by_task"),
+                        suite_name,
+                        task_id,
+                        cfg["inputs"].get("trajectory_chunk_kinematic_blend", spec_decoder.chunk_kinematic_blend),
+                    )
+                )
+                spec_decoder.chunk_max_rectification_bins = float(
+                    task_value(
+                        cfg["inputs"].get("trajectory_chunk_max_rectification_bins_by_task"),
+                        suite_name,
+                        task_id,
+                        cfg["inputs"].get(
+                            "trajectory_chunk_max_rectification_bins",
+                            spec_decoder.chunk_max_rectification_bins,
+                        ),
+                    )
+                )
+                spec_decoder.chunk_dynamic_accept = bool(
+                    task_value(
+                        cfg["inputs"].get("trajectory_chunk_dynamic_accept_by_task"),
+                        suite_name,
+                        task_id,
+                        cfg["inputs"].get("trajectory_chunk_dynamic_accept", spec_decoder.chunk_dynamic_accept),
+                    )
+                )
+                spec_decoder.chunk_late_head_threshold = float(
+                    task_value(
+                        cfg["inputs"].get("trajectory_chunk_late_head_threshold_by_task"),
+                        suite_name,
+                        task_id,
+                        cfg["inputs"].get("trajectory_chunk_late_head_threshold", spec_decoder.chunk_late_head_threshold),
+                    )
+                )
+                spec_decoder.chunk_late_min_confident_tokens = int(
+                    task_value(
+                        cfg["inputs"].get("trajectory_chunk_late_min_confident_tokens_by_task"),
+                        suite_name,
+                        task_id,
+                        cfg["inputs"].get(
+                            "trajectory_chunk_late_min_confident_tokens",
+                            spec_decoder.chunk_late_min_confident_tokens,
+                        ),
+                    )
+                )
+                spec_decoder.chunk_late_max_token_delta = float(
+                    task_value(
+                        cfg["inputs"].get("trajectory_chunk_late_max_token_delta_by_task"),
+                        suite_name,
+                        task_id,
+                        cfg["inputs"].get("trajectory_chunk_late_max_token_delta", spec_decoder.chunk_late_max_token_delta),
+                    )
+                )
+                late_curvature_cfg = task_value(
+                    cfg["inputs"].get("trajectory_chunk_late_max_kinematic_curvature_by_task"),
+                    suite_name,
+                    task_id,
+                    cfg["inputs"].get(
+                        "trajectory_chunk_late_max_kinematic_curvature",
+                        spec_decoder.chunk_late_max_kinematic_curvature,
+                    ),
+                )
+                spec_decoder.chunk_late_max_kinematic_curvature = (
+                    None if late_curvature_cfg is None else float(late_curvature_cfg)
                 )
                 spec_decoder.head_threshold = float(
                     task_value(
@@ -528,11 +709,42 @@ def run_suite_mode(
             t = 0
             inference_ms_total = 0.0
             done = False
+            action_trace_rows: list[dict[str, Any]] = []
             while t < max_steps + num_steps_wait:
                 if t < num_steps_wait:
                     obs, _, _, _ = env.step(get_libero_dummy_action(model_cfg.model_family))
                     t += 1
                     continue
+                if mode == "spec":
+                    assert spec_decoder is not None
+                    tic = time.perf_counter()
+                    action = spec_decoder.try_predict_buffered_action(
+                        unnorm_key=model_cfg.unnorm_key,
+                        task_key=f"{suite_name}:{task_id}:{task_description}",
+                    )
+                    if action is not None:
+                        inference_ms_total += (time.perf_counter() - tic) * 1000.0
+                        action = normalize_gripper_action(action, binarize=True)
+                        if model_cfg.model_family == "openvla":
+                            action = invert_gripper_action(action)
+                        env_action = action.tolist()
+                        if log_action_trace:
+                            action_trace_rows.append(
+                                {
+                                    "suite": suite_name,
+                                    "task_id": task_id,
+                                    "trial": episode_idx,
+                                    "mode": mode,
+                                    "action_step": max(t - num_steps_wait, 0),
+                                    "source": "buffer",
+                                    "action": [float(x) for x in env_action],
+                                }
+                            )
+                        obs, _, done, _ = env.step(env_action)
+                        t += 1
+                        if done:
+                            break
+                        continue
                 img = get_libero_image(obs, resize_size)
                 observation = {
                     "full_image": img,
@@ -570,22 +782,58 @@ def run_suite_mode(
                 action = normalize_gripper_action(action, binarize=True)
                 if model_cfg.model_family == "openvla":
                     action = invert_gripper_action(action)
-                obs, _, done, _ = env.step(action.tolist())
+                env_action = action.tolist()
+                if log_action_trace:
+                    action_trace_rows.append(
+                        {
+                            "suite": suite_name,
+                            "task_id": task_id,
+                            "trial": episode_idx,
+                            "mode": mode,
+                            "action_step": max(t - num_steps_wait, 0),
+                            "source": "model",
+                            "action": [float(x) for x in env_action],
+                        }
+                    )
+                obs, _, done, _ = env.step(env_action)
                 t += 1
                 if done:
                     break
-            rows.append(
-                {
-                    "suite": suite_name,
-                    "task_id": task_id,
-                    "trial": episode_idx,
-                    "mode": mode,
-                    "success": bool(done),
-                    "steps": max(t - num_steps_wait, 0),
-                    "inference_ms_total": inference_ms_total,
-                    "spec_stats": spec_decoder.stats.summary() if spec_decoder is not None else None,
-                }
-            )
+            episode_row = {
+                "suite": suite_name,
+                "task_id": task_id,
+                "trial": episode_idx,
+                "mode": mode,
+                "success": bool(done),
+                "steps": max(t - num_steps_wait, 0),
+                "inference_ms_total": inference_ms_total,
+                "spec_stats": spec_decoder.stats.summary() if spec_decoder is not None else None,
+            }
+            if log_chunk_decisions and spec_decoder is not None:
+                decision_rows = []
+                for record in spec_decoder.chunk_decision_log:
+                    enriched = dict(record)
+                    enriched.update(
+                        {
+                            "suite": suite_name,
+                            "task_id": task_id,
+                            "trial": episode_idx,
+                            "episode_success": bool(done),
+                            "episode_steps": max(t - num_steps_wait, 0),
+                        }
+                    )
+                    decision_rows.append(enriched)
+                append_jsonl(chunk_decision_path, decision_rows)
+                episode_row["chunk_decision_log"] = str(chunk_decision_path)
+                episode_row["chunk_decision_count"] = len(decision_rows)
+            if log_action_trace:
+                for record in action_trace_rows:
+                    record["episode_success"] = bool(done)
+                    record["episode_steps"] = max(t - num_steps_wait, 0)
+                append_jsonl(action_trace_path, action_trace_rows)
+                episode_row["action_trace_log"] = str(action_trace_path)
+                episode_row["action_trace_count"] = len(action_trace_rows)
+            rows.append(episode_row)
             if progress_logger:
                 progress_logger.maybe_emit(
                     mode=mode_label,
@@ -613,6 +861,14 @@ def write_json(path: Path, payload: Any) -> None:
 
 def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     with path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row) + "\n")
+
+
+def append_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    with path.open("a", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row) + "\n")
 

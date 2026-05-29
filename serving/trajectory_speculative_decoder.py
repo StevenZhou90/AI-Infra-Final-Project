@@ -16,6 +16,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from serving.accept_length_gate import AcceptLengthGate, build_accept_length_features
 from serving.kv_cache_manager import PastKV, kv_seq_len, trim_kv
 from serving.trajectory_draft_head import TinyTrajectoryHead, bins_to_token_ids, token_ids_to_bins
 from serving.trajectory_phase import PhaseThresholds, label_phase
@@ -93,6 +94,9 @@ class TrajectorySpecStats:
     chunk_smooth_actions: int = 0
     chunk_complex_actions: int = 0
     chunk_guard_rejects: int = 0
+    accept_length_gate_calls: int = 0
+    accept_length_gate_total: int = 0
+    accept_length_gate_zeroes: int = 0
     draft_time_ms: float = 0.0
     verify_time_ms: float = 0.0
 
@@ -141,6 +145,12 @@ class TrajectorySpecStats:
             "chunk_smooth_actions": self.chunk_smooth_actions,
             "chunk_complex_actions": self.chunk_complex_actions,
             "chunk_guard_rejects": self.chunk_guard_rejects,
+            "accept_length_gate_calls": self.accept_length_gate_calls,
+            "accept_length_gate_avg": round(
+                self.accept_length_gate_total / max(self.accept_length_gate_calls, 1),
+                3,
+            ),
+            "accept_length_gate_zeroes": self.accept_length_gate_zeroes,
             "draft_ms": round(self.draft_time_ms, 1),
             "verify_ms": round(self.verify_time_ms, 1),
         }
@@ -176,6 +186,9 @@ class TrajectorySpeculativeDecoder:
         direct_chunk_head: TinyTrajectoryHead | None = None,
         smooth_direct_chunk_head: TinyTrajectoryHead | None = None,
         complex_direct_chunk_head: TinyTrajectoryHead | None = None,
+        accept_length_gate: AcceptLengthGate | None = None,
+        accept_length_min: int = 0,
+        accept_length_max: int | None = None,
         head_threshold: float = 0.5,
         head_top_k: int = 3,
         decoder_mode: str = "trajectory-spec",
@@ -201,6 +214,23 @@ class TrajectorySpeculativeDecoder:
         chunk_heartbeat: int = 6,
         chunk_min_confident_tokens: int = 6,
         chunk_max_token_delta: float = 32.0,
+        chunk_allow_phase_switch: bool = False,
+        chunk_max_kinematic_curvature: float | None = None,
+        chunk_kinematic_blend: float = 0.0,
+        chunk_max_rectification_bins: float = 12.0,
+        chunk_dynamic_accept: bool = False,
+        chunk_late_head_threshold: float = 0.45,
+        chunk_late_min_confident_tokens: int = 6,
+        chunk_late_max_token_delta: float = 24.0,
+        chunk_late_max_kinematic_curvature: float | None = 8.0,
+        chunk_len_after_step: int | None = None,
+        chunk_smooth_len_late: int | None = None,
+        chunk_complex_len_late: int | None = None,
+        chunk_allow_phase_switch_after_step: int | None = None,
+        chunk_gripper_cooldown_steps: int = 0,
+        chunk_precision_guard_after_step: int | None = None,
+        chunk_precision_guard_token_delta: float = 0.0,
+        chunk_precision_guard_history_delta: float = 0.0,
     ) -> None:
         self.model = model
         self.decode_model = getattr(model, "language_model", model)
@@ -220,6 +250,9 @@ class TrajectorySpeculativeDecoder:
         self.direct_chunk_head = direct_chunk_head
         self.smooth_direct_chunk_head = smooth_direct_chunk_head
         self.complex_direct_chunk_head = complex_direct_chunk_head
+        self.accept_length_gate = accept_length_gate
+        self.accept_length_min = max(0, int(accept_length_min))
+        self.accept_length_max = None if accept_length_max is None else max(0, int(accept_length_max))
         self.head_threshold = head_threshold
         self.head_top_k = head_top_k
         self.decoder_mode = decoder_mode
@@ -253,6 +286,33 @@ class TrajectorySpeculativeDecoder:
         self.chunk_heartbeat = max(1, int(chunk_heartbeat))
         self.chunk_min_confident_tokens = max(1, int(chunk_min_confident_tokens))
         self.chunk_max_token_delta = float(chunk_max_token_delta)
+        self.chunk_allow_phase_switch = bool(chunk_allow_phase_switch)
+        self.chunk_max_kinematic_curvature = (
+            None if chunk_max_kinematic_curvature is None else float(chunk_max_kinematic_curvature)
+        )
+        self.chunk_kinematic_blend = max(0.0, min(float(chunk_kinematic_blend), 1.0))
+        self.chunk_max_rectification_bins = max(0.0, float(chunk_max_rectification_bins))
+        self.chunk_dynamic_accept = bool(chunk_dynamic_accept)
+        self.chunk_late_head_threshold = float(chunk_late_head_threshold)
+        self.chunk_late_min_confident_tokens = max(1, int(chunk_late_min_confident_tokens))
+        self.chunk_late_max_token_delta = float(chunk_late_max_token_delta)
+        self.chunk_late_max_kinematic_curvature = (
+            None
+            if chunk_late_max_kinematic_curvature is None
+            else float(chunk_late_max_kinematic_curvature)
+        )
+        self.chunk_len_after_step = None if chunk_len_after_step is None else int(chunk_len_after_step)
+        self.chunk_smooth_len_late = None if chunk_smooth_len_late is None else max(1, int(chunk_smooth_len_late))
+        self.chunk_complex_len_late = None if chunk_complex_len_late is None else max(1, int(chunk_complex_len_late))
+        self.chunk_allow_phase_switch_after_step = (
+            None if chunk_allow_phase_switch_after_step is None else int(chunk_allow_phase_switch_after_step)
+        )
+        self.chunk_gripper_cooldown_steps = max(0, int(chunk_gripper_cooldown_steps))
+        self.chunk_precision_guard_after_step = (
+            None if chunk_precision_guard_after_step is None else int(chunk_precision_guard_after_step)
+        )
+        self.chunk_precision_guard_token_delta = max(0.0, float(chunk_precision_guard_token_delta))
+        self.chunk_precision_guard_history_delta = max(0.0, float(chunk_precision_guard_history_delta))
         self.history: list[np.ndarray] = []
         self.token_history: list[np.ndarray] = []
         self._chunk_buffer: list[dict[str, Any]] = []
@@ -261,8 +321,10 @@ class TrajectorySpeculativeDecoder:
         self._action_step = 0
         self._fast_draft_calls_used = 0
         self._steps_since_vla_refresh = 0
+        self._chunk_gripper_cooldown_remaining = 0
         self._stationary_steps = 0
         self._last_residual_std = np.zeros(7, dtype=np.float32)
+        self.chunk_decision_log: list[dict[str, Any]] = []
         self.stats = TrajectorySpecStats()
 
     def set_decoder_mode(self, decoder_mode: str) -> None:
@@ -282,7 +344,9 @@ class TrajectorySpeculativeDecoder:
         self._action_step = 0
         self._fast_draft_calls_used = 0
         self._steps_since_vla_refresh = 0
+        self._chunk_gripper_cooldown_remaining = 0
         self._stationary_steps = 0
+        self.chunk_decision_log.clear()
         self.stats = TrajectorySpecStats()
 
     @torch.no_grad()
@@ -408,6 +472,23 @@ class TrajectorySpeculativeDecoder:
         action = self.decode_action_ids(generated_ids[0, -max_new_tokens:], unnorm_key)
         self.update_history(action, verified_token_ids)
         return action
+
+    @torch.no_grad()
+    def try_predict_buffered_action(self, unnorm_key: str, task_key: str | None = None) -> np.ndarray | None:
+        """Consume a queued chunk action without requiring OpenVLA inputs.
+
+        Chunk speculation alternates expensive OpenVLA anchor calls with cheap
+        buffered actions. The runner can call this before image/token
+        preprocessing to avoid work that the decoder will not use.
+        """
+        if not (self.use_chunk_spec or self.use_direct_chunk_spec):
+            return None
+        refresh_reason = self._chunk_refresh_reason()
+        if refresh_reason is not None:
+            return None
+        self.stats.calls += 1
+        self._current_task_key = task_key or unnorm_key
+        return self._consume_chunk_buffered_action(unnorm_key)
 
     @torch.no_grad()
     def generate_action_ids(
@@ -704,37 +785,64 @@ class TrajectorySpeculativeDecoder:
     def _predict_action_chunked(self, inputs, unnorm_key: str, max_new_tokens: int) -> np.ndarray:
         refresh_reason = self._chunk_refresh_reason()
         if refresh_reason is None:
-            item = self._chunk_buffer.pop(0)
-            token_ids = np.asarray(item["token_ids"], dtype=np.int64)
-            action = self.decode_action_ids(torch.as_tensor(token_ids, dtype=torch.long), unnorm_key)
-            self.stats.chunk_buffer_hits += 1
-            if item.get("phase") == "smooth":
-                self.stats.chunk_smooth_actions += 1
-            else:
-                self.stats.chunk_complex_actions += 1
-            self.update_history(action, token_ids)
-            self._steps_since_vla_refresh += 1
-            return action
+            return self._consume_chunk_buffered_action(unnorm_key)
 
         self._record_chunk_refresh(refresh_reason)
         self._chunk_buffer.clear()
         self.stats.chunk_anchor_calls += 1
         self.stats.fallback_calls += 1
-        self.stats.target_forwards += max_new_tokens + 1
-        out = self.model.generate(
-            inputs["input_ids"],
-            pixel_values=inputs.get("pixel_values"),
-            attention_mask=inputs.get("attention_mask"),
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            use_cache=True,
-        )
+        prefill_hidden: torch.Tensor | None = None
+        prefill_kw = {
+            key: value
+            for key, value in {
+                "pixel_values": inputs.get("pixel_values"),
+                "attention_mask": inputs.get("attention_mask"),
+            }.items()
+            if value is not None
+        }
+        if self._needs_draft_prefill_hidden():
+            prefill_out, prefill_hidden = capture_prefill_hidden_openvla(
+                self.model,
+                input_ids=inputs["input_ids"],
+                device=self.device,
+                **prefill_kw,
+            )
+            self.stats.target_forwards += 1
+            out = self._generate_baseline_from_prefill(
+                input_ids=inputs["input_ids"],
+                prefill_out=prefill_out,
+                prefill_kwargs=prefill_kw,
+                max_new_tokens=max_new_tokens,
+            )
+        else:
+            self.stats.target_forwards += max_new_tokens + 1
+            out = self.model.generate(
+                inputs["input_ids"],
+                pixel_values=inputs.get("pixel_values"),
+                attention_mask=inputs.get("attention_mask"),
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                use_cache=True,
+            )
         token_ids_t = out[0, -max_new_tokens:].detach().cpu()
         token_ids = token_ids_t.numpy()
         action = self.decode_action_ids(token_ids_t, unnorm_key)
         self.update_history(action, token_ids)
         self._steps_since_vla_refresh = 0
-        self._fill_chunk_buffer(max_new_tokens=max_new_tokens)
+        self._fill_chunk_buffer(max_new_tokens=max_new_tokens, prefill_hidden=prefill_hidden)
+        return action
+
+    def _consume_chunk_buffered_action(self, unnorm_key: str) -> np.ndarray:
+        item = self._chunk_buffer.pop(0)
+        token_ids = np.asarray(item["token_ids"], dtype=np.int64)
+        action = self.decode_action_ids(torch.as_tensor(token_ids, dtype=torch.long), unnorm_key)
+        self.stats.chunk_buffer_hits += 1
+        if item.get("phase") == "smooth":
+            self.stats.chunk_smooth_actions += 1
+        else:
+            self.stats.chunk_complex_actions += 1
+        self.update_history(action, token_ids)
+        self._steps_since_vla_refresh += 1
         return action
 
     def _record_chunk_refresh(self, reason: str) -> None:
@@ -742,6 +850,8 @@ class TrajectorySpeculativeDecoder:
         self.stats.chunk_refresh_reasons[reason] = self.stats.chunk_refresh_reasons.get(reason, 0) + 1
 
     def _chunk_refresh_reason(self) -> str | None:
+        if self._chunk_gripper_cooldown_remaining > 0:
+            return "gripper_cooldown"
         if not self._chunk_buffer:
             return "empty_buffer"
         if self._steps_since_vla_refresh >= self.chunk_heartbeat:
@@ -756,10 +866,49 @@ class TrajectorySpeculativeDecoder:
         if next_ids.shape[0] >= 6 and float(np.mean(np.abs(next_ids[:6] - prev[:6]))) > self.chunk_max_token_delta:
             self.stats.chunk_guard_rejects += 1
             return "large_delta"
-        if self._buffer_phase_switches_to_complex():
+        if self._buffer_precision_guard_triggers(next_ids, prev):
+            self.stats.chunk_guard_rejects += 1
+            return "precision_guard"
+        if self._buffer_kinematic_curvature_exceeds_limit():
+            self.stats.chunk_guard_rejects += 1
+            return "kinematic_curvature"
+        phase_switch_allowed = self.chunk_allow_phase_switch or (
+            self.chunk_allow_phase_switch_after_step is not None
+            and self._action_step >= self.chunk_allow_phase_switch_after_step
+        )
+        if not phase_switch_allowed and self._buffer_phase_switches_to_complex():
             self.stats.chunk_guard_rejects += 1
             return "phase_switch"
         return None
+
+    def _buffer_precision_guard_triggers(self, next_ids: np.ndarray, prev: np.ndarray) -> bool:
+        if self.chunk_precision_guard_after_step is None:
+            return False
+        if self._action_step < self.chunk_precision_guard_after_step:
+            return False
+        if self.chunk_precision_guard_token_delta <= 0.0 or next_ids.shape[0] < 6:
+            return False
+        proposal_delta = float(np.mean(np.abs(next_ids[:6].astype(np.float32) - prev[:6].astype(np.float32))))
+        if proposal_delta >= self.chunk_precision_guard_token_delta:
+            return False
+        if self.chunk_precision_guard_history_delta <= 0.0 or len(self.token_history) < 2:
+            return True
+        prev2 = np.asarray(self.token_history[-2], dtype=np.float32)
+        history_delta = float(np.mean(np.abs(prev[:6].astype(np.float32) - prev2[:6])))
+        return history_delta < self.chunk_precision_guard_history_delta
+
+    def _buffer_kinematic_curvature_exceeds_limit(self) -> bool:
+        if self.chunk_max_kinematic_curvature is None:
+            return False
+        if len(self.token_history) < 2 or not self._chunk_buffer:
+            return False
+        prev2 = np.asarray(self.token_history[-2], dtype=np.float32)
+        prev1 = np.asarray(self.token_history[-1], dtype=np.float32)
+        nxt = np.asarray(self._chunk_buffer[0]["token_ids"], dtype=np.float32)
+        if nxt.shape[0] < 6:
+            return False
+        curvature = float(np.mean(np.abs(nxt[:6] - 2.0 * prev1[:6] + prev2[:6])))
+        return curvature > self.chunk_max_kinematic_curvature
 
     def _buffer_phase_switches_to_complex(self) -> bool:
         if len(self.token_history) < 2 or not self._chunk_buffer:
@@ -769,7 +918,7 @@ class TrajectorySpeculativeDecoder:
         bin_hist = token_ids_to_bins(np.stack(history, axis=0), self.model.vocab_size).numpy()
         return label_phase(bin_hist, thresholds=self.phase_thresholds) == "complex" and self._chunk_buffer[0].get("phase") == "smooth"
 
-    def _fill_chunk_buffer(self, max_new_tokens: int) -> None:
+    def _fill_chunk_buffer(self, max_new_tokens: int, prefill_hidden: torch.Tensor | None = None) -> None:
         if not self._has_any_head() or len(self.token_history) < self.min_history:
             return
         token_history = [np.asarray(row, dtype=np.int64).copy() for row in self.token_history]
@@ -778,13 +927,17 @@ class TrajectorySpeculativeDecoder:
             or self.smooth_direct_chunk_head is not None
             or self.complex_direct_chunk_head is not None
         ):
-            self._fill_direct_chunk_buffer(token_history=token_history, max_new_tokens=max_new_tokens)
+            self._fill_direct_chunk_buffer(
+                token_history=token_history,
+                max_new_tokens=max_new_tokens,
+                prefill_hidden=prefill_hidden,
+            )
             return
         head, phase = self._select_phase_head_for_history(token_history)
         if head is None:
             self.stats.two_head_fallback_calls += 1
             return
-        total_len = self.chunk_smooth_len if phase == "smooth" else self.chunk_complex_len
+        total_len = self._chunk_len_for_phase(phase)
         draft_count = max(0, total_len - 1)
         for _ in range(draft_count):
             if len(token_history) < head.config.history_size:
@@ -792,11 +945,12 @@ class TrajectorySpeculativeDecoder:
             draft_ids, _bands, _residual_bins, confidence = self._draft_learned_head_from_history(
                 head=head,
                 token_history=token_history,
-                prefill_hidden=None,
+                prefill_hidden=prefill_hidden,
             )
             if int(np.sum(confidence[:max_new_tokens])) < self.chunk_min_confident_tokens:
                 break
             token_ids = draft_ids[0, :max_new_tokens].detach().cpu().numpy()
+            token_ids = self._rectify_chunk_tokens(token_ids, token_history)
             if token_history and token_ids.shape[0] >= 7 and int(token_ids[6]) != int(token_history[-1][6]):
                 break
             if token_history and token_ids.shape[0] >= 6:
@@ -818,7 +972,12 @@ class TrajectorySpeculativeDecoder:
             else:
                 self.stats.two_head_complex_calls += 1
 
-    def _fill_direct_chunk_buffer(self, token_history: list[np.ndarray], max_new_tokens: int) -> None:
+    def _fill_direct_chunk_buffer(
+        self,
+        token_history: list[np.ndarray],
+        max_new_tokens: int,
+        prefill_hidden: torch.Tensor | None = None,
+    ) -> None:
         phase = label_phase(
             token_ids_to_bins(np.stack(token_history, axis=0), self.model.vocab_size).numpy(),
             thresholds=self.phase_thresholds,
@@ -828,7 +987,7 @@ class TrajectorySpeculativeDecoder:
             self.stats.two_head_fallback_calls += 1
             return
 
-        total_len = self.chunk_smooth_len if phase == "smooth" else self.chunk_complex_len
+        total_len = self._chunk_len_for_phase(phase)
         max_buffer = max(0, min(total_len - 1, int(head.config.action_horizon)))
         if max_buffer <= 0:
             return
@@ -836,32 +995,80 @@ class TrajectorySpeculativeDecoder:
         top_bins, _top_probs, max_probs = self._predict_head_topk_from_history(
             head=head,
             token_history=token_history,
-            prefill_hidden=None,
+            prefill_hidden=prefill_hidden,
         )
         if top_bins.dim() == 3:
             top_bins = top_bins.unsqueeze(0)
             max_probs = max_probs.unsqueeze(0)
         top_bins = top_bins[0].detach().cpu()
         max_probs_np = max_probs[0].detach().cpu().numpy()
+        pred_bins = top_bins[:, :, 0].numpy()
+        decision_record: dict[str, Any] = {
+            "task_key": self._current_task_key,
+            "action_step": int(self._action_step),
+            "phase": phase,
+            "chunk_total_len": int(total_len),
+            "head_horizon": int(head.config.action_horizon),
+            "max_buffer_initial": int(max_buffer),
+            "history_tokens": [np.asarray(row, dtype=np.int64).tolist() for row in token_history[-self.history_size :]],
+            "predicted_bins": np.asarray(pred_bins[:max_buffer], dtype=np.int64).tolist(),
+            "max_probs": np.asarray(max_probs_np[:max_buffer], dtype=np.float32).round(6).tolist(),
+            "accepted_buffer": [],
+            "stop_reason": "not_started",
+        }
+        max_buffer = self._apply_accept_length_gate(
+            token_history=token_history,
+            predicted_bins=pred_bins,
+            max_probs=max_probs_np,
+            phase=phase,
+            max_buffer=max_buffer,
+        )
+        decision_record["max_buffer_after_gate"] = int(max_buffer)
+        if max_buffer <= 0:
+            decision_record["stop_reason"] = "gate_zero"
+            self.chunk_decision_log.append(decision_record)
+            return
 
         for step_idx in range(min(max_buffer, top_bins.shape[0])):
             confidence = max_probs_np[step_idx] >= self.head_threshold
             if int(np.sum(confidence[:max_new_tokens])) < self.chunk_min_confident_tokens:
+                decision_record["stop_reason"] = f"low_confidence:{step_idx}"
                 break
             center_bins = top_bins[step_idx, :, 0]
             token_ids = bins_to_token_ids(center_bins, self.model.vocab_size).long().numpy()[:max_new_tokens]
+            token_ids = self._rectify_chunk_tokens(token_ids, token_history)
             if token_history and token_ids.shape[0] >= 7 and int(token_ids[6]) != int(token_history[-1][6]):
+                decision_record["stop_reason"] = f"gripper_change:{step_idx}"
                 break
             if token_history and token_ids.shape[0] >= 6:
                 delta = float(np.mean(np.abs(token_ids[:6] - token_history[-1][:6])))
                 if delta > self.chunk_max_token_delta:
+                    decision_record["stop_reason"] = f"large_delta:{step_idx}:{delta:.3f}"
                     break
+            if not self._dynamic_chunk_step_allowed(
+                step_idx=step_idx,
+                token_ids=token_ids,
+                confidence=confidence,
+                max_probs=max_probs_np[step_idx],
+                token_history=token_history,
+                max_new_tokens=max_new_tokens,
+            ):
+                decision_record["stop_reason"] = f"dynamic_reject:{step_idx}"
+                break
             self._chunk_buffer.append(
                 {
                     "token_ids": token_ids.copy(),
                     "phase": phase,
                     "confidence": int(np.sum(confidence[:max_new_tokens])),
                     "direct_step": step_idx,
+                }
+            )
+            decision_record["accepted_buffer"].append(
+                {
+                    "step_idx": int(step_idx),
+                    "token_ids": np.asarray(token_ids, dtype=np.int64).tolist(),
+                    "confident_tokens": int(np.sum(confidence[:max_new_tokens])),
+                    "mean_prob": float(np.mean(max_probs_np[step_idx, :max_new_tokens])),
                 }
             )
             token_history.append(token_ids.copy())
@@ -871,6 +1078,104 @@ class TrajectorySpeculativeDecoder:
                 self.stats.two_head_smooth_calls += 1
             else:
                 self.stats.two_head_complex_calls += 1
+        else:
+            decision_record["stop_reason"] = "exhausted"
+        decision_record["accepted_count"] = len(decision_record["accepted_buffer"])
+        self.chunk_decision_log.append(decision_record)
+
+    def _chunk_len_for_phase(self, phase: str) -> int:
+        if self.chunk_len_after_step is not None and self._action_step >= self.chunk_len_after_step:
+            if phase == "smooth" and self.chunk_smooth_len_late is not None:
+                return self.chunk_smooth_len_late
+            if phase != "smooth" and self.chunk_complex_len_late is not None:
+                return self.chunk_complex_len_late
+        return self.chunk_smooth_len if phase == "smooth" else self.chunk_complex_len
+
+    def _dynamic_chunk_step_allowed(
+        self,
+        *,
+        step_idx: int,
+        token_ids: np.ndarray,
+        confidence: np.ndarray,
+        max_probs: np.ndarray,
+        token_history: list[np.ndarray],
+        max_new_tokens: int,
+    ) -> bool:
+        if not self.chunk_dynamic_accept or step_idx == 0:
+            return True
+
+        late_confidence = np.asarray(max_probs, dtype=np.float32) >= self.chunk_late_head_threshold
+        if int(np.sum(late_confidence[:max_new_tokens])) < self.chunk_late_min_confident_tokens:
+            return False
+
+        # Later speculative actions compound robot-state error, so require both
+        # the old confidence mask and a stricter late-step threshold.
+        if int(np.sum(np.asarray(confidence, dtype=bool)[:max_new_tokens])) < self.chunk_min_confident_tokens:
+            return False
+
+        if token_history and token_ids.shape[0] >= 6:
+            prev = np.asarray(token_history[-1], dtype=np.float32)
+            delta = float(np.mean(np.abs(token_ids[:6].astype(np.float32) - prev[:6])))
+            if delta > self.chunk_late_max_token_delta:
+                return False
+
+        if self.chunk_late_max_kinematic_curvature is not None and len(token_history) >= 2 and token_ids.shape[0] >= 6:
+            prev2 = np.asarray(token_history[-2], dtype=np.float32)
+            prev1 = np.asarray(token_history[-1], dtype=np.float32)
+            curvature = float(np.mean(np.abs(token_ids[:6].astype(np.float32) - 2.0 * prev1[:6] + prev2[:6])))
+            if curvature > self.chunk_late_max_kinematic_curvature:
+                return False
+
+        return True
+
+    def _rectify_chunk_tokens(self, token_ids: np.ndarray, token_history: list[np.ndarray]) -> np.ndarray:
+        if self.chunk_kinematic_blend <= 0.0 or len(token_history) < 2 or token_ids.shape[0] < 6:
+            return token_ids
+        prev2 = np.asarray(token_history[-2], dtype=np.float32)
+        prev1 = np.asarray(token_history[-1], dtype=np.float32)
+        expected = prev1 + (prev1 - prev2)
+        out = np.asarray(token_ids, dtype=np.int64).copy()
+        proposal = out[:6].astype(np.float32)
+        correction = expected[:6] - proposal
+        if self.chunk_max_rectification_bins > 0:
+            correction = np.clip(correction, -self.chunk_max_rectification_bins, self.chunk_max_rectification_bins)
+        rectified = proposal + self.chunk_kinematic_blend * correction
+        min_token = int(self.model.vocab_size - len(self.model.bin_centers))
+        max_token = int(self.model.vocab_size - 1)
+        out[:6] = np.clip(np.rint(rectified), min_token, max_token).astype(np.int64)
+        return out
+
+    def _apply_accept_length_gate(
+        self,
+        *,
+        token_history: list[np.ndarray],
+        predicted_bins: np.ndarray,
+        max_probs: np.ndarray,
+        phase: str,
+        max_buffer: int,
+    ) -> int:
+        if self.accept_length_gate is None or max_buffer <= 0:
+            return max_buffer
+        history_bins = token_ids_to_bins(np.stack(token_history, axis=0), self.model.vocab_size).numpy()
+        features = build_accept_length_features(
+            history_bins=history_bins,
+            predicted_bins=predicted_bins,
+            max_probs=max_probs,
+            phase=phase,
+            timestep=float(self._action_step),
+        )
+        feature_t = torch.as_tensor(features, dtype=torch.float32, device=self.device)
+        gate_len = self.accept_length_gate.predict_length(feature_t)
+        upper = min(int(self.accept_length_gate.config.max_accept), max_buffer)
+        if self.accept_length_max is not None:
+            upper = min(upper, self.accept_length_max)
+        lower = min(self.accept_length_min, upper)
+        gate_len = max(lower, min(int(gate_len), upper))
+        self.stats.accept_length_gate_calls += 1
+        self.stats.accept_length_gate_total += gate_len
+        if gate_len == 0:
+            self.stats.accept_length_gate_zeroes += 1
+        return gate_len
 
     def _select_direct_chunk_head_for_phase(self, phase: str) -> TinyTrajectoryHead | None:
         if phase == "smooth":
@@ -1041,6 +1346,8 @@ class TrajectorySpeculativeDecoder:
             self.history = self.history[-self.history_size :]
         if token_ids is not None:
             token_arr = np.asarray(token_ids, dtype=np.int64)
+            prev_gripper = int(self.token_history[-1][6]) if self.token_history and len(self.token_history[-1]) >= 7 else None
+            next_gripper = int(token_arr[6]) if len(token_arr) >= 7 else None
             prefix = self._retrieval_prefix()
             if prefix is not None:
                 self.retrieval_entries.append(
@@ -1059,6 +1366,16 @@ class TrajectorySpeculativeDecoder:
             self.token_history.append(token_arr)
             if len(self.token_history) > self.history_size:
                 self.token_history = self.token_history[-self.history_size :]
+            if (
+                self.chunk_gripper_cooldown_steps > 0
+                and prev_gripper is not None
+                and next_gripper is not None
+                and next_gripper != prev_gripper
+            ):
+                self._chunk_gripper_cooldown_remaining = self.chunk_gripper_cooldown_steps
+                self._chunk_buffer.clear()
+            elif self._chunk_gripper_cooldown_remaining > 0:
+                self._chunk_gripper_cooldown_remaining -= 1
         self._action_step += 1
 
     def _draft_action(self) -> np.ndarray:
