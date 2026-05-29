@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import numpy as np
+import torch
+
 from serving.pi0fast_serving_runtime import (
     NS_PER_MS,
+    PI0FastBackendResult,
     PI0FastDeadlineBatchScheduler,
     PI0FastRequest,
     PI0FastServingConfig,
     PI0FastServingRuntime,
     SyntheticPI0FastBackend,
     deadline_ns_from_period,
+    merge_prepared_pi0fast_batches,
 )
 
 
@@ -116,3 +121,47 @@ def test_synthetic_runtime_reports_batch_telemetry() -> None:
     assert {resp.telemetry.batch_reason for resp in responses} == {"max_batch"}
     assert all(resp.telemetry.runtime_ms == backend.last_runtime_ms for resp in responses)
     assert runtime.stats()["avg_batch_size"] == 4.0
+
+
+def test_merge_prepared_pi0fast_batches_concatenates_batch_fields() -> None:
+    first = {
+        "image": torch.ones((1, 3, 4, 4)),
+        "state": np.ones((1, 7), dtype=np.float32),
+        "task": ["pick"],
+        "scalar": 1,
+    }
+    second = {
+        "image": torch.zeros((1, 3, 4, 4)),
+        "state": np.zeros((1, 7), dtype=np.float32),
+        "task": ["place"],
+        "scalar": 2,
+    }
+
+    merged = merge_prepared_pi0fast_batches([first, second])
+
+    assert merged["image"].shape == (2, 3, 4, 4)
+    assert merged["state"].shape == (2, 7)
+    assert merged["task"] == ["pick", "place"]
+    assert merged["scalar"] == [1, 2]
+
+
+def test_runtime_carries_backend_extra_telemetry() -> None:
+    class ExtraBackend:
+        last_runtime_ms = 12.0
+
+        def predict_batch(self, batch, sessions):
+            return [
+                PI0FastBackendResult(
+                    actions=np.zeros((2, 7), dtype=np.float32),
+                    action_tokens=128,
+                    accelerator="test_backend",
+                    extra={"token_count_max": 128, "straggler": True},
+                )
+            ]
+
+    runtime = PI0FastServingRuntime(ExtraBackend(), PI0FastServingConfig(max_batch_delay_ms=1.0))
+    runtime.submit(make_request(0, at_ns=0))
+
+    responses = runtime.drain_ready(at_ns=2 * NS_PER_MS)
+
+    assert responses[0].telemetry.extra == {"token_count_max": 128, "straggler": True}

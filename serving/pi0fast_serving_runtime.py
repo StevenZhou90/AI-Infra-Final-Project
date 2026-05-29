@@ -13,9 +13,10 @@ import time
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 import numpy as np
+import torch
 
 from serving.kv_cache_manager import KVCacheManager
 
@@ -143,6 +144,7 @@ class PI0FastTelemetry:
     action_tokens: int
     actions_returned: int
     accelerator: str
+    extra: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -169,6 +171,124 @@ class PI0FastBatchBackend(Protocol):
         sessions: Mapping[str, PI0FastSessionState],
     ) -> Sequence[PI0FastBackendResult]:
         ...
+
+
+def merge_prepared_pi0fast_batches(batches: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Merge already-preprocessed PI0-FAST observations into one batch.
+
+    LeRobot preprocessors usually produce tensors with a leading batch
+    dimension plus a few list/string fields such as task prompts.  This helper
+    concatenates tensors on dim 0 and flattens list-like metadata.
+    """
+    if not batches:
+        raise ValueError("Cannot merge an empty PI0-FAST batch list")
+
+    keys = set(batches[0].keys())
+    for batch in batches[1:]:
+        if set(batch.keys()) != keys:
+            missing = sorted(keys.symmetric_difference(batch.keys()))
+            raise ValueError(f"Prepared PI0-FAST batches have different keys: {missing}")
+
+    merged: dict[str, Any] = {}
+    for key in sorted(keys):
+        values = [batch[key] for batch in batches]
+        first = values[0]
+        if torch.is_tensor(first):
+            merged[key] = torch.cat([value if value.ndim > 0 else value.view(1) for value in values], dim=0)
+        elif isinstance(first, np.ndarray):
+            merged[key] = np.concatenate([value if value.ndim > 0 else value.reshape(1) for value in values], axis=0)
+        elif isinstance(first, list):
+            out: list[Any] = []
+            for value in values:
+                out.extend(value)
+            merged[key] = out
+        elif isinstance(first, tuple):
+            out = []
+            for value in values:
+                out.extend(value)
+            merged[key] = tuple(out)
+        else:
+            merged[key] = values
+    return merged
+
+
+def actions_to_numpy(actions: Any) -> np.ndarray:
+    if torch.is_tensor(actions):
+        actions = actions.detach().cpu().numpy()
+    arr = np.asarray(actions, dtype=np.float32)
+    if arr.ndim == 1:
+        return arr.reshape(1, 1, -1)
+    if arr.ndim == 2:
+        return arr.reshape(1, arr.shape[0], arr.shape[1])
+    if arr.ndim == 3:
+        return arr
+    raise ValueError(f"Unsupported PI0-FAST action shape: {arr.shape}")
+
+
+class RealPI0FastBatchBackend:
+    """Backend that executes one real LeRobot PI0-FAST call per request batch."""
+
+    def __init__(
+        self,
+        policy: Any,
+        postprocessor: Callable[[Any], Any] | None = None,
+    ) -> None:
+        self.policy = policy
+        self.postprocessor = postprocessor
+        self.calls = 0
+        self.last_runtime_ms = 0.0
+
+    def predict_batch(
+        self,
+        batch: PI0FastBatch,
+        sessions: Mapping[str, PI0FastSessionState],
+    ) -> Sequence[PI0FastBackendResult]:
+        prepared = []
+        for request in batch.requests:
+            if request.observation is None:
+                raise ValueError(f"Request {request.request_id} has no prepared PI0-FAST observation")
+            prepared.append(request.observation)
+        merged = merge_prepared_pi0fast_batches(prepared)
+
+        device = self._policy_device()
+        if device is not None and device.type == "cuda":
+            torch.cuda.synchronize(device)
+        t0 = time.perf_counter()
+        with torch.inference_mode():
+            raw_actions = (
+                self.policy.predict_action_chunk(merged)
+                if hasattr(self.policy, "predict_action_chunk")
+                else self.policy.select_action(merged)
+            )
+            processed = self.postprocessor(raw_actions) if self.postprocessor is not None else raw_actions
+        if device is not None and device.type == "cuda":
+            torch.cuda.synchronize(device)
+        self.last_runtime_ms = (time.perf_counter() - t0) * 1000.0
+        self.calls += 1
+
+        action_batch = actions_to_numpy(processed)
+        if action_batch.shape[0] != batch.size:
+            raise RuntimeError(f"Expected {batch.size} action chunks, got shape {action_batch.shape}")
+
+        token_budget = max(request.max_action_tokens for request in batch.requests)
+        return [
+            PI0FastBackendResult(
+                actions=action_batch[idx],
+                action_tokens=token_budget,
+                accelerator="real_pi0fast_batch",
+                extra={"batch_runtime_ms": self.last_runtime_ms},
+            )
+            for idx in range(batch.size)
+        ]
+
+    def _policy_device(self) -> torch.device | None:
+        try:
+            return next(self.policy.parameters()).device
+        except Exception:
+            try:
+                return next(self.policy.model.parameters()).device
+            except Exception:
+                return None
 
 
 class PI0FastDeadlineBatchScheduler:
@@ -315,6 +435,7 @@ class PI0FastServingRuntime:
                 action_tokens=result.action_tokens,
                 actions_returned=int(result.actions.shape[0]) if result.actions.ndim > 1 else 1,
                 accelerator=result.accelerator,
+                extra=dict(result.extra),
             )
             responses.append(PI0FastResponse(req.request_id, result.actions, telemetry))
 
