@@ -38,6 +38,7 @@ PI0.5 rollout smoke, `libero_object` task 0, baseline chunk execution:
 | 4 flow steps, 1 episode | 1/1 success, ~155.9 ms/control step |
 | 6 flow steps, 1 episode | 1/1 success, ~159.3 ms/control step |
 | 4 flow steps, 3 episodes | 3/3 success, ~159.2 ms/control step |
+| 4 flow steps, tasks 0-4, 2 episodes each | 10/10 success, ~157.3 ms/control step |
 
 PI0-FAST, bf16, `lerobot/pi0fast-libero`, action-end decode:
 
@@ -97,6 +98,21 @@ MPLCONFIGDIR=/tmp/matplotlib-cache MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa \
   --dtype bfloat16 --amp-dtype bfloat16 \
   --num-inference-steps 4 \
   --output-dir outputs/pi05_rollout_steps4_task0_ep3
+```
+
+Broader PI0.5 rollout check:
+
+```bash
+TORCH_COMPILE_DISABLE=1 HF_HOME=/home/ubuntu/AI-Infra-Final-Project/.hf_cache \
+LIBERO_CONFIG_PATH=/home/ubuntu/AI-Infra-Final-Project/.libero_config \
+MPLCONFIGDIR=/tmp/matplotlib-cache MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa \
+.venv-pi/bin/python scripts/run_pi0fast_chunk_eval.py \
+  --policy-kind pi05 --task libero_object --task-ids 0,1,2,3,4 \
+  --episodes 2 --steps 300 --modes baseline \
+  --summary-baseline-mode baseline --device cuda \
+  --dtype bfloat16 --amp-dtype bfloat16 \
+  --num-inference-steps 4 \
+  --output-dir outputs/pi05_rollout_steps4_object0_4_ep2
 ```
 
 PI0-FAST action-end replicated batch:
