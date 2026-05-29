@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections import Counter, deque
 from dataclasses import asdict, dataclass, field
-from typing import Iterable
+from typing import Any, Iterable
 
 import numpy as np
 
@@ -75,11 +75,30 @@ class ChunkExecutionStats:
     exact_accepted_tokens: int = 0
     action_max_diffs: list[float] = field(default_factory=list)
     action_mean_diffs: list[float] = field(default_factory=list)
+    trace_stat_totals: Counter = field(default_factory=Counter)
+    trace_stat_counts: Counter = field(default_factory=Counter)
+
+    def record_trace_stats(self, stats: dict[str, Any] | None) -> None:
+        if not stats:
+            return
+        for key, value in stats.items():
+            if isinstance(value, bool):
+                numeric = float(value)
+            elif isinstance(value, (int, float, np.integer, np.floating)):
+                numeric = float(value)
+            else:
+                continue
+            self.trace_stat_totals[key] += numeric
+            self.trace_stat_counts[key] += 1
 
     def summary(self) -> dict:
         avg_ms = float(np.mean(self.inference_ms)) if self.inference_ms else 0.0
         avg_window = float(np.mean(self.accepted_windows)) if self.accepted_windows else 0.0
         avg_tokens = float(np.mean(self.token_counts)) if self.token_counts else 0.0
+        trace_stats = {
+            key: float(total) / max(float(self.trace_stat_counts[key]), 1.0)
+            for key, total in self.trace_stat_totals.items()
+        }
         return {
             "chunks_seen": self.chunks_seen,
             "chunks_accepted": self.chunks_accepted,
@@ -98,6 +117,7 @@ class ChunkExecutionStats:
             "max_action_diff": float(np.max(self.action_max_diffs)) if self.action_max_diffs else 0.0,
             "mean_action_diff": float(np.mean(self.action_mean_diffs)) if self.action_mean_diffs else 0.0,
             "guard_reasons": dict(self.guard_reasons),
+            "trace_stats": trace_stats,
         }
 
 

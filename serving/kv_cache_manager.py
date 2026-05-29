@@ -79,7 +79,7 @@ def trim_kv(kv: PastKV, max_len: int) -> PastKV:
     if kv is None:
         return None
     if is_dynamic_cache(kv):
-        if not hasattr(kv, "key_cache") and hasattr(kv, "crop"):
+        if hasattr(kv, "crop"):
             kv.crop(max_len)
             return kv
         for i in range(len(kv.key_cache)):
@@ -129,6 +129,8 @@ def clone_kv(kv: PastKV) -> PastKV:
         new = DynamicCache()
         new.key_cache = [k.clone() for k in kv.key_cache]
         new.value_cache = [v.clone() for v in kv.value_cache]
+        if hasattr(new, "_seen_tokens"):
+            new._seen_tokens = kv.get_seq_length()
         return new
     return tuple((k.clone(), v.clone()) for k, v in kv)
 

@@ -14,6 +14,17 @@ class NgramDraftConfig:
     max_context: int = 8
     min_count: int = 1
     lookahead: int = 4
+    stop_token_ids: tuple[int, ...] = ()
+
+
+def trim_at_stop_token(tokens: list[int], stop_token_ids: tuple[int, ...]) -> list[int]:
+    if not stop_token_ids:
+        return tokens
+    stop = set(int(token) for token in stop_token_ids)
+    for idx, token in enumerate(tokens):
+        if int(token) in stop:
+            return tokens[: idx + 1]
+    return tokens
 
 
 class NgramFastTokenDrafter:
@@ -33,6 +44,7 @@ class NgramFastTokenDrafter:
     def fit(self, traces: Iterable[PI0FastTraceRecord]) -> None:
         for trace in traces:
             tokens = [int(t) for t in trace.token_ids.tolist()]
+            tokens = trim_at_stop_token(tokens, self.config.stop_token_ids)
             for pos, token in enumerate(tokens):
                 for n in range(self.config.max_context + 1):
                     if pos < n:
@@ -87,6 +99,7 @@ def evaluate_ngram_drafter(
 
     for trace in traces:
         tokens = [int(t) for t in trace.token_ids.tolist()]
+        tokens = trim_at_stop_token(tokens, drafter.config.stop_token_ids)
         for pos in range(len(tokens) - 1):
             max_k = min(lookahead, len(tokens) - pos - 1)
             draft = drafter.draft(tokens[: pos + 1], lookahead=max_k)

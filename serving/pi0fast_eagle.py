@@ -197,10 +197,33 @@ def split_trace_records(
     return train, val
 
 
-def build_compact_token_map(records: list[PI0FastTraceRecord], indices: Iterable[int]) -> CompactTokenMap:
+def _trim_record_tokens_and_hidden(
+    record: PI0FastTraceRecord,
+    stop_token_ids: tuple[int, ...] = (),
+) -> tuple[torch.Tensor, torch.Tensor]:
+    tokens = record.token_ids
+    hidden = record.hidden_states
+    if not stop_token_ids:
+        return tokens, hidden
+    stop = {int(token) for token in stop_token_ids}
+    keep = int(tokens.numel())
+    for idx, token in enumerate(tokens.tolist()):
+        if int(token) in stop:
+            keep = idx + 1
+            break
+    return tokens[:keep], hidden[:keep]
+
+
+def build_compact_token_map(
+    records: list[PI0FastTraceRecord],
+    indices: Iterable[int],
+    *,
+    stop_token_ids: tuple[int, ...] = (),
+) -> CompactTokenMap:
     tokens: list[int] = []
     for idx in indices:
-        tokens.extend(int(t) for t in records[idx].token_ids.tolist())
+        trimmed_tokens, _hidden = _trim_record_tokens_and_hidden(records[idx], stop_token_ids)
+        tokens.extend(int(t) for t in trimmed_tokens.tolist())
     return CompactTokenMap(tokens)
 
 
@@ -210,6 +233,7 @@ def make_teacher_forcing_rows(
     token_map: CompactTokenMap,
     *,
     drop_oov: bool,
+    stop_token_ids: tuple[int, ...] = (),
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     hidden_rows: list[torch.Tensor] = []
     input_classes: list[int] = []
@@ -218,15 +242,16 @@ def make_teacher_forcing_rows(
 
     for idx in indices:
         record = records[idx]
-        if record.token_ids.numel() < 2:
+        tokens, hidden_states = _trim_record_tokens_and_hidden(record, stop_token_ids)
+        if tokens.numel() < 2:
             continue
-        encoded = token_map.encode_tensor(record.token_ids)
-        for pos in range(record.token_ids.numel() - 1):
+        encoded = token_map.encode_tensor(tokens)
+        for pos in range(tokens.numel() - 1):
             inp = int(encoded[pos])
             tgt = int(encoded[pos + 1])
             if drop_oov and (inp < 0 or tgt < 0):
                 continue
-            hidden_rows.append(record.hidden_states[pos].to(dtype=torch.float32))
+            hidden_rows.append(hidden_states[pos].to(dtype=torch.float32))
             input_classes.append(inp)
             target_classes.append(tgt)
             trace_indices.append(idx)
@@ -251,6 +276,7 @@ def evaluate_offline_acceptance(
     lookahead: int,
     device: str | torch.device,
     dtype: torch.dtype = torch.float32,
+    stop_token_ids: tuple[int, ...] = (),
 ) -> dict[str, Any]:
     model.eval()
     device = torch.device(device)
@@ -265,7 +291,7 @@ def evaluate_offline_acceptance(
 
     for idx in indices:
         record = records[idx]
-        tokens = record.token_ids
+        tokens, hidden_states = _trim_record_tokens_and_hidden(record, stop_token_ids)
         if tokens.numel() < 2:
             continue
         encoded = token_map.encode_tensor(tokens)
@@ -282,7 +308,7 @@ def evaluate_offline_acceptance(
                 per_task.setdefault(record.task_id, []).append(0)
                 continue
 
-            hidden = record.hidden_states[pos : pos + 1].to(device=device, dtype=dtype).unsqueeze(0)
+            hidden = hidden_states[pos : pos + 1].to(device=device, dtype=dtype).unsqueeze(0)
             input_class = torch.tensor([[current_class]], dtype=torch.long, device=device)
             model.reset_kv()
             accepted = 0
