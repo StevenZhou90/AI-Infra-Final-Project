@@ -43,7 +43,7 @@ from serving.pi0fast_token_hooks import PI0FastTokenLogitAdapter  # noqa: E402
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark real PI0-FAST system components.")
-    parser.add_argument("--policy", default="lerobot/pi0fast-libero")
+    parser.add_argument("--policy", default=None)
     parser.add_argument("--policy-kind", choices=["pi0fast", "pi05"], default="pi0fast")
     parser.add_argument("--task", default="libero_object")
     parser.add_argument("--task-id", type=int, default=0)
@@ -83,9 +83,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
+    parser.add_argument("--target-latency-ms", type=float, default=250.0)
     parser.add_argument("--libero-config-path", default=os.environ.get("LIBERO_CONFIG_PATH"))
     parser.add_argument("--output", type=Path, default=Path("outputs/pi0fast_system_components/summary.json"))
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.policy is None:
+        args.policy = "lerobot/pi05_libero_finetuned_v044" if args.policy_kind == "pi05" else "lerobot/pi0fast-libero"
+    return args
 
 
 def sync_if_cuda(device: torch.device) -> None:
@@ -221,6 +225,25 @@ def jsonable_config(args: argparse.Namespace) -> dict[str, Any]:
     return out
 
 
+def pi05_recommendation(rows: list[dict[str, Any]], target_latency_ms: float) -> dict[str, Any] | None:
+    candidates = [
+        row
+        for row in rows
+        if row.get("decode_path") == "public"
+        and not row.get("errors")
+        and row.get("single_inference", {}).get("mean_ms", float("inf")) <= target_latency_ms
+    ]
+    if not candidates:
+        return None
+    best = min(candidates, key=lambda row: row["single_inference"]["mean_ms"])
+    return {
+        "num_inference_steps": best.get("num_inference_steps"),
+        "single_mean_ms": best["single_inference"]["mean_ms"],
+        "target_latency_ms": float(target_latency_ms),
+        "meets_target": True,
+    }
+
+
 def predict_chunk(
     *,
     policy,
@@ -291,6 +314,7 @@ def main() -> None:
         "policy_use_kv_cache_initial": getattr(policy.config, "use_kv_cache", None),
         "policy_max_decoding_steps_initial": getattr(policy.config, "max_decoding_steps", None),
         "policy_num_inference_steps_initial": getattr(policy.config, "num_inference_steps", None),
+        "recommendation": None,
         "rows": rows,
     }
 
@@ -446,6 +470,8 @@ def main() -> None:
                         )
                         row["batch_inference"][str(batch_size)] = stats
                     rows.append(row)
+                    if args.policy_kind == "pi05":
+                        summary["recommendation"] = pi05_recommendation(rows, args.target_latency_ms)
     finally:
         try:
             env.close()

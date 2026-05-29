@@ -10,6 +10,7 @@ from serving.pi0fast_serving_runtime import (
     PI0FastRequest,
     PI0FastServingConfig,
     PI0FastServingRuntime,
+    RealPIBatchBackend,
     SyntheticPI0FastBackend,
     deadline_ns_from_period,
     merge_prepared_pi0fast_batches,
@@ -165,3 +166,44 @@ def test_runtime_carries_backend_extra_telemetry() -> None:
     responses = runtime.drain_ready(at_ns=2 * NS_PER_MS)
 
     assert responses[0].telemetry.extra == {"token_count_max": 128, "straggler": True}
+
+
+def test_real_pi_batch_backend_passes_inference_kwargs() -> None:
+    class FakePolicy:
+        def __init__(self) -> None:
+            self.seen_kwargs = None
+
+        def predict_action_chunk(self, batch, **kwargs):
+            self.seen_kwargs = kwargs
+            return torch.zeros((batch["state"].shape[0], 2, 7), dtype=torch.float32)
+
+    policy = FakePolicy()
+    backend = RealPIBatchBackend(
+        policy,
+        accelerator="real_pi05_batch",
+        inference_kwargs={"num_steps": 6},
+    )
+    batch = type(
+        "Batch",
+        (),
+        {
+            "requests": [
+                make_request(0, model="lerobot/pi05_libero_finetuned_v044"),
+                make_request(1, model="lerobot/pi05_libero_finetuned_v044"),
+            ],
+            "size": 2,
+        },
+    )()
+    batch.requests[0] = PI0FastRequest(
+        **{**batch.requests[0].__dict__, "observation": {"state": torch.ones((1, 7))}}
+    )
+    batch.requests[1] = PI0FastRequest(
+        **{**batch.requests[1].__dict__, "observation": {"state": torch.zeros((1, 7))}}
+    )
+
+    results = backend.predict_batch(batch, {})
+
+    assert policy.seen_kwargs == {"num_steps": 6}
+    assert len(results) == 2
+    assert results[0].accelerator == "real_pi05_batch"
+    assert results[0].extra["inference_kwargs"] == {"num_steps": 6}

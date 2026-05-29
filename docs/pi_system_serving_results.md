@@ -8,7 +8,9 @@ serving when distinct robot observations are batched together.
 ## Current Recommendation
 
 - Use `lerobot/pi05_libero_finetuned_v044` with bf16 autocast and
-  `num_inference_steps=6` for the primary single-machine serving path.
+  `num_inference_steps=4` for the primary single-machine latency path.
+- Keep `num_inference_steps=6` as the conservative fallback until rollout
+  success is validated for 4-step inference.
 - Keep PI0-FAST on the `action_end` decode path for serving.  Do not use the
   public fixed-256-token decode path except as a baseline.
 - Treat PI0-FAST rows above `96` FAST tokens as stragglers in telemetry.  Use a
@@ -21,9 +23,13 @@ PI0.5, bf16 autocast, `lerobot/pi05_libero_finetuned_v044`:
 
 | Mode | Mean chunk latency |
 | --- | ---: |
-| 6 flow steps, batch 1 | ~212 ms |
-| 10 flow steps, batch 1 | ~295 ms |
-| 6 flow steps, batch 4 | ~287 ms total, ~72 ms/request |
+| 4 flow steps, batch 1 | ~169 ms |
+| 5 flow steps, batch 1 | ~190 ms |
+| 6 flow steps, batch 1 | ~211 ms |
+| 8 flow steps, batch 1 | ~254 ms |
+| 10 flow steps, batch 1 | ~298 ms |
+| 4 flow steps, replicated batch 8 | ~357 ms total, ~44.6 ms/request |
+| 4 flow steps, distinct batch 8 | ~405 ms total, ~50.7 ms/request |
 
 PI0-FAST, bf16, `lerobot/pi0fast-libero`, action-end decode:
 
@@ -48,10 +54,26 @@ MPLCONFIGDIR=/tmp/matplotlib-cache MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa \
 .venv-pi/bin/python scripts/benchmark_pi0fast_system_components.py \
   --policy-kind pi05 --policy lerobot/pi05_libero_finetuned_v044 \
   --task libero_object --task-id 0 --warmup 1 --steps 3 \
-  --batch-sizes 1,2,4 --decode-path public \
-  --num-inference-steps 6,10 --kv-modes default \
-  --device cuda --dtype bfloat16 \
-  --output outputs/pi0fast_system_components/pi05_bf16_autocast_steps3.json
+  --batch-sizes 1,2,4,8 --decode-path public \
+  --num-inference-steps 4,5,6,8,10 --kv-modes default \
+  --device cuda --dtype bfloat16 --target-latency-ms 250 \
+  --output outputs/pi0fast_system_components/pi05_bf16_steps4_10_batch8.json
+```
+
+PI0.5 distinct-reset batch check:
+
+```bash
+TORCH_COMPILE_DISABLE=1 HF_HOME=/home/ubuntu/AI-Infra-Final-Project/.hf_cache \
+LIBERO_CONFIG_PATH=/home/ubuntu/AI-Infra-Final-Project/.libero_config \
+MPLCONFIGDIR=/tmp/matplotlib-cache MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa \
+.venv-pi/bin/python scripts/benchmark_pi0fast_system_components.py \
+  --policy-kind pi05 \
+  --task libero_object --task-id 0 --warmup 1 --steps 1 \
+  --batch-sizes 1,4,8 --batch-source distinct-reset \
+  --decode-path public --num-inference-steps 4,6 \
+  --kv-modes default --device cuda --dtype bfloat16 \
+  --target-latency-ms 250 \
+  --output outputs/pi0fast_system_components/pi05_bf16_distinct_steps4_6_batch8.json
 ```
 
 PI0-FAST action-end replicated batch:

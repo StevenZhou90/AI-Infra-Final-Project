@@ -9,6 +9,7 @@ per-request telemetry that can later be surfaced through the public API.
 from __future__ import annotations
 
 import heapq
+import contextlib
 import time
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
@@ -225,16 +226,23 @@ def actions_to_numpy(actions: Any) -> np.ndarray:
     raise ValueError(f"Unsupported PI0-FAST action shape: {arr.shape}")
 
 
-class RealPI0FastBatchBackend:
-    """Backend that executes one real LeRobot PI0-FAST call per request batch."""
+class RealPIBatchBackend:
+    """Backend that executes one real LeRobot policy call per request batch."""
 
     def __init__(
         self,
         policy: Any,
         postprocessor: Callable[[Any], Any] | None = None,
+        *,
+        accelerator: str = "real_pi_batch",
+        autocast_dtype: torch.dtype | None = None,
+        inference_kwargs: Mapping[str, Any] | None = None,
     ) -> None:
         self.policy = policy
         self.postprocessor = postprocessor
+        self.accelerator = accelerator
+        self.autocast_dtype = autocast_dtype
+        self.inference_kwargs = dict(inference_kwargs or {})
         self.calls = 0
         self.last_runtime_ms = 0.0
 
@@ -255,11 +263,16 @@ class RealPI0FastBatchBackend:
             torch.cuda.synchronize(device)
         t0 = time.perf_counter()
         with torch.inference_mode():
-            raw_actions = (
-                self.policy.predict_action_chunk(merged)
-                if hasattr(self.policy, "predict_action_chunk")
-                else self.policy.select_action(merged)
-            )
+            if self.autocast_dtype is not None and device is not None and device.type == "cuda":
+                cast_context = torch.autocast(device_type=device.type, dtype=self.autocast_dtype)
+            else:
+                cast_context = contextlib.nullcontext()
+            with cast_context:
+                raw_actions = (
+                    self.policy.predict_action_chunk(merged, **self.inference_kwargs)
+                    if hasattr(self.policy, "predict_action_chunk")
+                    else self.policy.select_action(merged)
+                )
             processed = self.postprocessor(raw_actions) if self.postprocessor is not None else raw_actions
         if device is not None and device.type == "cuda":
             torch.cuda.synchronize(device)
@@ -275,8 +288,14 @@ class RealPI0FastBatchBackend:
             PI0FastBackendResult(
                 actions=action_batch[idx],
                 action_tokens=token_budget,
-                accelerator="real_pi0fast_batch",
-                extra={"batch_runtime_ms": self.last_runtime_ms},
+                accelerator=self.accelerator,
+                extra={
+                    "batch_runtime_ms": self.last_runtime_ms,
+                    "inference_kwargs": dict(self.inference_kwargs),
+                    "autocast_dtype": str(self.autocast_dtype).replace("torch.", "")
+                    if self.autocast_dtype is not None
+                    else None,
+                },
             )
             for idx in range(batch.size)
         ]
@@ -289,6 +308,17 @@ class RealPI0FastBatchBackend:
                 return next(self.policy.model.parameters()).device
             except Exception:
                 return None
+
+
+class RealPI0FastBatchBackend(RealPIBatchBackend):
+    """Backward-compatible name for the generic real PI batch backend."""
+
+    def __init__(
+        self,
+        policy: Any,
+        postprocessor: Callable[[Any], Any] | None = None,
+    ) -> None:
+        super().__init__(policy, postprocessor, accelerator="real_pi0fast_batch")
 
 
 class PI0FastDeadlineBatchScheduler:
