@@ -31,6 +31,14 @@ PI0.5, bf16 autocast, `lerobot/pi05_libero_finetuned_v044`:
 | 4 flow steps, replicated batch 8 | ~357 ms total, ~44.6 ms/request |
 | 4 flow steps, distinct batch 8 | ~405 ms total, ~50.7 ms/request |
 
+PI0.5 rollout smoke, `libero_object` task 0, baseline chunk execution:
+
+| Mode | Result |
+| --- | ---: |
+| 4 flow steps, 1 episode | 1/1 success, ~155.9 ms/control step |
+| 6 flow steps, 1 episode | 1/1 success, ~159.3 ms/control step |
+| 4 flow steps, 3 episodes | 3/3 success, ~159.2 ms/control step |
+
 PI0-FAST, bf16, `lerobot/pi0fast-libero`, action-end decode:
 
 | Mode | Mean latency |
@@ -74,6 +82,21 @@ MPLCONFIGDIR=/tmp/matplotlib-cache MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa \
   --kv-modes default --device cuda --dtype bfloat16 \
   --target-latency-ms 250 \
   --output outputs/pi0fast_system_components/pi05_bf16_distinct_steps4_6_batch8.json
+```
+
+PI0.5 rollout smoke:
+
+```bash
+TORCH_COMPILE_DISABLE=1 HF_HOME=/home/ubuntu/AI-Infra-Final-Project/.hf_cache \
+LIBERO_CONFIG_PATH=/home/ubuntu/AI-Infra-Final-Project/.libero_config \
+MPLCONFIGDIR=/tmp/matplotlib-cache MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa \
+.venv-pi/bin/python scripts/run_pi0fast_chunk_eval.py \
+  --policy-kind pi05 --task libero_object --task-ids 0 \
+  --episodes 3 --steps 300 --modes baseline \
+  --summary-baseline-mode baseline --device cuda \
+  --dtype bfloat16 --amp-dtype bfloat16 \
+  --num-inference-steps 4 \
+  --output-dir outputs/pi05_rollout_steps4_task0_ep3
 ```
 
 PI0-FAST action-end replicated batch:

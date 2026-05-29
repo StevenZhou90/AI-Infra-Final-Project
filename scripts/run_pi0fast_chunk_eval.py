@@ -930,6 +930,7 @@ def run_episode(
     adaptive_prefix_gate_threshold: float,
     device: str,
     use_amp: bool,
+    amp_dtype: torch.dtype | None = None,
 ) -> EpisodeResult:
     policy.reset()
     controller.reset()
@@ -940,7 +941,13 @@ def run_episode(
     success = False
     control_step_ms: list[float] = []
     wall_start = time.perf_counter()
-    autocast_ctx = torch.autocast(device_type="cuda") if use_amp and device.startswith("cuda") else nullcontext()
+    autocast_ctx = (
+        torch.autocast(device_type="cuda", dtype=amp_dtype)
+        if use_amp and device.startswith("cuda") and amp_dtype is not None
+        else torch.autocast(device_type="cuda")
+        if use_amp and device.startswith("cuda")
+        else nullcontext()
+    )
 
     while not done and steps < max_steps:
         step_start = time.perf_counter()
@@ -1992,7 +1999,8 @@ def summarize(results: list[EpisodeResult], baseline_mode: str = "baseline") -> 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run π0-FAST chunk execution in LIBERO")
-    parser.add_argument("--policy", default="lerobot/pi0fast-libero")
+    parser.add_argument("--policy", default=None)
+    parser.add_argument("--policy-kind", choices=["pi0fast", "pi05"], default="pi0fast")
     parser.add_argument("--task", default="libero_object")
     parser.add_argument("--task-id", type=int, default=None)
     parser.add_argument(
@@ -2014,6 +2022,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--use-amp", action="store_true")
+    parser.add_argument("--amp-dtype", choices=["bfloat16", "float16"], default=None)
+    parser.add_argument(
+        "--num-inference-steps",
+        type=int,
+        default=None,
+        help="Flow inference steps for PI0.5 policies.",
+    )
     parser.add_argument(
         "--enable-fast-token-hooks",
         action="store_true",
@@ -2221,6 +2236,8 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     _ensure_libero_config(args.libero_config_path)
     make_env, make_env_pre_post_processors, preprocess_observation, LiberoEnv, make_pre_post_processors, PI0FastPolicy = _import_lerobot()
+    if args.policy is None:
+        args.policy = "lerobot/pi05_libero_finetuned_v044" if args.policy_kind == "pi05" else "lerobot/pi0fast-libero"
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -2228,6 +2245,10 @@ def main() -> None:
 
     device = torch.device(args.device if torch.cuda.is_available() or not args.device.startswith("cuda") else "cpu")
     dtype = getattr(torch, args.dtype)
+    amp_dtype = getattr(torch, args.amp_dtype) if args.amp_dtype else None
+    if args.policy_kind == "pi05" and dtype in (torch.bfloat16, torch.float16):
+        args.use_amp = True
+        amp_dtype = amp_dtype or dtype
     torch.backends.cuda.matmul.allow_tf32 = True
 
     selected_task_ids = sorted(_parse_ids(args.task_ids)) if args.task_ids else None
@@ -2240,7 +2261,15 @@ def main() -> None:
     env_cfg = LiberoEnv(**env_kwargs)
 
     logger.info("Loading policy %s on %s", args.policy, device)
-    policy = PI0FastPolicy.from_pretrained(args.policy).to(device=device, dtype=dtype).eval()
+    if args.policy_kind == "pi05":
+        from lerobot.policies.pi05.modeling_pi05 import PI05Policy
+
+        PolicyClass = PI05Policy
+    else:
+        PolicyClass = PI0FastPolicy
+    policy = PolicyClass.from_pretrained(args.policy).to(device=device, dtype=dtype).eval()
+    if args.num_inference_steps is not None and hasattr(policy.config, "num_inference_steps"):
+        policy.config.num_inference_steps = int(args.num_inference_steps)
     token_adapter = PI0FastTokenLogitAdapter(policy) if args.enable_fast_token_hooks else None
     policy_preprocessor, policy_postprocessor = make_pre_post_processors(
         policy.config,
@@ -2517,6 +2546,7 @@ def main() -> None:
                     adaptive_prefix_gate_threshold=args.adaptive_prefix_gate_threshold,
                     device=str(device),
                     use_amp=args.use_amp,
+                    amp_dtype=amp_dtype,
                 )
                 all_results.append(result)
                 with metrics_path.open("a") as f:
@@ -2533,6 +2563,11 @@ def main() -> None:
     summary = summarize(all_results, baseline_mode=args.summary_baseline_mode)
     summary["config"] = {
         "policy": args.policy,
+        "policy_kind": args.policy_kind,
+        "dtype": args.dtype,
+        "use_amp": args.use_amp,
+        "amp_dtype": args.amp_dtype or (args.dtype if amp_dtype is not None else None),
+        "num_inference_steps": args.num_inference_steps,
         "task": args.task,
         "task_id": args.task_id,
         "task_ids": task_ids,
