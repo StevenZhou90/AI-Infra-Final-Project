@@ -163,6 +163,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--heldout-task-id", type=int, default=4)
     parser.add_argument("--val-fraction", type=float, default=0.25)
     parser.add_argument("--lookahead", type=int, default=4)
+    parser.add_argument(
+        "--stop-token-ids",
+        default="",
+        help="Comma-separated token ids to trim traces through before training/eval.",
+    )
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -198,6 +203,7 @@ def main() -> None:
     dtype = getattr(torch, args.dtype)
 
     records = load_trace_records(args.data_dir)
+    stop_token_ids = tuple(int(part.strip()) for part in args.stop_token_ids.split(",") if part.strip())
     train_idx, val_idx = split_trace_records(
         records,
         split=args.split,
@@ -206,12 +212,13 @@ def main() -> None:
         heldout_task_id=args.heldout_task_id,
     )
     vocab_indices = train_idx if args.vocab_source == "train" else list(range(len(records)))
-    token_map = build_compact_token_map(records, vocab_indices)
+    token_map = build_compact_token_map(records, vocab_indices, stop_token_ids=stop_token_ids)
     X_train, input_train, target_train, trace_train = make_teacher_forcing_rows(
         records,
         train_idx,
         token_map,
         drop_oov=True,
+        stop_token_ids=stop_token_ids,
     )
 
     config = PI0FastEagleConfig(
@@ -273,6 +280,7 @@ def main() -> None:
             lookahead=args.lookahead,
             device=device,
             dtype=dtype,
+            stop_token_ids=stop_token_ids,
         )
         row = {"epoch": epoch, **train_metrics, "val": val_metrics}
         history.append(row)

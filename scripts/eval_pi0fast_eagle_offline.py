@@ -29,6 +29,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-fraction", type=float, default=0.25)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--lookahead", type=int, default=4)
+    parser.add_argument(
+        "--stop-token-ids",
+        default="",
+        help="Comma-separated token ids to trim traces through before eval.",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
     parser.add_argument("--output", default=None)
@@ -39,6 +44,7 @@ def main() -> None:
     args = parse_args()
     device = torch.device(args.device if torch.cuda.is_available() or not args.device.startswith("cuda") else "cpu")
     dtype = getattr(torch, args.dtype)
+    stop_token_ids = tuple(int(part.strip()) for part in args.stop_token_ids.split(",") if part.strip())
     model, token_map, ckpt_summary = load_checkpoint(args.checkpoint, device=device)
     records = load_trace_records(args.data_dir)
     if args.split == "all":
@@ -59,6 +65,7 @@ def main() -> None:
         lookahead=args.lookahead,
         device=device,
         dtype=dtype,
+        stop_token_ids=stop_token_ids,
     )
     summary = {
         "checkpoint": args.checkpoint,

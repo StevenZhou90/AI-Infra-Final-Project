@@ -19,42 +19,16 @@ import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from serving.pi0fast_eagle import CompactTokenMap, PI0FastTraceRecord, load_trace_records  # noqa: E402
+from serving.pi0fast_eagle import (  # noqa: E402
+    CompactTokenMap,
+    PI0FastTraceRecord,
+    _trim_record_tokens_and_hidden,
+    load_trace_records,
+)
+from serving.pi0fast_medusa import PI0FastMedusaConfig as MedusaConfig  # noqa: E402
+from serving.pi0fast_medusa import PI0FastMedusaHead as MedusaFutureTokenHeads  # noqa: E402
 
 logger = logging.getLogger("train_pi0fast_medusa_from_traces")
-
-
-@dataclass
-class MedusaConfig:
-    hidden_dim: int
-    vocab_size: int
-    lookahead: int
-    hidden_proj_dim: int = 0
-    dropout: float = 0.0
-
-
-class MedusaFutureTokenHeads(nn.Module):
-    """Parallel future-token classifiers over target PI0-FAST hidden states."""
-
-    def __init__(self, config: MedusaConfig) -> None:
-        super().__init__()
-        self.config = config
-        in_dim = config.hidden_dim
-        if config.hidden_proj_dim > 0:
-            self.backbone = nn.Sequential(
-                nn.LayerNorm(config.hidden_dim),
-                nn.Linear(config.hidden_dim, config.hidden_proj_dim),
-                nn.GELU(),
-                nn.Dropout(config.dropout),
-            )
-            in_dim = config.hidden_proj_dim
-        else:
-            self.backbone = nn.LayerNorm(config.hidden_dim)
-        self.heads = nn.ModuleList([nn.Linear(in_dim, config.vocab_size) for _ in range(config.lookahead)])
-
-    def forward(self, hidden: torch.Tensor) -> list[torch.Tensor]:
-        x = self.backbone(hidden)
-        return [head(x) for head in self.heads]
 
 
 def _parse_data_dirs(value: str) -> list[Path]:
@@ -102,11 +76,22 @@ def split_indices(records: list[PI0FastTraceRecord], args: argparse.Namespace) -
     return train, val
 
 
-def build_token_map(records: list[PI0FastTraceRecord], args: argparse.Namespace, train_idx: list[int]) -> CompactTokenMap:
+def _parse_stop_token_ids(value: str) -> tuple[int, ...]:
+    return tuple(int(part.strip()) for part in value.split(",") if part.strip())
+
+
+def build_token_map(
+    records: list[PI0FastTraceRecord],
+    args: argparse.Namespace,
+    train_idx: list[int],
+    *,
+    stop_token_ids: tuple[int, ...],
+) -> CompactTokenMap:
     indices = list(range(len(records))) if args.vocab_source == "all" else train_idx
     tokens: list[int] = []
     for idx in indices:
-        tokens.extend(int(token) for token in records[idx].token_ids.tolist())
+        trimmed_tokens, _hidden = _trim_record_tokens_and_hidden(records[idx], stop_token_ids)
+        tokens.extend(int(token) for token in trimmed_tokens.tolist())
     return CompactTokenMap(tokens)
 
 
@@ -117,19 +102,26 @@ def build_rows(
     lookahead: int,
     *,
     drop_oov: bool,
+    stop_token_ids: tuple[int, ...],
+    min_position: int = 0,
+    max_position: int = 0,
 ) -> tuple[torch.Tensor, list[torch.Tensor], torch.Tensor]:
     hidden_rows: list[torch.Tensor] = []
     labels_by_head: list[list[int]] = [[] for _ in range(lookahead)]
     trace_rows: list[int] = []
     for record_idx in indices:
         record = records[record_idx]
-        tokens = record.token_ids
+        tokens, hidden_states = _trim_record_tokens_and_hidden(record, stop_token_ids)
         encoded = token_map.encode_tensor(tokens)
         for pos in range(max(0, tokens.numel() - lookahead)):
+            if pos < min_position:
+                continue
+            if max_position > 0 and pos > max_position:
+                continue
             future = encoded[pos + 1 : pos + 1 + lookahead]
             if drop_oov and bool((future < 0).any().item()):
                 continue
-            hidden_rows.append(record.hidden_states[pos].to(dtype=torch.float32))
+            hidden_rows.append(hidden_states[pos].to(dtype=torch.float32))
             trace_rows.append(record_idx)
             for head_idx in range(lookahead):
                 labels_by_head[head_idx].append(int(future[head_idx]))
@@ -297,6 +289,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--train-device", default="cuda")
+    parser.add_argument("--min-position", type=int, default=0)
+    parser.add_argument("--max-position", type=int, default=0)
+    parser.add_argument(
+        "--stop-token-ids",
+        default="",
+        help="Comma-separated FAST token ids that terminate an action chunk; rows after the first match are ignored.",
+    )
     return parser.parse_args()
 
 
@@ -310,9 +309,28 @@ def main() -> None:
 
     records = load_all_records(_parse_data_dirs(args.data_dirs))
     train_idx, val_idx = split_indices(records, args)
-    token_map = build_token_map(records, args, train_idx)
-    X_train, y_train, train_trace_rows = build_rows(records, train_idx, token_map, args.lookahead, drop_oov=True)
-    X_val, y_val, val_trace_rows = build_rows(records, val_idx, token_map, args.lookahead, drop_oov=True)
+    stop_token_ids = _parse_stop_token_ids(args.stop_token_ids)
+    token_map = build_token_map(records, args, train_idx, stop_token_ids=stop_token_ids)
+    X_train, y_train, train_trace_rows = build_rows(
+        records,
+        train_idx,
+        token_map,
+        args.lookahead,
+        drop_oov=True,
+        stop_token_ids=stop_token_ids,
+        min_position=args.min_position,
+        max_position=args.max_position,
+    )
+    X_val, y_val, val_trace_rows = build_rows(
+        records,
+        val_idx,
+        token_map,
+        args.lookahead,
+        drop_oov=True,
+        stop_token_ids=stop_token_ids,
+        min_position=args.min_position,
+        max_position=args.max_position,
+    )
     logger.info(
         "records=%d train_records=%d val_records=%d train_rows=%d val_rows=%d vocab=%d hidden=%d",
         len(records),

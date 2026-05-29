@@ -24,6 +24,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-context", type=int, default=8)
     parser.add_argument("--min-count", type=int, default=1)
     parser.add_argument("--lookahead", type=int, default=4)
+    parser.add_argument(
+        "--stop-token-ids",
+        default="",
+        help="Comma-separated token ids to trim traces through, e.g. FAST action end and EOS.",
+    )
     parser.add_argument("--output", default=None)
     return parser.parse_args()
 
@@ -38,8 +43,14 @@ def main() -> None:
         seed=args.seed,
         heldout_task_id=args.heldout_task_id,
     )
+    stop_token_ids = tuple(int(part.strip()) for part in args.stop_token_ids.split(",") if part.strip())
     drafter = NgramFastTokenDrafter(
-        NgramDraftConfig(max_context=args.max_context, min_count=args.min_count, lookahead=args.lookahead)
+        NgramDraftConfig(
+            max_context=args.max_context,
+            min_count=args.min_count,
+            lookahead=args.lookahead,
+            stop_token_ids=stop_token_ids,
+        )
     )
     drafter.fit(records[idx] for idx in train_idx)
     metrics = evaluate_ngram_drafter(

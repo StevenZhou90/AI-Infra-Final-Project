@@ -120,7 +120,11 @@ def collect_for_task(
         if device.type == "cuda":
             torch.cuda.synchronize()
         t0 = time.perf_counter()
-        trace = adapter.predict_action_chunk_with_trace(batch, return_hidden_states=True)
+        trace = adapter.predict_action_chunk_with_trace(
+            batch,
+            return_hidden_states=True,
+            early_stop_action_end=args.early_stop_action_end,
+        )
         if device.type == "cuda":
             torch.cuda.synchronize()
         decode_ms = (time.perf_counter() - t0) * 1000
@@ -165,6 +169,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--traces-per-task", type=int, default=20)
     parser.add_argument("--steps-per-task", type=int, default=250)
     parser.add_argument("--execute-actions-per-trace", type=int, default=10)
+    parser.add_argument(
+        "--early-stop-action-end",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Stop FAST-token tracing at the action-end token. This matches the optimized target_eos baseline.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
