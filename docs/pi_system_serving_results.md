@@ -79,6 +79,7 @@ disabled, staggered robot chunk requests:
 | 8 robots, 1000 ms request period, 250 ms deadline | 22/24 misses, p95 ~1120 ms |
 | 8 robots, 1500 ms request period, 250 ms deadline | 0/24 misses, p95 ~223.0 ms |
 | 4 robots, 10 s soak, action-buffer mode, 1000 ms request period, 250 ms deadline | 0/40 misses, p95 ~182.8 ms |
+| gRPC server, 1 robot, 3 s warm smoke, 1000 ms request period, 250 ms deadline | 0/3 misses, p95 ~171.9 ms |
 
 The real serving smoke confirms that the practical 250 ms single-GPU boundary is
 around 4 robots at a 1000 ms chunk request period, or 8 robots at 1500 ms.  The
@@ -212,6 +213,36 @@ MPLCONFIGDIR=/tmp/matplotlib-cache MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa \
   --deadline-ms 250 --soak-seconds 60 \
   --max-active-sessions 8 --action-buffer-mode \
   --output outputs/pi05_real_serving_runtime/load_soak_60s.json
+```
+
+PI0.5 gRPC server:
+
+```bash
+TORCHDYNAMO_DISABLE=1 \
+LIBERO_CONFIG_PATH=/home/ubuntu/AI-Infra-Final-Project/.libero_config \
+MPLCONFIGDIR=/tmp/matplotlib-cache MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa \
+.venv-pi/bin/python -m serving.pi05_server \
+  --port 50051 \
+  --max-active-sessions 4 \
+  --deadline-ms 250 \
+  --num-inference-steps 4 \
+  --metrics-path outputs/pi05_grpc_server/metrics.jsonl
+```
+
+PI0.5 gRPC load test:
+
+```bash
+LIBERO_CONFIG_PATH=/home/ubuntu/AI-Infra-Final-Project/.libero_config \
+MPLCONFIGDIR=/tmp/matplotlib-cache MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa \
+.venv-pi/bin/python scripts/load_pi05_grpc.py \
+  --server localhost:50051 \
+  --robots 4 \
+  --duration-seconds 300 \
+  --request-period-ms 1000 \
+  --deadline-ms 250 \
+  --stagger-arrivals \
+  --warmup-requests 1 \
+  --output outputs/pi05_grpc_load/r4_300s_req1000_d250.json
 ```
 
 PI0-FAST action-end replicated batch:

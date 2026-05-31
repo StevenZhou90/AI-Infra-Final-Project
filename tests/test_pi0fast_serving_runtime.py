@@ -17,6 +17,7 @@ from serving.pi0fast_serving_runtime import (
     merge_prepared_pi0fast_batches,
 )
 from serving.pi05_runtime_service import PI05RuntimeService
+from serving.pi05_grpc_codec import decode_prepared_observation, encode_prepared_observation
 
 
 def make_request(
@@ -302,3 +303,15 @@ def test_pi05_runtime_service_reports_admission_rejection() -> None:
     assert second.admitted is False
     assert second.reason == "admission_rejected"
     assert service.status()["rejected_requests"] == 1
+
+
+def test_pi05_grpc_codec_round_trips_prepared_observation() -> None:
+    observation = {
+        "state": torch.ones((1, 7), dtype=torch.float32),
+        "task": ["pick up the object"],
+    }
+
+    decoded = decode_prepared_observation(encode_prepared_observation(observation))
+
+    assert torch.equal(decoded["state"], observation["state"])
+    assert decoded["task"] == ["pick up the object"]
