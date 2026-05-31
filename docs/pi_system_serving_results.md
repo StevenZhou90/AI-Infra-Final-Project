@@ -39,6 +39,13 @@ PI0.5 rollout smoke, `libero_object` task 0, baseline chunk execution:
 | 6 flow steps, 1 episode | 1/1 success, ~159.3 ms/control step |
 | 4 flow steps, 3 episodes | 3/3 success, ~159.2 ms/control step |
 | 4 flow steps, tasks 0-4, 2 episodes each | 10/10 success, ~157.3 ms/control step |
+| 4 flow steps, tasks 0-9, 3 episodes each | 29/30 success, ~156.0 ms/control step |
+| 6 flow steps, task 7, 3 episodes | 2/3 success, ~150.6 ms/control step |
+| 10 flow steps, task 7, 3 episodes | 2/3 success, ~153.3 ms/control step |
+
+The one 4-step failure was `libero_object` task 7, seed 43.  The same episode
+also failed at 6 and 10 flow steps, so this result does not appear to be caused
+by the 4-step latency setting.
 
 PI0-FAST, bf16, `lerobot/pi0fast-libero`, action-end decode:
 
@@ -113,6 +120,21 @@ MPLCONFIGDIR=/tmp/matplotlib-cache MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa \
   --dtype bfloat16 --amp-dtype bfloat16 \
   --num-inference-steps 4 \
   --output-dir outputs/pi05_rollout_steps4_object0_4_ep2
+```
+
+Full PI0.5 object-task rollout:
+
+```bash
+TORCH_COMPILE_DISABLE=1 HF_HOME=/home/ubuntu/AI-Infra-Final-Project/.hf_cache \
+LIBERO_CONFIG_PATH=/home/ubuntu/AI-Infra-Final-Project/.libero_config \
+MPLCONFIGDIR=/tmp/matplotlib-cache MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa \
+.venv-pi/bin/python scripts/run_pi0fast_chunk_eval.py \
+  --policy-kind pi05 --task libero_object --task-ids 0,1,2,3,4,5,6,7,8,9 \
+  --episodes 3 --steps 300 --modes baseline \
+  --summary-baseline-mode baseline --device cuda \
+  --dtype bfloat16 --amp-dtype bfloat16 \
+  --num-inference-steps 4 \
+  --output-dir outputs/pi05_rollout_steps4_object0_9_ep3
 ```
 
 PI0-FAST action-end replicated batch:
