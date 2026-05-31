@@ -9,6 +9,12 @@ serving when distinct robot observations are batched together.
 
 - Use `lerobot/pi05_libero_finetuned_v044` with bf16 autocast and
   `num_inference_steps=4` for the primary single-machine latency path.
+- Serve PI0.5 through deadline-aware admission control.  On one A100, start
+  with `max_active_sessions=4` for 1000 ms chunk requests or `8` for 1500 ms
+  chunk requests.
+- Use action-buffer mode for robot control loops.  With a 50-action chunk,
+  20 ms control period, and 5-action low watermark, each robot should request a
+  new chunk about every 900 ms or slower.
 - Do not keep `num_inference_steps=6` as the default fallback for task 7.  The
   same task/seed failed at 4, 6, and 10 steps, so the failure is not explained
   by the lower latency setting.
@@ -72,10 +78,13 @@ disabled, staggered robot chunk requests:
 | 4 robots, 1000 ms request period, 250 ms deadline | 0/20 misses, p95 ~169.4 ms |
 | 8 robots, 1000 ms request period, 250 ms deadline | 22/24 misses, p95 ~1120 ms |
 | 8 robots, 1500 ms request period, 250 ms deadline | 0/24 misses, p95 ~223.0 ms |
+| 4 robots, 10 s soak, action-buffer mode, 1000 ms request period, 250 ms deadline | 0/40 misses, p95 ~182.8 ms |
 
 The real serving smoke confirms that the practical 250 ms single-GPU boundary is
 around 4 robots at a 1000 ms chunk request period, or 8 robots at 1500 ms.  The
 8-robot/1500 ms case has only ~18 ms worst-case slack in this short run.
+The serving runtime now trims batches when estimated runtime would consume
+deadline slack, and it can reject new sessions with `--max-active-sessions`.
 
 PI0-FAST, bf16, `lerobot/pi0fast-libero`, action-end decode:
 
@@ -190,6 +199,19 @@ MPLCONFIGDIR=/tmp/matplotlib-cache MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa \
   --max-batch-size 8 --max-batch-delay-ms 5 \
   --num-inference-steps 4 --stagger-arrivals \
   --output outputs/pi05_real_serving_runtime/stagger_r8_s3_req1500_d250.json
+```
+
+PI0.5 load sweep / soak driver:
+
+```bash
+TORCHDYNAMO_DISABLE=1 \
+LIBERO_CONFIG_PATH=/home/ubuntu/AI-Infra-Final-Project/.libero_config \
+MPLCONFIGDIR=/tmp/matplotlib-cache MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa \
+.venv-pi/bin/python scripts/load_pi05_serving_runtime.py \
+  --robots 4,8 --request-period-ms 1000,1500 \
+  --deadline-ms 250 --soak-seconds 60 \
+  --max-active-sessions 8 --action-buffer-mode \
+  --output outputs/pi05_real_serving_runtime/load_soak_60s.json
 ```
 
 PI0-FAST action-end replicated batch:

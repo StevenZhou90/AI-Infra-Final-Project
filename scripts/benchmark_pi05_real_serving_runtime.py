@@ -48,13 +48,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--control-mode", choices=["relative", "absolute"], default="relative")
     parser.add_argument("--robots", type=int, default=4)
     parser.add_argument("--steps", type=int, default=5)
+    parser.add_argument("--soak-seconds", type=float, default=None)
     parser.add_argument("--warmup", type=int, default=1)
+    parser.add_argument("--control-period-ms", type=float, default=20.0)
     parser.add_argument("--request-period-ms", type=float, default=1000.0)
     parser.add_argument("--deadline-ms", type=float, default=250.0)
     parser.add_argument("--max-batch-size", type=int, default=8)
     parser.add_argument("--max-batch-delay-ms", type=float, default=5.0)
     parser.add_argument("--deadline-slack-ms", type=float, default=8.0)
     parser.add_argument("--num-inference-steps", type=int, default=4)
+    parser.add_argument("--max-active-sessions", type=int, default=None)
+    parser.add_argument("--estimated-base-ms", type=float, default=160.0)
+    parser.add_argument("--estimated-per-request-ms", type=float, default=35.0)
+    parser.add_argument("--action-buffer-mode", action="store_true")
+    parser.add_argument("--action-horizon", type=int, default=50)
+    parser.add_argument("--buffer-low-watermark", type=int, default=5)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
@@ -101,16 +109,27 @@ def prepare_robot_observations(
     return prepared
 
 
+def effective_request_period_ms(args: argparse.Namespace) -> float:
+    if not args.action_buffer_mode:
+        return args.request_period_ms
+    chunk_ms = max(args.action_horizon - args.buffer_low_watermark, 1) * args.control_period_ms
+    return max(args.request_period_ms, chunk_ms)
+
+
 def build_events(args: argparse.Namespace) -> list[tuple[int, int, int]]:
     events: list[tuple[int, int, int]] = []
-    for step in range(args.steps):
+    request_period_ms = effective_request_period_ms(args)
+    steps = args.steps
+    if args.soak_seconds is not None:
+        steps = max(1, int(np.ceil((args.soak_seconds * 1000.0) / request_period_ms)))
+    for step in range(steps):
         for robot in range(args.robots):
             phase_ns = (
-                int((robot / max(args.robots, 1)) * args.request_period_ms * NS_PER_MS)
+                int((robot / max(args.robots, 1)) * request_period_ms * NS_PER_MS)
                 if args.stagger_arrivals
                 else 0
             )
-            enqueued_ns = int(step * args.request_period_ms * NS_PER_MS) + phase_ns
+            enqueued_ns = int(step * request_period_ms * NS_PER_MS) + phase_ns
             events.append((enqueued_ns, robot, step))
     events.sort()
     return events
@@ -162,8 +181,11 @@ def run_serving_smoke(args: argparse.Namespace) -> dict[str, Any]:
             max_batch_size=args.max_batch_size,
             max_batch_delay_ms=args.max_batch_delay_ms,
             deadline_slack_ms=args.deadline_slack_ms,
+            estimated_batch_base_ms=args.estimated_base_ms,
+            estimated_batch_per_request_ms=args.estimated_per_request_ms,
             default_control_period_ms=args.deadline_ms,
             default_decode_mode="flow",
+            max_active_sessions=args.max_active_sessions,
         )
         runtime = PI0FastServingRuntime(backend, config)
 
@@ -204,7 +226,7 @@ def run_serving_smoke(args: argparse.Namespace) -> dict[str, Any]:
                 drain_once(service_available_ns, force=False)
                 if len(runtime.responses) == before:
                     break
-            runtime.submit(
+            admitted = runtime.try_submit(
                 PI0FastRequest(
                     request_id=f"r{robot}-s{step}",
                     session_id=f"robot-{robot}",
@@ -217,7 +239,8 @@ def run_serving_smoke(args: argparse.Namespace) -> dict[str, Any]:
                     observation=observations[robot],
                 )
             )
-            drain_once(enqueued_ns + int(args.max_batch_delay_ms * NS_PER_MS), force=False)
+            if admitted:
+                drain_once(enqueued_ns + int(args.max_batch_delay_ms * NS_PER_MS), force=False)
 
         while runtime.scheduler.queue_depth():
             drain_once(service_available_ns, force=True)
@@ -240,6 +263,7 @@ def run_serving_smoke(args: argparse.Namespace) -> dict[str, Any]:
             "dtype": args.dtype,
             "amp_dtype": None if args.amp_dtype == "none" else args.amp_dtype,
             "policy_num_inference_steps": getattr(policy.config, "num_inference_steps", None),
+            "effective_request_period_ms": effective_request_period_ms(args),
             "p50_latency_ms": percentile(latencies, 50),
             "p95_latency_ms": percentile(latencies, 95),
             "p99_latency_ms": percentile(latencies, 99),
