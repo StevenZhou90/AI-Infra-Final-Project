@@ -16,6 +16,7 @@ from serving.pi0fast_serving_runtime import (
     deadline_ns_from_period,
     merge_prepared_pi0fast_batches,
 )
+from serving.pi05_runtime_service import PI05RuntimeService
 
 
 def make_request(
@@ -93,6 +94,24 @@ def test_scheduler_flushes_when_deadline_is_close() -> None:
     assert batch.reason == "deadline"
 
 
+def test_scheduler_trims_batch_when_slack_is_tight() -> None:
+    cfg = PI0FastServingConfig(
+        max_batch_size=4,
+        max_batch_delay_ms=1.0,
+        deadline_slack_ms=5.0,
+        estimated_batch_base_ms=160.0,
+        estimated_batch_per_request_ms=45.0,
+    )
+    scheduler = PI0FastDeadlineBatchScheduler(cfg)
+    for idx in range(3):
+        scheduler.submit(make_request(idx, at_ns=0, period_ms=250.0, model="lerobot/pi05", mode="flow"))
+
+    batch = scheduler.pop_ready_batch(at_ns=2 * NS_PER_MS)
+
+    assert batch is not None
+    assert batch.size == 2
+
+
 def test_runtime_tracks_prompt_and_session_cache_hits() -> None:
     runtime = PI0FastServingRuntime(
         SyntheticPI0FastBackend(prefill_ms=10.0, decode_ms_per_token=1.0),
@@ -110,9 +129,29 @@ def test_runtime_tracks_prompt_and_session_cache_hits() -> None:
     assert runtime.stats()["session_cache_hit_rate"] == 0.5
 
 
+def test_runtime_rejects_new_sessions_over_limit() -> None:
+    runtime = PI0FastServingRuntime(
+        SyntheticPI0FastBackend(prefill_ms=10.0, decode_ms_per_token=1.0),
+        PI0FastServingConfig(max_active_sessions=1),
+    )
+
+    assert runtime.try_submit(make_request(0, session="session-a")) is True
+    assert runtime.try_submit(make_request(1, session="session-b")) is False
+    assert runtime.try_submit(make_request(2, session="session-a")) is True
+    assert runtime.stats()["rejected_requests"] == 1
+
+
 def test_synthetic_runtime_reports_batch_telemetry() -> None:
     backend = SyntheticPI0FastBackend(prefill_ms=20.0, decode_ms_per_token=2.0, batch_efficiency=0.5)
-    runtime = PI0FastServingRuntime(backend, PI0FastServingConfig(max_batch_size=4, max_batch_delay_ms=1.0))
+    runtime = PI0FastServingRuntime(
+        backend,
+        PI0FastServingConfig(
+            max_batch_size=4,
+            max_batch_delay_ms=1.0,
+            estimated_prefill_ms=20.0,
+            estimated_decode_ms_per_token=2.0,
+        ),
+    )
     for idx in range(4):
         runtime.submit(make_request(idx, at_ns=0))
 
@@ -212,9 +251,19 @@ def test_real_pi_batch_backend_passes_inference_kwargs() -> None:
 
 def test_synthetic_pi05_backend_scales_with_batch_size() -> None:
     backend = SyntheticPI05Backend(base_ms=160.0, per_request_ms=30.0, num_inference_steps=4)
-    runtime = PI0FastServingRuntime(backend, PI0FastServingConfig(max_batch_size=4, max_batch_delay_ms=1.0))
+    runtime = PI0FastServingRuntime(
+        backend,
+        PI0FastServingConfig(
+            max_batch_size=4,
+            max_batch_delay_ms=1.0,
+            estimated_batch_base_ms=160.0,
+            estimated_batch_per_request_ms=30.0,
+        ),
+    )
     for idx in range(4):
-        runtime.submit(make_request(idx, at_ns=0, model="lerobot/pi05_libero_finetuned_v044", mode="flow"))
+        runtime.submit(
+            make_request(idx, at_ns=0, period_ms=300.0, model="lerobot/pi05_libero_finetuned_v044", mode="flow")
+        )
 
     responses = runtime.drain_ready(at_ns=0)
 
@@ -222,3 +271,34 @@ def test_synthetic_pi05_backend_scales_with_batch_size() -> None:
     assert {resp.telemetry.runtime_ms for resp in responses} == {250.0}
     assert {resp.telemetry.action_tokens for resp in responses} == {4}
     assert responses[0].telemetry.extra["num_inference_steps"] == 4
+
+
+def test_pi05_runtime_service_reports_admission_rejection() -> None:
+    service = PI05RuntimeService(
+        SyntheticPI05Backend(base_ms=10.0, per_request_ms=1.0),
+        config=PI0FastServingConfig(max_active_sessions=1, max_batch_delay_ms=1.0),
+    )
+    observation = {"state": torch.zeros((1, 7))}
+
+    first = service.predict(
+        request_id="req-0",
+        robot_id="robot-0",
+        session_id="session-0",
+        observation=observation,
+        enqueued_ns=0,
+        force=True,
+    )
+    second = service.predict(
+        request_id="req-1",
+        robot_id="robot-1",
+        session_id="session-1",
+        observation=observation,
+        enqueued_ns=0,
+        force=True,
+    )
+
+    assert first.admitted is True
+    assert len(first.responses) == 1
+    assert second.admitted is False
+    assert second.reason == "admission_rejected"
+    assert service.status()["rejected_requests"] == 1

@@ -45,6 +45,9 @@ class PI0FastServingConfig:
     default_decode_mode: str = "prefix_gate"
     default_max_action_tokens: int = 64
     cache_memory_mb: float = 4096.0
+    max_active_sessions: int | None = None
+    estimated_batch_base_ms: float | None = None
+    estimated_batch_per_request_ms: float = 0.0
 
     def max_wait_ns(self, control_period_ms: float) -> int:
         """Wait no longer than a small fraction of the control period."""
@@ -54,6 +57,12 @@ class PI0FastServingConfig:
     def estimated_runtime_ns(self, token_budget: int) -> int:
         ms = self.estimated_prefill_ms + self.estimated_decode_ms_per_token * max(token_budget, 1)
         return int(ms * NS_PER_MS)
+
+    def estimated_batch_runtime_ns(self, token_budget: int, batch_size: int) -> int:
+        if self.estimated_batch_base_ms is not None:
+            ms = self.estimated_batch_base_ms + self.estimated_batch_per_request_ms * max(batch_size - 1, 0)
+            return int(ms * NS_PER_MS)
+        return self.estimated_runtime_ns(token_budget)
 
 
 @dataclass(frozen=True)
@@ -362,12 +371,29 @@ class PI0FastDeadlineBatchScheduler:
 
         _deadline, _neg_priority, reason, key = heapq.heappop(candidates)
         queue = self._queues[key]
-        selected = queue[: self.config.max_batch_size]
+        selected = self._select_batch_requests(queue, at_ns, reason)
         del queue[: len(selected)]
         if not queue:
             self._queues.pop(key, None)
         self.total_batches += 1
         return PI0FastBatch(requests=selected, formed_ns=at_ns, reason=reason)
+
+    def _select_batch_requests(self, queue: list[PI0FastRequest], at_ns: int, reason: str) -> list[PI0FastRequest]:
+        limit = min(len(queue), self.config.max_batch_size)
+        if limit <= 1 or reason in {"deadline", "force_flush"}:
+            return queue[:1] if not reason == "force_flush" else queue[:limit]
+
+        selected: list[PI0FastRequest] = []
+        slack_ns = int(self.config.deadline_slack_ms * NS_PER_MS)
+        for candidate in queue[:limit]:
+            trial = selected + [candidate]
+            token_budget = max(req.max_action_tokens for req in trial)
+            runtime_ns = self.config.estimated_batch_runtime_ns(token_budget, len(trial))
+            finish_ns = at_ns + runtime_ns + slack_ns
+            if selected and any(finish_ns >= req.effective_deadline_ns for req in trial):
+                break
+            selected = trial
+        return selected or queue[:1]
 
     def _ready_reason(self, queue: list[PI0FastRequest], at_ns: int, force: bool) -> str | None:
         if force:
@@ -402,10 +428,19 @@ class PI0FastServingRuntime:
         self.sessions: dict[str, PI0FastSessionState] = {}
         self.prompt_cache: set[str] = set()
         self.responses: list[PI0FastResponse] = []
+        self.rejected_requests = 0
 
     def submit(self, request: PI0FastRequest) -> None:
+        if not self.try_submit(request):
+            raise RuntimeError(f"Admission rejected request {request.request_id} for session {request.session_id}")
+
+    def try_submit(self, request: PI0FastRequest) -> bool:
+        if not self._can_admit(request):
+            self.rejected_requests += 1
+            return False
         self._ensure_session(request)
         self.scheduler.submit(request)
+        return True
 
     def drain_ready(self, at_ns: int | None = None, force: bool = False) -> list[PI0FastResponse]:
         responses: list[PI0FastResponse] = []
@@ -490,7 +525,15 @@ class PI0FastServingRuntime:
             "session_cache_hit_rate": cache_hits / max(total, 1),
             "prompt_cache_hit_rate": prompt_hits / max(total, 1),
             "sessions": len(self.sessions),
+            "rejected_requests": self.rejected_requests,
         }
+
+    def _can_admit(self, request: PI0FastRequest) -> bool:
+        if request.session_id in self.sessions:
+            return True
+        if self.config.max_active_sessions is None:
+            return True
+        return len(self.sessions) < self.config.max_active_sessions
 
     def _ensure_session(self, request: PI0FastRequest) -> PI0FastSessionState:
         session = self.sessions.get(request.session_id)
