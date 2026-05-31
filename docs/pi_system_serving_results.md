@@ -47,6 +47,21 @@ The one 4-step failure was `libero_object` task 7, seed 43.  The same episode
 also failed at 6 and 10 flow steps, so this result does not appear to be caused
 by the 4-step latency setting.
 
+PI0.5 synthetic serving capacity, calibrated from 4-step bf16 latency and
+staggered robot chunk requests:
+
+| Chunk request period | 200 ms deadline | 250 ms deadline |
+| --- | ---: | ---: |
+| 800 ms | 4 robots | 4 robots |
+| 1000 ms | 4 robots | 4 robots |
+| 1500 ms | 8 robots | 8 robots |
+| 2000 ms | 12 robots | 12 robots |
+
+These are zero-deadline-miss estimates using single-request execution after
+staggering robot phases.  Synchronous requests batch better for throughput but
+miss strict 200-250 ms per-request deadlines once batch latency exceeds the
+deadline.
+
 PI0-FAST, bf16, `lerobot/pi0fast-libero`, action-end decode:
 
 | Mode | Mean latency |
@@ -135,6 +150,17 @@ MPLCONFIGDIR=/tmp/matplotlib-cache MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa \
   --dtype bfloat16 --amp-dtype bfloat16 \
   --num-inference-steps 4 \
   --output-dir outputs/pi05_rollout_steps4_object0_9_ep3
+```
+
+PI0.5 synthetic serving capacity:
+
+```bash
+.venv-pi/bin/python scripts/benchmark_pi0fast_serving_runtime.py \
+  --backend pi05 --robots 8 --steps 50 \
+  --request-period-ms 1500 --deadline-ms 250 \
+  --mode flow --max-batch-size 8 --max-batch-delay-ms 5 \
+  --stagger-arrivals --pi05-base-ms 158 --pi05-per-request-ms 31 \
+  --output outputs/pi05_serving_capacity_staggered/pi05_r8_req1500_d250.json
 ```
 
 PI0-FAST action-end replicated batch:

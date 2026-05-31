@@ -11,6 +11,7 @@ from serving.pi0fast_serving_runtime import (
     PI0FastServingConfig,
     PI0FastServingRuntime,
     RealPIBatchBackend,
+    SyntheticPI05Backend,
     SyntheticPI0FastBackend,
     deadline_ns_from_period,
     merge_prepared_pi0fast_batches,
@@ -207,3 +208,17 @@ def test_real_pi_batch_backend_passes_inference_kwargs() -> None:
     assert len(results) == 2
     assert results[0].accelerator == "real_pi05_batch"
     assert results[0].extra["inference_kwargs"] == {"num_steps": 6}
+
+
+def test_synthetic_pi05_backend_scales_with_batch_size() -> None:
+    backend = SyntheticPI05Backend(base_ms=160.0, per_request_ms=30.0, num_inference_steps=4)
+    runtime = PI0FastServingRuntime(backend, PI0FastServingConfig(max_batch_size=4, max_batch_delay_ms=1.0))
+    for idx in range(4):
+        runtime.submit(make_request(idx, at_ns=0, model="lerobot/pi05_libero_finetuned_v044", mode="flow"))
+
+    responses = runtime.drain_ready(at_ns=0)
+
+    assert len(responses) == 4
+    assert {resp.telemetry.runtime_ms for resp in responses} == {250.0}
+    assert {resp.telemetry.action_tokens for resp in responses} == {4}
+    assert responses[0].telemetry.extra["num_inference_steps"] == 4

@@ -573,3 +573,54 @@ class SyntheticPI0FastBackend:
         if request.decode_mode == "prefix_gate":
             return min(request.max_action_tokens, self.prefix_gate_tokens)
         return min(request.max_action_tokens, self.baseline_tokens)
+
+
+class SyntheticPI05Backend:
+    """Synthetic backend calibrated from measured PI0.5 flow serving latencies."""
+
+    def __init__(
+        self,
+        action_dim: int = 7,
+        action_horizon: int = 50,
+        base_ms: float = 158.0,
+        per_request_ms: float = 31.0,
+        num_inference_steps: int = 4,
+        sleep: bool = False,
+    ) -> None:
+        self.action_dim = action_dim
+        self.action_horizon = action_horizon
+        self.base_ms = base_ms
+        self.per_request_ms = per_request_ms
+        self.num_inference_steps = num_inference_steps
+        self.sleep = sleep
+        self.calls = 0
+        self.last_runtime_ms = 0.0
+
+    def predict_batch(
+        self,
+        batch: PI0FastBatch,
+        sessions: Mapping[str, PI0FastSessionState],
+    ) -> Sequence[PI0FastBackendResult]:
+        self.calls += 1
+        self.last_runtime_ms = self.base_ms + self.per_request_ms * max(batch.size - 1, 0)
+        if self.sleep:
+            time.sleep(self.last_runtime_ms / 1000.0)
+
+        results: list[PI0FastBackendResult] = []
+        for req in batch.requests:
+            seed = abs(hash((req.request_id, req.session_id))) % (2**32)
+            rng = np.random.default_rng(seed)
+            actions = rng.normal(0.0, 0.02, size=(self.action_horizon, self.action_dim)).astype(np.float32)
+            actions[:, -1] = 0.0
+            results.append(
+                PI0FastBackendResult(
+                    actions=actions,
+                    action_tokens=self.num_inference_steps,
+                    accelerator="synthetic_pi05",
+                    extra={
+                        "num_inference_steps": self.num_inference_steps,
+                        "synthetic_runtime_ms": self.last_runtime_ms,
+                    },
+                )
+            )
+        return results
