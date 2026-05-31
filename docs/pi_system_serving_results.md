@@ -9,8 +9,9 @@ serving when distinct robot observations are batched together.
 
 - Use `lerobot/pi05_libero_finetuned_v044` with bf16 autocast and
   `num_inference_steps=4` for the primary single-machine latency path.
-- Keep `num_inference_steps=6` as the conservative fallback until rollout
-  success is validated for 4-step inference.
+- Do not keep `num_inference_steps=6` as the default fallback for task 7.  The
+  same task/seed failed at 4, 6, and 10 steps, so the failure is not explained
+  by the lower latency setting.
 - Keep PI0-FAST on the `action_end` decode path for serving.  Do not use the
   public fixed-256-token decode path except as a baseline.
 - Treat PI0-FAST rows above `96` FAST tokens as stragglers in telemetry.  Use a
@@ -61,6 +62,20 @@ These are zero-deadline-miss estimates using single-request execution after
 staggering robot phases.  Synchronous requests batch better for throughput but
 miss strict 200-250 ms per-request deadlines once batch latency exceeds the
 deadline.
+
+PI0.5 real serving-runtime smoke, bf16 autocast, 4 flow steps, TorchDynamo
+disabled, staggered robot chunk requests:
+
+| Mode | Result |
+| --- | ---: |
+| 1 robot, 1000 ms request period, 250 ms deadline | 0/5 misses, p95 ~166.9 ms |
+| 4 robots, 1000 ms request period, 250 ms deadline | 0/20 misses, p95 ~169.4 ms |
+| 8 robots, 1000 ms request period, 250 ms deadline | 22/24 misses, p95 ~1120 ms |
+| 8 robots, 1500 ms request period, 250 ms deadline | 0/24 misses, p95 ~223.0 ms |
+
+The real serving smoke confirms that the practical 250 ms single-GPU boundary is
+around 4 robots at a 1000 ms chunk request period, or 8 robots at 1500 ms.  The
+8-robot/1500 ms case has only ~18 ms worst-case slack in this short run.
 
 PI0-FAST, bf16, `lerobot/pi0fast-libero`, action-end decode:
 
@@ -161,6 +176,20 @@ PI0.5 synthetic serving capacity:
   --mode flow --max-batch-size 8 --max-batch-delay-ms 5 \
   --stagger-arrivals --pi05-base-ms 158 --pi05-per-request-ms 31 \
   --output outputs/pi05_serving_capacity_staggered/pi05_r8_req1500_d250.json
+```
+
+PI0.5 real serving-runtime smoke:
+
+```bash
+TORCHDYNAMO_DISABLE=1 \
+LIBERO_CONFIG_PATH=/home/ubuntu/AI-Infra-Final-Project/.libero_config \
+MPLCONFIGDIR=/tmp/matplotlib-cache MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa \
+.venv-pi/bin/python scripts/benchmark_pi05_real_serving_runtime.py \
+  --robots 8 --steps 3 --warmup 2 \
+  --request-period-ms 1500 --deadline-ms 250 \
+  --max-batch-size 8 --max-batch-delay-ms 5 \
+  --num-inference-steps 4 --stagger-arrivals \
+  --output outputs/pi05_real_serving_runtime/stagger_r8_s3_req1500_d250.json
 ```
 
 PI0-FAST action-end replicated batch:
