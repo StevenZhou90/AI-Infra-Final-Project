@@ -21,7 +21,7 @@ import numpy as np
 import torch
 
 from proto import inference_pb2, inference_pb2_grpc
-from serving.pi05_grpc_codec import decode_prepared_observation
+from serving.pi05_grpc_codec import decode_prepared_observation, decode_prepared_observation_fields
 from serving.pi05_runtime_service import PI05RuntimeService
 from serving.pi0fast_serving_runtime import (
     NS_PER_MS,
@@ -105,9 +105,12 @@ class PI05InferenceServicer(inference_pb2_grpc.InferenceServiceServicer):
         session_id = request.session_id or request.robot_id or request.request_id
         robot_id = request.robot_id or session_id
         try:
-            if request.observation_format not in {"", "torch"}:
+            if request.observation_format not in {"", "torch", "tensor_fields"}:
                 raise ValueError(f"Unsupported observation_format={request.observation_format!r}")
-            observation = decode_prepared_observation(request.prepared_observation, device=self.device)
+            if request.observation_format == "tensor_fields":
+                observation = decode_prepared_observation_fields(request.prepared_fields, device=self.device)
+            else:
+                observation = decode_prepared_observation(request.prepared_observation, device=self.device)
             work = PI05QueuedWork(
                 request_id=request.request_id,
                 robot_id=robot_id,
@@ -280,6 +283,7 @@ def load_service(args: argparse.Namespace) -> tuple[PI05RuntimeService, torch.de
     policy = PI05Policy.from_pretrained(args.policy).to(device=device, dtype=dtype).eval()
     if hasattr(policy.config, "num_inference_steps"):
         policy.config.num_inference_steps = int(args.num_inference_steps)
+    maybe_compile_policy(policy, args)
     backend = RealPIBatchBackend(
         policy,
         postprocessor=None,
@@ -299,6 +303,24 @@ def load_service(args: argparse.Namespace) -> tuple[PI05RuntimeService, torch.de
         max_admission_utilization=args.max_admission_utilization,
     )
     return PI05RuntimeService(backend, model_id=args.policy, config=config), device
+
+
+def maybe_compile_policy(policy: Any, args: argparse.Namespace) -> None:
+    if args.compile_target == "none":
+        return
+    if args.compile_target == "model":
+        if not hasattr(policy, "model"):
+            raise ValueError("--compile-target model requires policy.model")
+        policy.model = torch.compile(policy.model, mode=args.compile_mode)
+        logger.info("Compiled policy.model with torch.compile mode=%s", args.compile_mode)
+        return
+    if args.compile_target == "sample_actions":
+        if not hasattr(policy, "model") or not hasattr(policy.model, "sample_actions"):
+            raise ValueError("--compile-target sample_actions requires policy.model.sample_actions")
+        policy.model.sample_actions = torch.compile(policy.model.sample_actions, mode=args.compile_mode)
+        logger.info("Compiled policy.model.sample_actions with torch.compile mode=%s", args.compile_mode)
+        return
+    raise ValueError(f"Unsupported compile target: {args.compile_target}")
 
 
 def serve(args: argparse.Namespace) -> None:
@@ -368,6 +390,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
     parser.add_argument("--amp-dtype", default="bfloat16", choices=["bfloat16", "float16", "float32", "none"])
     parser.add_argument("--num-inference-steps", type=int, default=4)
+    parser.add_argument("--compile-target", choices=["none", "model", "sample_actions"], default="none")
+    parser.add_argument("--compile-mode", default="default")
     parser.add_argument("--deadline-ms", type=float, default=250.0)
     parser.add_argument("--max-active-sessions", type=int, default=4)
     parser.add_argument("--max-admission-utilization", type=float, default=None)

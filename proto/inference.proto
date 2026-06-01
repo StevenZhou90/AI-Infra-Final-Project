@@ -42,6 +42,14 @@ message ImageFrame {
   string encoding = 5;          // "jpeg", "raw_rgb"
 }
 
+message ObservationField {
+  string name = 1;
+  string dtype = 2;             // torch dtype name, e.g. "float32", "bfloat16"
+  repeated int64 shape = 3;
+  bytes data = 4;               // contiguous CPU tensor bytes
+  string json_value = 5;        // JSON fallback for list/string/scalar metadata
+}
+
 message PredictRequest {
   string request_id = 1;
   string model_id = 2;          // which loaded model to use
@@ -56,7 +64,8 @@ message PredictRequest {
   float control_period_ms = 11;
   float request_period_ms = 12;
   bytes prepared_observation = 13;  // torch.save(dict) for PI0.5 prepared observations
-  string observation_format = 14;   // "torch"
+  string observation_format = 14;   // "torch", "tensor_fields"
+  repeated ObservationField prepared_fields = 15;
 }
 
 message PredictResponse {

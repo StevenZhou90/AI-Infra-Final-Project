@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from proto import inference_pb2, inference_pb2_grpc  # noqa: E402
 from scripts.run_pi0fast_chunk_eval import _ensure_libero_config, _import_lerobot, _prepare_observation  # noqa: E402
-from serving.pi05_grpc_codec import encode_prepared_observation  # noqa: E402
+from serving.pi05_grpc_codec import encode_prepared_observation, encode_prepared_observation_fields  # noqa: E402
 
 
 def percentile(values: list[float], q: float) -> float:
@@ -41,13 +41,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stagger-arrivals", action="store_true")
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--payload-format", choices=["torch", "tensor_fields"], default="torch")
     parser.add_argument("--libero-config-path", default=os.environ.get("LIBERO_CONFIG_PATH"))
     parser.add_argument("--save-warmup-observation", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=Path("outputs/pi05_grpc_load/summary.json"))
     return parser.parse_args()
 
 
-def prepare_observation_payloads(args: argparse.Namespace) -> list[bytes]:
+def prepare_observation_payloads(args: argparse.Namespace) -> list[dict[str, Any]]:
     _ensure_libero_config(args.libero_config_path)
     make_env, make_env_pre_post_processors, preprocess_observation, LiberoEnv, make_pre_post_processors, _PI0FastPolicy = (
         _import_lerobot()
@@ -67,11 +68,19 @@ def prepare_observation_payloads(args: argparse.Namespace) -> list[bytes]:
     env_map = make_env(env_cfg, n_envs=1, use_async_envs=False)
     env = env_map[args.task][args.task_id]
     try:
-        payloads: list[bytes] = []
+        payloads: list[dict[str, Any]] = []
         for robot in range(args.robots):
             observation, _info = env.reset(seed=[args.seed + robot])
             prepared = _prepare_observation(observation, env, env_preprocessor, policy_preprocessor, preprocess_observation)
-            payloads.append(encode_prepared_observation(prepared))
+            if args.payload_format == "tensor_fields":
+                payloads.append(
+                    {
+                        "bytes": encode_prepared_observation(prepared),
+                        "fields": encode_prepared_observation_fields(prepared),
+                    }
+                )
+            else:
+                payloads.append({"bytes": encode_prepared_observation(prepared)})
         return payloads
     finally:
         try:
@@ -84,7 +93,7 @@ def worker(
     *,
     args: argparse.Namespace,
     robot_idx: int,
-    payload: bytes,
+    payload: dict[str, Any],
     start_at: float,
     rows: list[dict[str, Any]],
     lock: threading.Lock,
@@ -107,8 +116,9 @@ def worker(
                 timestamp_ns=time.time_ns(),
                 deadline_ms=args.deadline_ms,
                 request_period_ms=args.request_period_ms,
-                prepared_observation=payload,
-                observation_format="torch",
+                prepared_observation=payload.get("bytes", b""),
+                prepared_fields=payload.get("fields", []),
+                observation_format=args.payload_format,
             )
         )
     period_s = args.request_period_ms / 1000.0
@@ -131,8 +141,9 @@ def worker(
                 timestamp_ns=time.time_ns(),
                 deadline_ms=args.deadline_ms,
                 request_period_ms=args.request_period_ms,
-                prepared_observation=payload,
-                observation_format="torch",
+                prepared_observation=payload.get("bytes", b""),
+                prepared_fields=payload.get("fields", []),
+                observation_format=args.payload_format,
             )
         )
         client_latency_ms = (time.perf_counter() - wall_start) * 1000.0
@@ -193,7 +204,7 @@ def main() -> None:
     payloads = prepare_observation_payloads(args)
     if args.save_warmup_observation is not None:
         args.save_warmup_observation.parent.mkdir(parents=True, exist_ok=True)
-        args.save_warmup_observation.write_bytes(payloads[0])
+        args.save_warmup_observation.write_bytes(payloads[0]["bytes"])
     if args.duration_seconds <= 0:
         summary = summarize(args, [])
         args.output.parent.mkdir(parents=True, exist_ok=True)

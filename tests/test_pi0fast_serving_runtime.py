@@ -17,7 +17,12 @@ from serving.pi0fast_serving_runtime import (
     merge_prepared_pi0fast_batches,
 )
 from serving.pi05_runtime_service import PI05RuntimeService
-from serving.pi05_grpc_codec import decode_prepared_observation, encode_prepared_observation
+from serving.pi05_grpc_codec import (
+    decode_prepared_observation,
+    decode_prepared_observation_fields,
+    encode_prepared_observation,
+    encode_prepared_observation_fields,
+)
 from serving.pi05_server import PI05InferenceServicer, PI05QueuedWork
 
 
@@ -344,6 +349,18 @@ def test_pi05_grpc_codec_round_trips_prepared_observation() -> None:
     }
 
     decoded = decode_prepared_observation(encode_prepared_observation(observation))
+
+    assert torch.equal(decoded["state"], observation["state"])
+    assert decoded["task"] == ["pick up the object"]
+
+
+def test_pi05_grpc_codec_round_trips_tensor_fields() -> None:
+    observation = {
+        "state": torch.ones((1, 7), dtype=torch.float32),
+        "task": ["pick up the object"],
+    }
+
+    decoded = decode_prepared_observation_fields(encode_prepared_observation_fields(observation))
 
     assert torch.equal(decoded["state"], observation["state"])
     assert decoded["task"] == ["pick up the object"]
