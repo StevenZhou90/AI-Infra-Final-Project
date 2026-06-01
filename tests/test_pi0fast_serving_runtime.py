@@ -140,6 +140,37 @@ def test_runtime_rejects_new_sessions_over_limit() -> None:
     assert runtime.try_submit(make_request(1, session="session-b")) is False
     assert runtime.try_submit(make_request(2, session="session-a")) is True
     assert runtime.stats()["rejected_requests"] == 1
+    assert runtime.stats()["rejection_reasons"] == {"max_active_sessions": 1}
+
+
+def test_runtime_rejects_projected_utilization_over_limit() -> None:
+    runtime = PI0FastServingRuntime(
+        SyntheticPI05Backend(base_ms=160.0, per_request_ms=30.0),
+        PI0FastServingConfig(
+            estimated_batch_base_ms=160.0,
+            max_admission_utilization=0.7,
+            default_request_period_ms=1000.0,
+        ),
+    )
+
+    for idx in range(4):
+        req = make_request(
+            idx,
+            session=f"session-{idx}",
+            model="lerobot/pi05_libero_finetuned_v044",
+            mode="flow",
+        )
+        req = PI0FastRequest(**{**req.__dict__, "metadata": {"request_period_ms": 1000.0}})
+        assert runtime.try_submit(req) is True
+
+    rejected = make_request(5, session="session-5", model="lerobot/pi05_libero_finetuned_v044", mode="flow")
+    rejected = PI0FastRequest(**{**rejected.__dict__, "metadata": {"request_period_ms": 1000.0}})
+
+    assert runtime.try_submit(rejected) is False
+    stats = runtime.stats()
+    assert stats["rejected_requests"] == 1
+    assert stats["rejection_reasons"] == {"projected_utilization": 1}
+    assert 0.63 < stats["admission_utilization"] < 0.65
 
 
 def test_synthetic_runtime_reports_batch_telemetry() -> None:
@@ -301,7 +332,7 @@ def test_pi05_runtime_service_reports_admission_rejection() -> None:
     assert first.admitted is True
     assert len(first.responses) == 1
     assert second.admitted is False
-    assert second.reason == "admission_rejected"
+    assert second.reason == "max_active_sessions"
     assert service.status()["rejected_requests"] == 1
 
 

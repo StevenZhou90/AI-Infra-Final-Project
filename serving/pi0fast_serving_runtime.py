@@ -46,6 +46,8 @@ class PI0FastServingConfig:
     default_max_action_tokens: int = 64
     cache_memory_mb: float = 4096.0
     max_active_sessions: int | None = None
+    max_admission_utilization: float | None = None
+    default_request_period_ms: float = 1000.0
     estimated_batch_base_ms: float | None = None
     estimated_batch_per_request_ms: float = 0.0
 
@@ -111,6 +113,8 @@ class PI0FastSessionState:
     cache_hits: int = 0
     cache_misses: int = 0
     buffered_actions: int = 0
+    request_period_ms: float = 1000.0
+    token_budget: int = 64
 
 
 @dataclass
@@ -429,15 +433,21 @@ class PI0FastServingRuntime:
         self.prompt_cache: set[str] = set()
         self.responses: list[PI0FastResponse] = []
         self.rejected_requests = 0
+        self.rejection_reasons: dict[str, int] = defaultdict(int)
+        self.last_rejection_reason = ""
 
     def submit(self, request: PI0FastRequest) -> None:
         if not self.try_submit(request):
             raise RuntimeError(f"Admission rejected request {request.request_id} for session {request.session_id}")
 
     def try_submit(self, request: PI0FastRequest) -> bool:
-        if not self._can_admit(request):
+        reason = self._admission_rejection_reason(request)
+        if reason is not None:
             self.rejected_requests += 1
+            self.rejection_reasons[reason] += 1
+            self.last_rejection_reason = reason
             return False
+        self.last_rejection_reason = ""
         self._ensure_session(request)
         self.scheduler.submit(request)
         return True
@@ -526,14 +536,39 @@ class PI0FastServingRuntime:
             "prompt_cache_hit_rate": prompt_hits / max(total, 1),
             "sessions": len(self.sessions),
             "rejected_requests": self.rejected_requests,
+            "rejection_reasons": dict(self.rejection_reasons),
+            "admission_utilization": self.admission_utilization(),
         }
 
-    def _can_admit(self, request: PI0FastRequest) -> bool:
+    def admission_utilization(self) -> float:
+        return sum(self._session_utilization(session) for session in self.sessions.values())
+
+    def _admission_rejection_reason(self, request: PI0FastRequest) -> str | None:
         if request.session_id in self.sessions:
-            return True
-        if self.config.max_active_sessions is None:
-            return True
-        return len(self.sessions) < self.config.max_active_sessions
+            return None
+        if self.config.max_active_sessions is not None and len(self.sessions) >= self.config.max_active_sessions:
+            return "max_active_sessions"
+        if self.config.max_admission_utilization is None:
+            return None
+        projected = self.admission_utilization() + self._request_utilization(request)
+        if projected > self.config.max_admission_utilization:
+            return "projected_utilization"
+        return None
+
+    def _session_utilization(self, session: PI0FastSessionState) -> float:
+        runtime_ms = self.config.estimated_batch_runtime_ns(session.token_budget, 1) / NS_PER_MS
+        return runtime_ms / max(session.request_period_ms, 1.0)
+
+    def _request_utilization(self, request: PI0FastRequest) -> float:
+        runtime_ms = self.config.estimated_batch_runtime_ns(request.max_action_tokens, 1) / NS_PER_MS
+        return runtime_ms / max(self._request_period_ms(request), 1.0)
+
+    def _request_period_ms(self, request: PI0FastRequest) -> float:
+        raw = request.metadata.get("request_period_ms", self.config.default_request_period_ms)
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return self.config.default_request_period_ms
 
     def _ensure_session(self, request: PI0FastRequest) -> PI0FastSessionState:
         session = self.sessions.get(request.session_id)
@@ -542,8 +577,13 @@ class PI0FastServingRuntime:
                 session_id=request.session_id,
                 robot_id=request.robot_id,
                 model_id=request.model_id,
+                request_period_ms=self._request_period_ms(request),
+                token_budget=request.max_action_tokens,
             )
             self.sessions[request.session_id] = session
+        else:
+            session.request_period_ms = self._request_period_ms(request)
+            session.token_budget = request.max_action_tokens
         return session
 
 

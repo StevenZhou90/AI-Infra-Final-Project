@@ -58,6 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--deadline-slack-ms", type=float, default=8.0)
     parser.add_argument("--num-inference-steps", type=int, default=4)
     parser.add_argument("--max-active-sessions", type=int, default=None)
+    parser.add_argument("--max-admission-utilization", type=float, default=None)
     parser.add_argument("--estimated-base-ms", type=float, default=160.0)
     parser.add_argument("--estimated-per-request-ms", type=float, default=35.0)
     parser.add_argument("--action-buffer-mode", action="store_true")
@@ -186,6 +187,8 @@ def run_serving_smoke(args: argparse.Namespace) -> dict[str, Any]:
             default_control_period_ms=args.deadline_ms,
             default_decode_mode="flow",
             max_active_sessions=args.max_active_sessions,
+            max_admission_utilization=args.max_admission_utilization,
+            default_request_period_ms=effective_request_period_ms(args),
         )
         runtime = PI0FastServingRuntime(backend, config)
 
@@ -237,6 +240,7 @@ def run_serving_smoke(args: argparse.Namespace) -> dict[str, Any]:
                     control_period_ms=args.deadline_ms,
                     decode_mode="flow",
                     observation=observations[robot],
+                    metadata={"request_period_ms": effective_request_period_ms(args)},
                 )
             )
             if admitted:

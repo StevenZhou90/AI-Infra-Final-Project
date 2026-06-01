@@ -83,6 +83,7 @@ class PI05InferenceServicer(inference_pb2_grpc.InferenceServiceServicer):
                     observation=observation,
                     enqueued_ns=request.timestamp_ns or None,
                     deadline_ms=deadline_ms,
+                    request_period_ms=float(request.request_period_ms or 0.0) or None,
                 )
                 if not result.admitted:
                     response = inference_pb2.PredictResponse(
@@ -186,8 +187,10 @@ def load_service(args: argparse.Namespace) -> tuple[PI05RuntimeService, torch.de
         estimated_batch_base_ms=args.estimated_base_ms,
         estimated_batch_per_request_ms=args.estimated_per_request_ms,
         default_control_period_ms=args.deadline_ms,
+        default_request_period_ms=args.default_request_period_ms,
         default_decode_mode="flow",
         max_active_sessions=args.max_active_sessions,
+        max_admission_utilization=args.max_admission_utilization,
     )
     return PI05RuntimeService(backend, model_id=args.policy, config=config), device
 
@@ -224,6 +227,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-inference-steps", type=int, default=4)
     parser.add_argument("--deadline-ms", type=float, default=250.0)
     parser.add_argument("--max-active-sessions", type=int, default=4)
+    parser.add_argument("--max-admission-utilization", type=float, default=None)
+    parser.add_argument("--default-request-period-ms", type=float, default=1000.0)
     parser.add_argument("--max-batch-size", type=int, default=8)
     parser.add_argument("--max-batch-delay-ms", type=float, default=5.0)
     parser.add_argument("--deadline-slack-ms", type=float, default=8.0)

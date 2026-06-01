@@ -12,6 +12,9 @@ serving when distinct robot observations are batched together.
 - Serve PI0.5 through deadline-aware admission control.  On one A100, start
   with `max_active_sessions=4` for 1000 ms chunk requests or `8` for 1500 ms
   chunk requests.
+- Prefer load-based admission once request periods are known.  With the current
+  160 ms p95 runtime estimate, `--max-admission-utilization 0.7` admits about
+  four 1000 ms sessions and rejects the fifth before queueing latency explodes.
 - Use action-buffer mode for robot control loops.  With a 50-action chunk,
   20 ms control period, and 5-action low watermark, each robot should request a
   new chunk about every 900 ms or slower.
@@ -85,7 +88,8 @@ The real serving smoke confirms that the practical 250 ms single-GPU boundary is
 around 4 robots at a 1000 ms chunk request period, or 8 robots at 1500 ms.  The
 8-robot/1500 ms case has only ~18 ms worst-case slack in this short run.
 The serving runtime now trims batches when estimated runtime would consume
-deadline slack, and it can reject new sessions with `--max-active-sessions`.
+deadline slack.  It can reject new sessions with either `--max-active-sessions`
+or projected utilization from `--max-admission-utilization`.
 
 PI0-FAST, bf16, `lerobot/pi0fast-libero`, action-end decode:
 
@@ -224,6 +228,7 @@ MPLCONFIGDIR=/tmp/matplotlib-cache MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa \
 .venv-pi/bin/python -m serving.pi05_server \
   --port 50051 \
   --max-active-sessions 4 \
+  --max-admission-utilization 0.7 \
   --deadline-ms 250 \
   --num-inference-steps 4 \
   --metrics-path outputs/pi05_grpc_server/metrics.jsonl

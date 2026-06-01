@@ -49,6 +49,7 @@ class PI05RuntimeService:
         observation: Mapping[str, Any],
         enqueued_ns: int | None = None,
         deadline_ms: float = 250.0,
+        request_period_ms: float | None = None,
         max_batch_delay_ms: float | None = None,
         force: bool = False,
     ) -> PI05ServiceResult:
@@ -63,9 +64,16 @@ class PI05RuntimeService:
             control_period_ms=deadline_ms,
             decode_mode="flow",
             observation=observation,
+            metadata={"request_period_ms": request_period_ms}
+            if request_period_ms is not None
+            else {},
         )
         if not self.runtime.try_submit(request):
-            return PI05ServiceResult(admitted=False, responses=[], reason="admission_rejected")
+            return PI05ServiceResult(
+                admitted=False,
+                responses=[],
+                reason=self.runtime.last_rejection_reason or "admission_rejected",
+            )
 
         delay_ms = self.runtime.config.max_batch_delay_ms if max_batch_delay_ms is None else max_batch_delay_ms
         drain_ns = enqueued_ns + int(delay_ms * 1_000_000)

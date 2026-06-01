@@ -34,6 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-batch-delay-ms", type=float, default=5.0)
     parser.add_argument("--num-inference-steps", type=int, default=4)
     parser.add_argument("--max-active-sessions", type=int, default=None)
+    parser.add_argument("--max-admission-utilization", type=float, default=None)
     parser.add_argument("--action-buffer-mode", action="store_true")
     parser.add_argument("--stagger-arrivals", action="store_true", default=True)
     parser.add_argument("--output", type=Path, default=Path("outputs/pi05_real_serving_runtime/load_sweep.json"))
@@ -61,6 +62,7 @@ def child_args(args: argparse.Namespace, robots: int, request_period_ms: float, 
         "deadline_slack_ms": 8.0,
         "num_inference_steps": args.num_inference_steps,
         "max_active_sessions": args.max_active_sessions,
+        "max_admission_utilization": args.max_admission_utilization,
         "estimated_base_ms": 160.0,
         "estimated_per_request_ms": 35.0,
         "action_buffer_mode": args.action_buffer_mode,
