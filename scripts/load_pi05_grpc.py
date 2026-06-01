@@ -206,6 +206,7 @@ def worker(
                     "batch_size": int(response.batch_size),
                     "batch_reason": response.batch_reason,
                     "actions_returned": int(response.actions_returned),
+                    "telemetry_json": response.telemetry_json,
                     "rpc_error": False,
                     "rpc_status": "",
                     "rpc_details": "",
@@ -226,6 +227,18 @@ def summarize(args: argparse.Namespace, rows: list[dict[str, Any]]) -> dict[str,
     queues = [row["queue_ms"] for row in admitted]
     runtimes = [row["runtime_ms"] for row in admitted]
     slacks = [row["deadline_slack_ms"] for row in admitted]
+    cluster_worker_counts: dict[str, int] = {}
+    for row in rows:
+        telemetry_json = row.get("telemetry_json")
+        if not telemetry_json:
+            continue
+        try:
+            telemetry = json.loads(telemetry_json)
+        except json.JSONDecodeError:
+            continue
+        worker_id = telemetry.get("cluster_worker_id")
+        if worker_id:
+            cluster_worker_counts[str(worker_id)] = cluster_worker_counts.get(str(worker_id), 0) + 1
     return {
         "config": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
         "requests": len(rows),
@@ -243,6 +256,7 @@ def summarize(args: argparse.Namespace, rows: list[dict[str, Any]]) -> dict[str,
         "p95_queue_ms": percentile(queues, 95),
         "p95_runtime_ms": percentile(runtimes, 95),
         "min_deadline_slack_ms": float(min(slacks)) if slacks else 0.0,
+        "cluster_worker_counts": cluster_worker_counts,
         "rows": rows,
     }
 
