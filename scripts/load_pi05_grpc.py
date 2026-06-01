@@ -38,17 +38,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-requests", type=int, default=1)
     parser.add_argument("--request-period-ms", type=float, default=1000.0)
     parser.add_argument("--deadline-ms", type=float, default=250.0)
+    parser.add_argument("--rpc-timeout-ms", type=float, default=None)
     parser.add_argument("--stagger-arrivals", action="store_true")
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--payload-format", choices=["torch", "tensor_fields"], default="torch")
     parser.add_argument("--libero-config-path", default=os.environ.get("LIBERO_CONFIG_PATH"))
+    parser.add_argument("--prepared-observation-path", type=Path, default=None)
     parser.add_argument("--save-warmup-observation", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=Path("outputs/pi05_grpc_load/summary.json"))
     return parser.parse_args()
 
 
 def prepare_observation_payloads(args: argparse.Namespace) -> list[dict[str, Any]]:
+    if args.prepared_observation_path is not None:
+        if args.payload_format != "torch":
+            raise ValueError("--prepared-observation-path currently supports --payload-format torch only")
+        observation_bytes = args.prepared_observation_path.read_bytes()
+        return [{"bytes": observation_bytes} for _ in range(args.robots)]
+
     _ensure_libero_config(args.libero_config_path)
     make_env, make_env_pre_post_processors, preprocess_observation, LiberoEnv, make_pre_post_processors, _PI0FastPolicy = (
         _import_lerobot()
@@ -106,6 +114,7 @@ def worker(
         ],
     )
     stub = inference_pb2_grpc.InferenceServiceStub(channel)
+    rpc_timeout_s = ((args.rpc_timeout_ms or max(args.deadline_ms * 4.0, 1000.0)) / 1000.0)
     for warmup_idx in range(args.warmup_requests):
         stub.Predict(
             inference_pb2.PredictRequest(
@@ -119,7 +128,8 @@ def worker(
                 prepared_observation=payload.get("bytes", b""),
                 prepared_fields=payload.get("fields", []),
                 observation_format=args.payload_format,
-            )
+            ),
+            timeout=rpc_timeout_s,
         )
     period_s = args.request_period_ms / 1000.0
     phase_s = (robot_idx / max(args.robots, 1)) * period_s if args.stagger_arrivals else 0.0
@@ -132,21 +142,53 @@ def worker(
             time.sleep(sleep_s)
         request_id = f"robot-{robot_idx}-s{step}"
         wall_start = time.perf_counter()
-        response = stub.Predict(
-            inference_pb2.PredictRequest(
-                request_id=request_id,
-                model_id=args.policy,
-                robot_id=f"robot-{robot_idx}",
-                session_id=f"robot-{robot_idx}",
-                timestamp_ns=time.time_ns(),
-                deadline_ms=args.deadline_ms,
-                request_period_ms=args.request_period_ms,
-                prepared_observation=payload.get("bytes", b""),
-                prepared_fields=payload.get("fields", []),
-                observation_format=args.payload_format,
+        try:
+            response = stub.Predict(
+                inference_pb2.PredictRequest(
+                    request_id=request_id,
+                    model_id=args.policy,
+                    robot_id=f"robot-{robot_idx}",
+                    session_id=f"robot-{robot_idx}",
+                    timestamp_ns=time.time_ns(),
+                    deadline_ms=args.deadline_ms,
+                    request_period_ms=args.request_period_ms,
+                    prepared_observation=payload.get("bytes", b""),
+                    prepared_fields=payload.get("fields", []),
+                    observation_format=args.payload_format,
+                ),
+                timeout=rpc_timeout_s,
             )
-        )
-        client_latency_ms = (time.perf_counter() - wall_start) * 1000.0
+            client_latency_ms = (time.perf_counter() - wall_start) * 1000.0
+        except grpc.RpcError as exc:
+            client_latency_ms = (time.perf_counter() - wall_start) * 1000.0
+            code = exc.code()
+            details = exc.details() or ""
+            with lock:
+                rows.append(
+                    {
+                        "request_id": request_id,
+                        "robot_id": f"robot-{robot_idx}",
+                        "session_id": f"robot-{robot_idx}",
+                        "admitted": False,
+                        "rejection_reason": f"rpc_{code.name.lower()}: {details}" if code else details,
+                        "client_latency_ms": client_latency_ms,
+                        "queue_ms": 0.0,
+                        "runtime_ms": 0.0,
+                        "latency_ms": client_latency_ms,
+                        "deadline_missed": code == grpc.StatusCode.DEADLINE_EXCEEDED
+                        or client_latency_ms > args.deadline_ms,
+                        "deadline_slack_ms": args.deadline_ms - client_latency_ms,
+                        "batch_size": 0,
+                        "batch_reason": "rpc_error",
+                        "actions_returned": 0,
+                        "rpc_error": True,
+                        "rpc_status": code.name if code else "UNKNOWN",
+                        "rpc_details": details,
+                    }
+                )
+            step += 1
+            next_at += period_s
+            continue
         with lock:
             rows.append(
                 {
@@ -164,6 +206,9 @@ def worker(
                     "batch_size": int(response.batch_size),
                     "batch_reason": response.batch_reason,
                     "actions_returned": int(response.actions_returned),
+                    "rpc_error": False,
+                    "rpc_status": "",
+                    "rpc_details": "",
                 }
             )
         step += 1
@@ -172,9 +217,10 @@ def worker(
 
 
 def summarize(args: argparse.Namespace, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    rpc_errors = [row for row in rows if row.get("rpc_error")]
     admitted = [row for row in rows if row["admitted"]]
-    rejected = [row for row in rows if not row["admitted"]]
-    deadline_misses = [row for row in admitted if row["deadline_missed"]]
+    rejected = [row for row in rows if not row["admitted"] and not row.get("rpc_error")]
+    deadline_misses = [row for row in rows if row["deadline_missed"]]
     latencies = [row["latency_ms"] for row in admitted]
     client_latencies = [row["client_latency_ms"] for row in rows]
     queues = [row["queue_ms"] for row in admitted]
@@ -186,8 +232,10 @@ def summarize(args: argparse.Namespace, rows: list[dict[str, Any]]) -> dict[str,
         "admitted": len(admitted),
         "rejected": len(rejected),
         "rejection_rate": len(rejected) / max(len(rows), 1),
+        "rpc_errors": len(rpc_errors),
+        "rpc_error_rate": len(rpc_errors) / max(len(rows), 1),
         "deadline_misses": len(deadline_misses),
-        "deadline_miss_rate": len(deadline_misses) / max(len(admitted), 1),
+        "deadline_miss_rate": len(deadline_misses) / max(len(rows), 1),
         "p50_latency_ms": percentile(latencies, 50),
         "p95_latency_ms": percentile(latencies, 95),
         "p99_latency_ms": percentile(latencies, 99),
