@@ -42,6 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--libero-config-path", default=os.environ.get("LIBERO_CONFIG_PATH"))
+    parser.add_argument("--save-warmup-observation", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=Path("outputs/pi05_grpc_load/summary.json"))
     return parser.parse_args()
 
@@ -190,6 +191,15 @@ def summarize(args: argparse.Namespace, rows: list[dict[str, Any]]) -> dict[str,
 def main() -> None:
     args = parse_args()
     payloads = prepare_observation_payloads(args)
+    if args.save_warmup_observation is not None:
+        args.save_warmup_observation.parent.mkdir(parents=True, exist_ok=True)
+        args.save_warmup_observation.write_bytes(payloads[0])
+    if args.duration_seconds <= 0:
+        summary = summarize(args, [])
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(summary, indent=2) + "\n")
+        print(json.dumps({key: value for key, value in summary.items() if key != "rows"}, indent=2))
+        return
     rows: list[dict[str, Any]] = []
     lock = threading.Lock()
     start_at = time.monotonic() + 2.0

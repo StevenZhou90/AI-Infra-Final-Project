@@ -6,9 +6,11 @@ import argparse
 import json
 import logging
 import os
+import queue
 import threading
 import time
 from concurrent import futures
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -21,9 +23,30 @@ import torch
 from proto import inference_pb2, inference_pb2_grpc
 from serving.pi05_grpc_codec import decode_prepared_observation
 from serving.pi05_runtime_service import PI05RuntimeService
-from serving.pi0fast_serving_runtime import PI0FastServingConfig, RealPIBatchBackend
+from serving.pi0fast_serving_runtime import (
+    NS_PER_MS,
+    PI0FastRequest,
+    PI0FastResponse,
+    PI0FastServingConfig,
+    RealPIBatchBackend,
+    deadline_ns_from_period,
+)
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class PI05QueuedWork:
+    request_id: str
+    robot_id: str
+    session_id: str
+    observation: dict[str, Any]
+    enqueued_ns: int
+    deadline_ms: float
+    request_period_ms: float | None
+    event: threading.Event = field(default_factory=threading.Event)
+    response: inference_pb2.PredictResponse | None = None
+    error: Exception | None = None
 
 
 def response_from_telemetry(resp) -> inference_pb2.PredictResponse:
@@ -56,13 +79,23 @@ def response_from_telemetry(resp) -> inference_pb2.PredictResponse:
 
 
 class PI05InferenceServicer(inference_pb2_grpc.InferenceServiceServicer):
-    def __init__(self, service: PI05RuntimeService, *, device: torch.device, metrics_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        service: PI05RuntimeService,
+        *,
+        device: torch.device,
+        metrics_path: Path | None = None,
+        worker_timeout_s: float = 30.0,
+    ) -> None:
         self.service = service
         self.device = device
         self.metrics_path = metrics_path
         self.started_at = time.time()
         self.total_requests = 0
-        self._lock = threading.Lock()
+        self.worker_timeout_s = worker_timeout_s
+        self._queue: queue.Queue[PI05QueuedWork] = queue.Queue()
+        self._worker = threading.Thread(target=self._gpu_worker_loop, daemon=True, name="pi05-gpu-worker")
+        self._worker.start()
         if metrics_path is not None:
             metrics_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -75,29 +108,35 @@ class PI05InferenceServicer(inference_pb2_grpc.InferenceServiceServicer):
             if request.observation_format not in {"", "torch"}:
                 raise ValueError(f"Unsupported observation_format={request.observation_format!r}")
             observation = decode_prepared_observation(request.prepared_observation, device=self.device)
-            with self._lock:
-                result = self.service.predict(
+            work = PI05QueuedWork(
+                request_id=request.request_id,
+                robot_id=robot_id,
+                session_id=session_id,
+                observation=observation,
+                enqueued_ns=request.timestamp_ns or time.time_ns(),
+                deadline_ms=deadline_ms,
+                request_period_ms=float(request.request_period_ms or 0.0) or None,
+            )
+            self._queue.put(work)
+            if not work.event.wait(timeout=self.worker_timeout_s):
+                context.set_code(grpc.StatusCode.DEADLINE_EXCEEDED)
+                context.set_details("PI0.5 GPU worker timeout")
+                return inference_pb2.PredictResponse(
                     request_id=request.request_id,
+                    admitted=False,
+                    rejection_reason="worker_timeout",
                     robot_id=robot_id,
                     session_id=session_id,
-                    observation=observation,
-                    enqueued_ns=request.timestamp_ns or None,
-                    deadline_ms=deadline_ms,
-                    request_period_ms=float(request.request_period_ms or 0.0) or None,
                 )
-                if not result.admitted:
-                    response = inference_pb2.PredictResponse(
-                        request_id=request.request_id,
-                        admitted=False,
-                        rejection_reason=result.reason,
-                        robot_id=robot_id,
-                        session_id=session_id,
-                    )
-                    self._write_metric(response)
-                    return response
-                responses = result.responses or self.service.drain(force=True)
-            matching = next((resp for resp in responses if resp.request_id == request.request_id), responses[-1])
-            response = response_from_telemetry(matching)
+            if work.error is not None:
+                raise work.error
+            response = work.response or inference_pb2.PredictResponse(
+                request_id=request.request_id,
+                admitted=False,
+                rejection_reason="empty_worker_response",
+                robot_id=robot_id,
+                session_id=session_id,
+            )
             self._write_metric(response)
             return response
         except Exception as exc:
@@ -163,6 +202,73 @@ class PI05InferenceServicer(inference_pb2_grpc.InferenceServiceServicer):
         with self.metrics_path.open("a") as handle:
             handle.write(json.dumps(row, sort_keys=True) + "\n")
 
+    def _gpu_worker_loop(self) -> None:
+        while True:
+            first = self._queue.get()
+            batch = [first]
+            deadline_s = time.monotonic() + max(self.service.runtime.config.max_batch_delay_ms, 0.0) / 1000.0
+            while len(batch) < self.service.runtime.config.max_batch_size:
+                timeout_s = deadline_s - time.monotonic()
+                if timeout_s <= 0:
+                    break
+                try:
+                    batch.append(self._queue.get(timeout=timeout_s))
+                except queue.Empty:
+                    break
+            self._process_worker_batch(batch)
+
+    def _process_worker_batch(self, works: list[PI05QueuedWork]) -> None:
+        response_by_id: dict[str, PI0FastResponse] = {}
+        try:
+            for work in works:
+                request = PI0FastRequest(
+                    request_id=work.request_id,
+                    robot_id=work.robot_id,
+                    session_id=work.session_id,
+                    model_id=self.service.model_id,
+                    enqueued_ns=work.enqueued_ns,
+                    deadline_ns=deadline_ns_from_period(work.enqueued_ns, work.deadline_ms),
+                    control_period_ms=work.deadline_ms,
+                    decode_mode="flow",
+                    observation=work.observation,
+                    metadata={"request_period_ms": work.request_period_ms}
+                    if work.request_period_ms is not None
+                    else {},
+                )
+                if not self.service.runtime.try_submit(request):
+                    work.response = inference_pb2.PredictResponse(
+                        request_id=work.request_id,
+                        admitted=False,
+                        rejection_reason=self.service.runtime.last_rejection_reason or "admission_rejected",
+                        robot_id=work.robot_id,
+                        session_id=work.session_id,
+                    )
+            drain_ns = max(work.enqueued_ns for work in works) + int(
+                self.service.runtime.config.max_batch_delay_ms * NS_PER_MS
+            )
+            responses = self.service.runtime.drain_ready(at_ns=drain_ns, force=True)
+            response_by_id = {resp.request_id: resp for resp in responses}
+            for work in works:
+                if work.response is None:
+                    runtime_response = response_by_id.get(work.request_id)
+                    if runtime_response is None:
+                        work.response = inference_pb2.PredictResponse(
+                            request_id=work.request_id,
+                            admitted=False,
+                            rejection_reason="missing_runtime_response",
+                            robot_id=work.robot_id,
+                            session_id=work.session_id,
+                        )
+                    else:
+                        work.response = response_from_telemetry(runtime_response)
+        except Exception as exc:
+            logger.exception("PI0.5 GPU worker failed")
+            for work in works:
+                work.error = exc
+        finally:
+            for work in works:
+                work.event.set()
+
 
 def load_service(args: argparse.Namespace) -> tuple[PI05RuntimeService, torch.device]:
     from lerobot.policies.pi05.modeling_pi05 import PI05Policy
@@ -197,10 +303,20 @@ def load_service(args: argparse.Namespace) -> tuple[PI05RuntimeService, torch.de
 
 def serve(args: argparse.Namespace) -> None:
     service, device = load_service(args)
+    if args.warmup_observation_path is not None:
+        warmup_service(
+            service,
+            device=device,
+            observation_path=args.warmup_observation_path,
+            requests=args.warmup_requests,
+            deadline_ms=args.deadline_ms,
+            request_period_ms=args.default_request_period_ms,
+        )
     servicer = PI05InferenceServicer(
         service,
         device=device,
         metrics_path=args.metrics_path,
+        worker_timeout_s=args.worker_timeout_s,
     )
     server = grpc.server(
         futures.ThreadPoolExecutor(max_workers=args.workers),
@@ -214,6 +330,33 @@ def serve(args: argparse.Namespace) -> None:
     server.start()
     logger.info("PI0.5 gRPC server listening on port %d", args.port)
     server.wait_for_termination()
+
+
+def warmup_service(
+    service: PI05RuntimeService,
+    *,
+    device: torch.device,
+    observation_path: Path,
+    requests: int,
+    deadline_ms: float,
+    request_period_ms: float,
+) -> None:
+    payload = observation_path.read_bytes()
+    observation = decode_prepared_observation(payload, device=device)
+    for idx in range(max(requests, 0)):
+        result = service.predict(
+            request_id=f"server-warmup-{idx}",
+            robot_id="server-warmup",
+            session_id="server-warmup",
+            observation=observation,
+            enqueued_ns=time.time_ns(),
+            deadline_ms=deadline_ms,
+            request_period_ms=request_period_ms,
+            force=True,
+        )
+        if not result.admitted:
+            raise RuntimeError(f"PI0.5 server warmup was rejected: {result.reason}")
+    logger.info("Completed %d PI0.5 server warmup request(s)", max(requests, 0))
 
 
 def parse_args() -> argparse.Namespace:
@@ -235,6 +378,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--estimated-base-ms", type=float, default=160.0)
     parser.add_argument("--estimated-per-request-ms", type=float, default=35.0)
     parser.add_argument("--metrics-path", type=Path, default=Path("outputs/pi05_grpc_server/metrics.jsonl"))
+    parser.add_argument("--worker-timeout-s", type=float, default=30.0)
+    parser.add_argument("--warmup-observation-path", type=Path, default=None)
+    parser.add_argument("--warmup-requests", type=int, default=1)
     return parser.parse_args()
 
 

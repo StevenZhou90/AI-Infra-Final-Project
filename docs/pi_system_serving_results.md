@@ -83,13 +83,16 @@ disabled, staggered robot chunk requests:
 | 8 robots, 1500 ms request period, 250 ms deadline | 0/24 misses, p95 ~223.0 ms |
 | 4 robots, 10 s soak, action-buffer mode, 1000 ms request period, 250 ms deadline | 0/40 misses, p95 ~182.8 ms |
 | gRPC server, 1 robot, 3 s warm smoke, 1000 ms request period, 250 ms deadline | 0/3 misses, p95 ~171.9 ms |
+| gRPC worker queue + server warmup, 1 robot, 3 s smoke, 1000 ms request period, 250 ms deadline | 0/3 misses, p95 server ~176.4 ms |
 
 The real serving smoke confirms that the practical 250 ms single-GPU boundary is
 around 4 robots at a 1000 ms chunk request period, or 8 robots at 1500 ms.  The
 8-robot/1500 ms case has only ~18 ms worst-case slack in this short run.
 The serving runtime now trims batches when estimated runtime would consume
 deadline slack.  It can reject new sessions with either `--max-active-sessions`
-or projected utilization from `--max-admission-utilization`.
+or projected utilization from `--max-admission-utilization`.  The gRPC server
+also has a dedicated GPU worker queue so request handler threads only decode and
+enqueue work, and it can run startup warmup from a saved prepared observation.
 
 PI0-FAST, bf16, `lerobot/pi0fast-libero`, action-end decode:
 
@@ -231,6 +234,8 @@ MPLCONFIGDIR=/tmp/matplotlib-cache MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa \
   --max-admission-utilization 0.7 \
   --deadline-ms 250 \
   --num-inference-steps 4 \
+  --warmup-observation-path outputs/pi05_grpc_load/warmup_observation.pt \
+  --warmup-requests 1 \
   --metrics-path outputs/pi05_grpc_server/metrics.jsonl
 ```
 
@@ -247,6 +252,7 @@ MPLCONFIGDIR=/tmp/matplotlib-cache MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa \
   --deadline-ms 250 \
   --stagger-arrivals \
   --warmup-requests 1 \
+  --save-warmup-observation outputs/pi05_grpc_load/warmup_observation.pt \
   --output outputs/pi05_grpc_load/r4_300s_req1000_d250.json
 ```
 

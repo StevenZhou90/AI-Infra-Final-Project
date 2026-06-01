@@ -18,6 +18,7 @@ from serving.pi0fast_serving_runtime import (
 )
 from serving.pi05_runtime_service import PI05RuntimeService
 from serving.pi05_grpc_codec import decode_prepared_observation, encode_prepared_observation
+from serving.pi05_server import PI05InferenceServicer, PI05QueuedWork
 
 
 def make_request(
@@ -346,3 +347,35 @@ def test_pi05_grpc_codec_round_trips_prepared_observation() -> None:
 
     assert torch.equal(decoded["state"], observation["state"])
     assert decoded["task"] == ["pick up the object"]
+
+
+def test_pi05_grpc_worker_batches_queued_work() -> None:
+    service = PI05RuntimeService(
+        SyntheticPI05Backend(base_ms=10.0, per_request_ms=2.0),
+        config=PI0FastServingConfig(
+            max_batch_size=2,
+            max_batch_delay_ms=1.0,
+            estimated_batch_base_ms=10.0,
+            estimated_batch_per_request_ms=2.0,
+        ),
+    )
+    servicer = PI05InferenceServicer(service, device=torch.device("cpu"), metrics_path=None)
+    works = [
+        PI05QueuedWork(
+            request_id=f"req-{idx}",
+            robot_id=f"robot-{idx}",
+            session_id=f"session-{idx}",
+            observation={"state": torch.zeros((1, 7))},
+            enqueued_ns=0,
+            deadline_ms=250.0,
+            request_period_ms=1000.0,
+        )
+        for idx in range(2)
+    ]
+
+    servicer._process_worker_batch(works)
+
+    assert all(work.event.is_set() for work in works)
+    assert all(work.response is not None and work.response.admitted for work in works)
+    assert {work.response.batch_size for work in works if work.response is not None} == {2}
+    assert service.status()["requests"] == 2
