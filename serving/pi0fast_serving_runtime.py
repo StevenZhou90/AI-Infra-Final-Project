@@ -543,6 +543,10 @@ class PI0FastServingRuntime:
     def admission_utilization(self) -> float:
         return sum(self._session_utilization(session) for session in self.sessions.values())
 
+    def clear_session_state(self) -> None:
+        self.sessions.clear()
+        self.prompt_cache.clear()
+
     def _admission_rejection_reason(self, request: PI0FastRequest) -> str | None:
         if request.session_id in self.sessions:
             return None

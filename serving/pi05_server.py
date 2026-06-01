@@ -378,6 +378,7 @@ def warmup_service(
         )
         if not result.admitted:
             raise RuntimeError(f"PI0.5 server warmup was rejected: {result.reason}")
+    service.runtime.clear_session_state()
     logger.info("Completed %d PI0.5 server warmup request(s)", max(requests, 0))
 
 

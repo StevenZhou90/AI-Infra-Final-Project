@@ -179,6 +179,18 @@ def test_runtime_rejects_projected_utilization_over_limit() -> None:
     assert 0.63 < stats["admission_utilization"] < 0.65
 
 
+def test_runtime_clear_session_state_resets_admission_accounting() -> None:
+    runtime = PI0FastServingRuntime(
+        SyntheticPI05Backend(base_ms=160.0, per_request_ms=30.0),
+        PI0FastServingConfig(estimated_batch_base_ms=160.0, max_active_sessions=1),
+    )
+
+    assert runtime.try_submit(make_request(0, session="warmup", model="lerobot/pi05", mode="flow")) is True
+    runtime.clear_session_state()
+    assert runtime.try_submit(make_request(1, session="robot-0", model="lerobot/pi05", mode="flow")) is True
+    assert runtime.stats()["sessions"] == 1
+
+
 def test_synthetic_runtime_reports_batch_telemetry() -> None:
     backend = SyntheticPI0FastBackend(prefill_ms=20.0, decode_ms_per_token=2.0, batch_efficiency=0.5)
     runtime = PI0FastServingRuntime(

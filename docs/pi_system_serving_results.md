@@ -15,6 +15,9 @@ serving when distinct robot observations are batched together.
 - Prefer load-based admission once request periods are known.  With the current
   160 ms p95 runtime estimate, `--max-admission-utilization 0.7` admits about
   four 1000 ms sessions and rejects the fifth before queueing latency explodes.
+- For experimental low-latency deployments, compile `sample_actions` with
+  `--compile-mode default` and `TORCHINDUCTOR_USE_CUDAGRAPHS=0`.  Do not use
+  `reduce-overhead` yet; CUDA graph capture failed on this PI0.5 path.
 - Use action-buffer mode for robot control loops.  With a 50-action chunk,
   20 ms control period, and 5-action low watermark, each robot should request a
   new chunk about every 900 ms or slower.
@@ -84,6 +87,21 @@ disabled, staggered robot chunk requests:
 | 4 robots, 10 s soak, action-buffer mode, 1000 ms request period, 250 ms deadline | 0/40 misses, p95 ~182.8 ms |
 | gRPC server, 1 robot, 3 s warm smoke, 1000 ms request period, 250 ms deadline | 0/3 misses, p95 ~171.9 ms |
 | gRPC worker queue + server warmup, 1 robot, 3 s smoke, 1000 ms request period, 250 ms deadline | 0/3 misses, p95 server ~176.4 ms |
+| gRPC compiled `sample_actions`, no CUDA graphs, 1 robot, 10 s, 1000 ms request period, 250 ms deadline | 0/10 misses, p95 server ~76.3 ms |
+| gRPC compiled `sample_actions`, no CUDA graphs, 2 robots, 5 s, 1000 ms request period, 250 ms deadline | 0/10 misses, p95 server ~79.1 ms |
+
+The compiled `sample_actions` path is the first large model-runtime speedup.
+`reduce-overhead` mode failed during Inductor CUDA graph capture with a cuDNN
+device-allocation error, but `default` mode with `TORCHINDUCTOR_USE_CUDAGRAPHS=0`
+was stable in short smoke tests.  The first compile/warmup can take minutes on a
+cold cache, so this should remain an explicit server startup option until longer
+soaks validate it.
+
+The PyTorch profiler run adds substantial overhead and should not be used for
+latency SLO numbers.  It did show many pageable host-to-device copies under
+profile, so the next transport/runtime focus should be keeping prepared tensors
+resident or moving to shared-memory/local tensor transport instead of rebuilding
+payload tensors for every request.
 
 The real serving smoke confirms that the practical 250 ms single-GPU boundary is
 around 4 robots at a 1000 ms chunk request period, or 8 robots at 1500 ms.  The
@@ -237,6 +255,25 @@ MPLCONFIGDIR=/tmp/matplotlib-cache MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa \
   --warmup-observation-path outputs/pi05_grpc_load/warmup_observation.pt \
   --warmup-requests 1 \
   --metrics-path outputs/pi05_grpc_server/metrics.jsonl
+```
+
+PI0.5 compiled gRPC server:
+
+```bash
+TORCHDYNAMO_DISABLE=0 TORCHINDUCTOR_USE_CUDAGRAPHS=0 \
+LIBERO_CONFIG_PATH=/home/ubuntu/AI-Infra-Final-Project/.libero_config \
+MPLCONFIGDIR=/tmp/matplotlib-cache MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa \
+.venv-pi/bin/python -m serving.pi05_server \
+  --port 50051 \
+  --max-active-sessions 4 \
+  --max-admission-utilization 0.7 \
+  --deadline-ms 250 \
+  --num-inference-steps 4 \
+  --compile-target sample_actions \
+  --compile-mode default \
+  --warmup-observation-path outputs/pi05_grpc_load/warmup_observation.pt \
+  --warmup-requests 1 \
+  --metrics-path outputs/pi05_grpc_server/compiled_metrics.jsonl
 ```
 
 PI0.5 gRPC load test:
