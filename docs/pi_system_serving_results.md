@@ -9,15 +9,16 @@ serving when distinct robot observations are batched together.
 
 - Use `lerobot/pi05_libero_finetuned_v044` with bf16 autocast and
   `num_inference_steps=4` for the primary single-machine latency path.
-- Serve PI0.5 through deadline-aware admission control.  On one A100, start
-  with `max_active_sessions=4` for 1000 ms chunk requests or `8` for 1500 ms
-  chunk requests.
-- Prefer load-based admission once request periods are known.  With the current
-  160 ms p95 runtime estimate, `--max-admission-utilization 0.7` admits about
-  four 1000 ms sessions and rejects the fifth before queueing latency explodes.
 - For experimental low-latency deployments, compile `sample_actions` with
   `--compile-mode default` and `TORCHINDUCTOR_USE_CUDAGRAPHS=0`.  Do not use
   `reduce-overhead` yet; CUDA graph capture failed on this PI0.5 path.
+- Serve PI0.5 through deadline-aware admission control.  On one A100 with the
+  compiled `sample_actions` path, 12 robots at 1000 ms chunk requests were clean
+  under a 250 ms deadline; 16 open sessions overloaded the single-worker queue.
+- Prefer load-based admission once request periods are known.  With the eager
+  runtime, `--max-admission-utilization 0.7` admits about four 1000 ms sessions.
+  With compiled `sample_actions`, cap 1000 ms sessions around 12 until a longer
+  soak validates more aggressive settings.
 - Use action-buffer mode for robot control loops.  With a 50-action chunk,
   20 ms control period, and 5-action low watermark, each robot should request a
   new chunk about every 900 ms or slower.
@@ -89,6 +90,10 @@ disabled, staggered robot chunk requests:
 | gRPC worker queue + server warmup, 1 robot, 3 s smoke, 1000 ms request period, 250 ms deadline | 0/3 misses, p95 server ~176.4 ms |
 | gRPC compiled `sample_actions`, no CUDA graphs, 1 robot, 10 s, 1000 ms request period, 250 ms deadline | 0/10 misses, p95 server ~76.3 ms |
 | gRPC compiled `sample_actions`, no CUDA graphs, 2 robots, 5 s, 1000 ms request period, 250 ms deadline | 0/10 misses, p95 server ~79.1 ms |
+| gRPC compiled `sample_actions`, no CUDA graphs, 4 robots, 10 s, 1000 ms request period, 250 ms deadline | 0/40 misses, p95 server ~76.5 ms |
+| gRPC compiled `sample_actions`, no CUDA graphs, 8 robots, 10 s, 1000 ms request period, 250 ms deadline | 0/80 misses, p95 server ~67.7 ms |
+| gRPC compiled `sample_actions`, no CUDA graphs, 12 robots, 10 s, 1000 ms request period, 250 ms deadline, open cap | 0/120 misses, p95 server ~73.1 ms |
+| gRPC compiled `sample_actions`, no CUDA graphs, 16 robots, 10 s, 1000 ms request period, 250 ms deadline, open cap | 157/160 misses, 157 RPC timeouts |
 
 The compiled `sample_actions` path is the first large model-runtime speedup.
 `reduce-overhead` mode failed during Inductor CUDA graph capture with a cuDNN
@@ -96,6 +101,12 @@ device-allocation error, but `default` mode with `TORCHINDUCTOR_USE_CUDAGRAPHS=0
 was stable in short smoke tests.  The first compile/warmup can take minutes on a
 cold cache, so this should remain an explicit server startup option until longer
 soaks validate it.
+
+The compiled capacity cliff is admission-related, not a slow admitted request:
+the successful 16-robot responses still ran in ~78-88 ms server latency, but
+open admission allowed a timeout storm.  The load tester now records RPC errors
+as deadline misses and can reuse `--prepared-observation-path` to avoid rebuilding
+LIBERO observations between capacity runs.
 
 The PyTorch profiler run adds substantial overhead and should not be used for
 latency SLO numbers.  It did show many pageable host-to-device copies under
@@ -291,6 +302,24 @@ MPLCONFIGDIR=/tmp/matplotlib-cache MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa \
   --warmup-requests 1 \
   --save-warmup-observation outputs/pi05_grpc_load/warmup_observation.pt \
   --output outputs/pi05_grpc_load/r4_300s_req1000_d250.json
+```
+
+For repeated capacity checks, reuse the saved prepared observation so the client
+does not rebuild the LeRobot policy and LIBERO simulator before every run:
+
+```bash
+LIBERO_CONFIG_PATH=/home/ubuntu/AI-Infra-Final-Project/.libero_config \
+MPLCONFIGDIR=/tmp/matplotlib-cache MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa \
+.venv-pi/bin/python scripts/load_pi05_grpc.py \
+  --server localhost:50051 \
+  --robots 12 \
+  --duration-seconds 10 \
+  --request-period-ms 1000 \
+  --deadline-ms 250 \
+  --stagger-arrivals \
+  --warmup-requests 0 \
+  --prepared-observation-path outputs/pi05_grpc_load/warmup_observation.pt \
+  --output outputs/pi05_grpc_load/r12_cached_10s_req1000_d250.json
 ```
 
 PI0-FAST action-end replicated batch:
