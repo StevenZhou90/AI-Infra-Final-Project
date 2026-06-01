@@ -322,6 +322,21 @@ MPLCONFIGDIR=/tmp/matplotlib-cache MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa \
   --output outputs/pi05_grpc_load/r12_cached_10s_req1000_d250.json
 ```
 
+PI0.5 cluster router, local dev mode:
+
+```bash
+.venv-pi/bin/python -m serving.pi05_cluster_router \
+  --port 50100 \
+  --worker id=w0,addr=localhost:50051,gpu=0,max_sessions=12,util=1.0,rt=75
+```
+
+The router exposes the same `InferenceService/Predict` API as the worker.  For
+single-GPU development, run one compiled PI0.5 worker and route through
+`localhost:50100`; for multi-GPU deployment, launch one worker per GPU and add
+one `--worker` entry per address.  Router telemetry is added to
+`telemetry_json`, and `scripts/load_pi05_grpc.py` reports
+`cluster_worker_counts` when pointed at the router.
+
 PI0-FAST action-end replicated batch:
 
 ```bash
