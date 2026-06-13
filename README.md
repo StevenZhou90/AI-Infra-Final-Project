@@ -16,10 +16,11 @@ serving, GPU-aware routing, admission control, and benchmark tooling.
 
 ## Verified Results
 
-Short answer: the results are good for a serving-platform submission. The real
-robotic-arm benchmark slices show either no success loss with about 2.08x lower
-latency, or slightly better success with about 1.57x lower latency. The
-multi-GPU serving path has also been exercised on GPUs 0-2 on this machine.
+Short answer: the serving-platform results are good, and the real-policy smoke
+is now measured instead of guessed. Synthetic serving scales across GPUs 0-2,
+while the real LIBERO/OpenVLA smoke confirms the distributed runner works but
+shows the current trajectory head needs more tuning before it should be claimed
+as quality-preserving.
 
 ### SimplerEnv OpenVLA Coke-Can Matrix
 
@@ -98,10 +99,50 @@ p95_latency_ms: 44.0
 throughput_req_per_s: 497.12
 ```
 
+Apples-to-apples synthetic throughput check:
+
+```text
+240 requests, same per-request modeled latency
+1 GPU: 584.20 req/s, worker_requests gpu0=240
+3 GPU: 762.06 req/s, worker_requests gpu0=80,gpu1=80,gpu2=80
+throughput_speedup: 1.30x
+```
+
 This validates the multi-GPU serving scheduler, router balancing, admission
-control, per-GPU runtime services, and CUDA device binding. The full distributed
-LIBERO/OpenVLA model benchmark is wired up, but the checked-out environment does
-not include the required `.tmp_specvla` checkout or trajectory-head checkpoints.
+control, per-GPU runtime services, and CUDA device binding.
+
+### Real 3-GPU LIBERO/OpenVLA Smoke
+
+Measured on this machine with GPUs 0-2, `torchrun --nproc_per_node=3`,
+OpenVLA loaded once per rank, LIBERO rendered through OSMesa, and the R2
+trajectory-head checkpoint restored from the project Hugging Face artifact.
+
+Run artifact:
+
+```text
+outputs/libero_specvla_mirror/real_multigpu_smoke_20260613/smoke
+```
+
+Result:
+
+| Decoder | Episodes | Success | Avg ms/step | Speedup vs AR |
+| --- | ---: | ---: | ---: | ---: |
+| AR OpenVLA | `5` | `3/5` | `172.63` | `1.00x` |
+| Trajectory speculative | `5` | `0/5` | `164.51` | `1.049x` |
+
+Gate:
+
+```text
+passed: false
+speedup: 1.049x
+success_drop: 0.6000
+```
+
+Interpretation: the distributed real-policy stack runs end to end on three H100s
+and speculative inference is slightly faster per control step, but the current
+R2 trajectory head is not quality-preserving on this smoke. Use the serving
+router/load-test numbers for the multi-GPU platform claim, and use this smoke as
+evidence that the real LIBERO runner is operational with honest gating.
 
 ## Quick Start
 
@@ -116,7 +157,7 @@ git clone https://github.com/StevenZhou90/AI-Infra-Final-Project.git
 cd AI-Infra-Final-Project
 
 sudo apt-get update
-sudo apt-get install -y libegl1 libopengl0 libgl1-mesa-glx libvulkan1 libglvnd-dev
+sudo apt-get install -y libegl1 libopengl0 libgl1-mesa-glx libvulkan1 libglvnd-dev libosmesa6 libosmesa6-dev
 
 uv python install 3.10
 uv sync --python 3.10
@@ -215,7 +256,12 @@ CUDA_VISIBLE_DEVICES=0 uv run python scripts/run_libero_specvla_mirror.py \
 Distributed single-node run on GPUs 0-2:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2 torchrun --standalone --nproc_per_node=3 \
+CUDA_VISIBLE_DEVICES=0,1,2 \
+MUJOCO_GL=osmesa \
+PYOPENGL_PLATFORM=osmesa \
+LIBERO_CONFIG_PATH=.libero_config \
+PYTHONPATH=.tmp_specvla:.tmp_specvla/openvla:external/LIBERO:$PYTHONPATH \
+torchrun --standalone --nproc_per_node=3 \
   scripts/run_libero_specvla_distributed.py \
   --config configs/libero_specvla_distributed.yaml \
   --mode smoke

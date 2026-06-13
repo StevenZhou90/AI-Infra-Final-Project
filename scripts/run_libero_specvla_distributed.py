@@ -183,7 +183,7 @@ def build_model_cfg(suite_name: str, cfg: dict[str, Any], decoder_mode: str) -> 
         load_in_8bit=bool(inputs.get("load_in_8bit", False)),
         load_in_4bit=bool(inputs.get("load_in_4bit", False)),
         center_crop=bool(inputs.get("center_crop", True)),
-        use_spec=(decoder_mode == "spec"),
+        use_spec=False,
         parallel_draft=bool(inputs.get("parallel_draft", False)),
         accept_threshold=int(inputs["accept_threshold_by_suite"][suite_name]),
         spec_checkpoint=inputs["spec_checkpoint_by_suite"][suite_name],
@@ -311,6 +311,8 @@ def run_suite_decoder_real(
         set_seed_everywhere,
     )
     from experiments.robot.openvla_utils import get_processor  # type: ignore
+    import experiments.robot.openvla_utils as openvla_utils  # type: ignore
+    import experiments.robot.robot_utils as robot_utils  # type: ignore
     from PIL import Image
     import numpy as np
     import torch
@@ -318,6 +320,18 @@ def run_suite_decoder_real(
     from serving.trajectory_draft_head import TinyTrajectoryHead
     from serving.trajectory_phase import PhaseThresholds
     from serving.trajectory_speculative_decoder import TrajectorySpeculativeDecoder
+
+    device = "cuda"
+    if torch.cuda.is_available():
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        torch.cuda.set_device(local_rank)
+        device = f"cuda:{local_rank}"
+        current_device = torch.device(device)
+    else:
+        current_device = torch.device("cpu")
+
+    openvla_utils.DEVICE = current_device
+    robot_utils.DEVICE = current_device
 
     model_cfg = build_model_cfg(suite_name=suite_name, cfg=cfg, decoder_mode=decoder_mode)
     set_seed_everywhere(model_cfg.seed)
@@ -327,22 +341,22 @@ def run_suite_decoder_real(
     spec_decoder: TrajectorySpeculativeDecoder | None = None
     if decoder_mode == "spec":
         draft_head = (
-            TinyTrajectoryHead.load(model_cfg.spec_checkpoint, device="cuda")
+            TinyTrajectoryHead.load(model_cfg.spec_checkpoint, device=device)
             if model_cfg.spec_checkpoint and Path(model_cfg.spec_checkpoint).exists()
             else None
         )
         smooth_head = (
-            TinyTrajectoryHead.load(model_cfg.smooth_spec_checkpoint, device="cuda")
+            TinyTrajectoryHead.load(model_cfg.smooth_spec_checkpoint, device=device)
             if model_cfg.smooth_spec_checkpoint and Path(model_cfg.smooth_spec_checkpoint).exists()
             else None
         )
         complex_head = (
-            TinyTrajectoryHead.load(model_cfg.complex_spec_checkpoint, device="cuda")
+            TinyTrajectoryHead.load(model_cfg.complex_spec_checkpoint, device=device)
             if model_cfg.complex_spec_checkpoint and Path(model_cfg.complex_spec_checkpoint).exists()
             else None
         )
         direct_chunk_head = (
-            TinyTrajectoryHead.load(model_cfg.chunk_spec_checkpoint, device="cuda")
+            TinyTrajectoryHead.load(model_cfg.chunk_spec_checkpoint, device=device)
             if model_cfg.chunk_spec_checkpoint and Path(model_cfg.chunk_spec_checkpoint).exists()
             else None
         )
@@ -361,7 +375,7 @@ def run_suite_decoder_real(
         stationary_patience = None if stationary_patience_cfg is None else int(stationary_patience_cfg)
         spec_decoder = TrajectorySpeculativeDecoder(
             model=model,
-            device="cuda",
+            device=device,
             draft_head=draft_head,
             smooth_draft_head=smooth_head,
             complex_draft_head=complex_head,
@@ -395,10 +409,26 @@ def run_suite_decoder_real(
     num_steps_wait = int(cfg["benchmark"]["num_steps_wait"])
 
     task_suite = benchmark.get_benchmark_dict()[suite_name]()
+
+    def get_task_init_states_compat(task_id: int):
+        # LIBERO stores trusted local init states as numpy pickles; PyTorch 2.6+
+        # defaults torch.load to weights_only=True and rejects those files.
+        original_load = torch.load
+
+        def torch_load_with_pickles(*args, **kwargs):
+            kwargs.setdefault("weights_only", False)
+            return original_load(*args, **kwargs)
+
+        torch.load = torch_load_with_pickles
+        try:
+            return task_suite.get_task_init_states(task_id)
+        finally:
+            torch.load = original_load
+
     rows: list[dict[str, Any]] = []
     for task_id, trials in sorted(task_trials.items()):
         task = task_suite.get_task(task_id)
-        initial_states = task_suite.get_task_init_states(task_id)
+        initial_states = get_task_init_states_compat(task_id)
         env, task_description = get_libero_env(task, model_cfg.model_family, resolution=256)
         for episode_idx in sorted(trials):
             if spec_decoder is not None:
@@ -516,8 +546,8 @@ def run_suite_decoder_real(
                     prompt = f"In: What action should the robot take to {task_description.lower()}?\nOut:"
                     image = Image.fromarray(img).convert("RGB")
                     image = center_crop_openvla_image(image, enabled=bool(model_cfg.center_crop))
-                    inputs = processor(prompt, image).to("cuda", dtype=torch.bfloat16)
-                    inputs = ensure_openvla_action_prompt_token(inputs, "cuda")
+                    inputs = processor(prompt, image).to(device, dtype=torch.bfloat16)
+                    inputs = ensure_openvla_action_prompt_token(inputs, device)
                     action = spec_decoder.predict_action(
                         inputs,
                         unnorm_key=model_cfg.unnorm_key,
