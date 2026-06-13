@@ -42,6 +42,14 @@ message ImageFrame {
   string encoding = 5;          // "jpeg", "raw_rgb"
 }
 
+message ObservationField {
+  string name = 1;
+  string dtype = 2;             // torch dtype name, e.g. "float32", "bfloat16"
+  repeated int64 shape = 3;
+  bytes data = 4;               // contiguous CPU tensor bytes
+  string json_value = 5;        // JSON fallback for list/string/scalar metadata
+}
+
 message PredictRequest {
   string request_id = 1;
   string model_id = 2;          // which loaded model to use
@@ -50,6 +58,14 @@ message PredictRequest {
   repeated float state = 5;     // joint positions / robot state
   int64 timestamp_ns = 6;       // client-side timestamp for latency tracking
   string instruction = 7;       // language instruction for VLA models (e.g. "pick up the coke can")
+  string robot_id = 8;
+  string session_id = 9;
+  float deadline_ms = 10;
+  float control_period_ms = 11;
+  float request_period_ms = 12;
+  bytes prepared_observation = 13;  // torch.save(dict) for PI0.5 prepared observations
+  string observation_format = 14;   // "torch", "tensor_fields"
+  repeated ObservationField prepared_fields = 15;
 }
 
 message PredictResponse {
@@ -58,6 +74,21 @@ message PredictResponse {
   int32 action_dim = 3;         // actions per step (e.g. 7 for SimplerEnv/OpenVLA)
   int32 chunk_size = 4;         // how many timesteps in this chunk
   float inference_time_ms = 5;
+  bool admitted = 6;
+  string rejection_reason = 7;
+  string robot_id = 8;
+  string session_id = 9;
+  float queue_ms = 10;
+  float runtime_ms = 11;
+  float latency_ms = 12;
+  bool deadline_missed = 13;
+  float deadline_slack_ms = 14;
+  int32 batch_size = 15;
+  string batch_reason = 16;
+  int32 actions_returned = 17;
+  bool session_cache_hit = 18;
+  bool prompt_cache_hit = 19;
+  string telemetry_json = 20;
 }
 
 // ---------------------------------------------------------------------------

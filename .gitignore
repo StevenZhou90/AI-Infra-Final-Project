@@ -4,6 +4,12 @@ __pycache__/
 dist/
 build/
 .venv/
+.venv-pi/
+.venv-pi*/
+.hf_cache/
+.libero_config/
+.libero_config_main312/
+.libero_datasets/
 .venv_user/
 .cache/
 .libero/
