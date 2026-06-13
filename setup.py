@@ -1,0 +1,35 @@
+from setuptools import find_packages, setup
+
+
+if __name__ == "__main__":
+    setup(
+        name="vla-serving-platform",
+        version="0.1.0",
+        description="Multi-model VLA serving platform with SimplerEnv/OpenVLA evaluation",
+        long_description=open("README.md", encoding="utf-8").read(),
+        long_description_content_type="text/markdown",
+        python_requires=">=3.10,<3.11",
+        packages=find_packages(include=["envs*", "policies*", "eval*", "serving*", "proto*"]),
+        install_requires=[
+            "torch>=2.2.0",
+            "transformers==4.40.1",
+            "tokenizers==0.19.1",
+            "accelerate>=0.27.0",
+            "timm>=0.9.10,<1.0.0",
+            "imageio[ffmpeg]>=2.34.0",
+            "opencv-python-headless>=4.9.0",
+            "pyyaml>=6.0",
+            "numpy>=1.24.0,<2.0.0",
+            "transforms3d>=0.4.2",
+            "grpcio>=1.80.0",
+            "grpcio-tools>=1.80.0",
+            "protobuf>=6.33.5,<7.0.0",
+        ],
+        extras_require={
+            "dev": ["pytest>=8.0.0", "ruff>=0.2.0"],
+            "pi": [
+                "lerobot[pi] @ git+https://github.com/huggingface/lerobot.git@v0.4.4",
+                "hf-libero>=0.1.3,<0.2.0",
+            ],
+        },
+    )
