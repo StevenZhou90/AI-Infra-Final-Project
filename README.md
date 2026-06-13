@@ -14,6 +14,77 @@ serving, GPU-aware routing, admission control, and benchmark tooling.
 - pi0-FAST token/chunk hooks for target-equivalent serving experiments.
 - LIBERO and SimplerEnv benchmark runners with reproducible result summaries.
 
+## Serving Platform
+
+The main deliverable is the serving stack under `serving/`. It is designed to
+run robotic-arm policy inference as a multi-GPU service instead of as a single
+offline evaluation script.
+
+Request path:
+
+```text
+robot client
+  -> proto/inference.proto gRPC Predict
+  -> PI05InferenceServicer
+  -> PI05RuntimeService
+  -> PI0FastServingRuntime
+  -> per-GPU policy backend
+  -> action chunk + latency/deadline telemetry
+```
+
+Cluster path:
+
+```text
+client
+  -> ClusterRouter
+  -> WorkerSpec(cuda:0) / WorkerSpec(cuda:1) / WorkerSpec(cuda:2)
+  -> one PI0.5 runtime service per GPU
+```
+
+What the serving layer does:
+
+- accepts prepared tensor observations over gRPC
+- keeps model/runtime state warm inside long-lived worker processes
+- binds workers to explicit CUDA devices
+- routes sessions to healthy workers with sticky session placement
+- rejects overload using session count and projected utilization
+- batches requests up to a bounded delay budget
+- returns action chunks plus queue/runtime/deadline telemetry
+- exposes profiling and load-test scripts for repeatable measurements
+
+Key files:
+
+| File | Purpose |
+| --- | --- |
+| `proto/inference.proto` | public inference API |
+| `serving/pi05_server.py` | gRPC PI0.5 worker process |
+| `serving/pi05_cluster_router.py` | multi-worker GPU router |
+| `serving/pi05_runtime_service.py` | service boundary around runtime admission |
+| `serving/pi0fast_serving_runtime.py` | batching, deadline, cache, and backend runtime |
+| `serving/pi05_grpc_codec.py` | tensor observation serialization |
+| `scripts/load_pi05_grpc.py` | gRPC load generator |
+| `scripts/profile_pi05_serving.py` | serving profiler |
+
+Start a three-GPU service:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2 uv run python -m serving.pi05_server \
+  --host 0.0.0.0 \
+  --port 50051 \
+  --devices cuda:0,cuda:1,cuda:2 \
+  --max-concurrent 12 \
+  --warmup-steps 2
+```
+
+Load-test it:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2 uv run python scripts/load_pi05_grpc.py \
+  --target localhost:50051 \
+  --clients 16 \
+  --requests 128
+```
+
 ## Verified Results
 
 Short answer: the serving-platform results are good, and the real-policy smoke
@@ -21,41 +92,6 @@ is now measured instead of guessed. Synthetic serving scales across GPUs 0-2,
 while the real LIBERO/OpenVLA smoke confirms the distributed runner works but
 shows the current trajectory head needs more tuning before it should be claimed
 as quality-preserving.
-
-### SimplerEnv OpenVLA Coke-Can Matrix
-
-Matched benchmark matrix:
-- tasks: vertical, horizontal, standing coke-can
-- x positions: `-0.3500`, `-0.2925`, `-0.2350`
-- episodes: `27`
-
-| Decoder | Success | Avg ms/step | Speedup |
-| --- | ---: | ---: | ---: |
-| Baseline OpenVLA | `14/27` | `302.5` | `1.00x` |
-| Adaptive fast policy | `14/27` | `145.1` | `2.08x` |
-
-The adaptive fast policy keeps the same success count while reducing per-step
-latency by about 52%.
-
-### LIBERO Goal SpecVLA-Style Slice
-
-Selected-slice protocol:
-- suite: `libero_goal`
-- task ids: `0, 1, 3, 5, 7, 9`
-- trials per task: `5`
-- total episodes: `30`
-- base policy: `openvla/openvla-7b-finetuned-libero-goal`
-
-| Decoder | Success | Avg ms/step | Speedup vs AR |
-| --- | ---: | ---: | ---: |
-| AR OpenVLA | `22/30` | `317.6` | `1.00x` |
-| SpecVLA-style tuned chunk | `23/30` | `280.7` | `1.13x` |
-| Adaptive direct K=2 | `21/30` | `202.7` | `1.57x` |
-| Two-head direct K=3/K=2, strict smooth | `22/30` | `213.5` | `1.49x` |
-| Two-head direct K=3/K=2, loose smooth | `23/30` | `202.0` | `1.57x` |
-
-The best no-task-router configuration is the loose-smooth two-head direct chunk
-decoder: K=3 smooth head, K=2 complex head, and relaxed smooth-phase thresholds.
 
 ### Multi-GPU Serving Validation
 
@@ -110,6 +146,41 @@ throughput_speedup: 1.30x
 
 This validates the multi-GPU serving scheduler, router balancing, admission
 control, per-GPU runtime services, and CUDA device binding.
+
+### SimplerEnv OpenVLA Coke-Can Matrix
+
+Matched benchmark matrix:
+- tasks: vertical, horizontal, standing coke-can
+- x positions: `-0.3500`, `-0.2925`, `-0.2350`
+- episodes: `27`
+
+| Decoder | Success | Avg ms/step | Speedup |
+| --- | ---: | ---: | ---: |
+| Baseline OpenVLA | `14/27` | `302.5` | `1.00x` |
+| Adaptive fast policy | `14/27` | `145.1` | `2.08x` |
+
+The adaptive fast policy keeps the same success count while reducing per-step
+latency by about 52%.
+
+### LIBERO Goal SpecVLA-Style Slice
+
+Selected-slice protocol:
+- suite: `libero_goal`
+- task ids: `0, 1, 3, 5, 7, 9`
+- trials per task: `5`
+- total episodes: `30`
+- base policy: `openvla/openvla-7b-finetuned-libero-goal`
+
+| Decoder | Success | Avg ms/step | Speedup vs AR |
+| --- | ---: | ---: | ---: |
+| AR OpenVLA | `22/30` | `317.6` | `1.00x` |
+| SpecVLA-style tuned chunk | `23/30` | `280.7` | `1.13x` |
+| Adaptive direct K=2 | `21/30` | `202.7` | `1.57x` |
+| Two-head direct K=3/K=2, strict smooth | `22/30` | `213.5` | `1.49x` |
+| Two-head direct K=3/K=2, loose smooth | `23/30` | `202.0` | `1.57x` |
+
+The best no-task-router configuration is the loose-smooth two-head direct chunk
+decoder: K=3 smooth head, K=2 complex head, and relaxed smooth-phase thresholds.
 
 ### Real 3-GPU LIBERO/OpenVLA Smoke
 
