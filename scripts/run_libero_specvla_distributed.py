@@ -579,7 +579,7 @@ def run_rank_work(
                             "task_id": task_id,
                             "trial": trial,
                             "mode": decoder,
-                            "success": bool((task_id + trial + rank) % 2 == 0),
+                            "success": bool((task_id + trial) % 2 == 0),
                             "steps": min(15, SUITE_STEP_CAPS[suite]),
                             "inference_ms_total": 15 * (200.0 if decoder == "ar" else 140.0),
                         }
@@ -603,7 +603,13 @@ def maybe_init_dist(rank: int, world_size: int) -> None:
     if world_size <= 1 or dist is None or dist.is_initialized():
         return
     backend = "nccl" if torch and torch.cuda.is_available() else "gloo"
-    dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+    if backend == "nccl":
+        local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
+        device = torch.device(f"cuda:{local_rank}")
+        torch.cuda.set_device(device)
+        dist.init_process_group(backend=backend, rank=rank, world_size=world_size, device_id=device)
+    else:
+        dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
 
 
 def maybe_barrier(world_size: int) -> None:
