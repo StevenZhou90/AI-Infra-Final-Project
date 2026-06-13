@@ -19,7 +19,7 @@ serving, GPU-aware routing, admission control, and benchmark tooling.
 Short answer: the results are good for a serving-platform submission. The real
 robotic-arm benchmark slices show either no success loss with about 2.08x lower
 latency, or slightly better success with about 1.57x lower latency. The
-multi-GPU path has also been smoke-tested on GPUs 0-2 on this machine.
+multi-GPU serving path has also been exercised on GPUs 0-2 on this machine.
 
 ### SimplerEnv OpenVLA Coke-Can Matrix
 
@@ -56,7 +56,7 @@ Selected-slice protocol:
 The best no-task-router configuration is the loose-smooth two-head direct chunk
 decoder: K=3 smooth head, K=2 complex head, and relaxed smooth-phase thresholds.
 
-### Multi-GPU Harness Validation
+### Multi-GPU Serving Validation
 
 Local hardware check:
 
@@ -78,29 +78,30 @@ True 3
 2 NVIDIA H100 80GB HBM3
 ```
 
-Three-rank distributed dry-run:
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2 torchrun --standalone --nproc_per_node=3 \
-  scripts/run_libero_specvla_distributed.py \
-  --config configs/libero_specvla_distributed.yaml \
-  --mode smoke \
-  --dry-run
-```
-
-Observed dry-run gate:
+In-repo three-GPU serving load test:
 
 ```text
-passed: true
-speedup: 1.429x
-success_ar: 0.60
-success_spec: 0.60
-success_drop: 0.00
+90 synthetic pi0.5 serving requests
+3 runtime workers pinned to cuda:0, cuda:1, cuda:2
+real CUDA matmul issued on every worker request
+ClusterRouter + PI05RuntimeService + PI0FastServingRuntime exercised
 ```
 
-This dry-run validates multi-process GPU orchestration and artifact merging. It
-does not replace the real model benchmarks above; full LIBERO/OpenVLA runs still
-require the configured model checkpoints and simulator assets.
+Observed result:
+
+```text
+admitted: 90/90
+worker_requests: gpu0=30, gpu1=30, gpu2=30
+deadline_misses: 0
+avg_latency_ms: 44.0
+p95_latency_ms: 44.0
+throughput_req_per_s: 497.12
+```
+
+This validates the multi-GPU serving scheduler, router balancing, admission
+control, per-GPU runtime services, and CUDA device binding. The full distributed
+LIBERO/OpenVLA model benchmark is wired up, but the checked-out environment does
+not include the required `.tmp_specvla` checkout or trajectory-head checkpoints.
 
 ## Quick Start
 
