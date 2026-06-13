@@ -13,6 +13,7 @@ import torch.nn as nn
 class TrajectoryHeadConfig:
     history_size: int = 4
     action_dim: int = 7
+    action_horizon: int = 1
     n_bins: int = 256
     embed_dim: int = 64
     hidden_dim: int = 512
@@ -58,11 +59,15 @@ class TinyTrajectoryHead(nn.Module):
                 ]
             )
             dim = c.hidden_dim
-        layers.append(nn.Linear(dim, c.action_dim * c.n_bins))
+        layers.append(nn.Linear(dim, c.action_horizon * c.action_dim * c.n_bins))
         self.net = nn.Sequential(*layers)
 
     def forward(self, history_bins: torch.Tensor, prefill_hidden: torch.Tensor | None = None) -> torch.Tensor:
-        """Return logits with shape [batch, action_dim, n_bins].
+        """Return action-bin logits.
+
+        For legacy one-step heads, returns ``[batch, action_dim, n_bins]``.
+        For direct chunk heads with ``action_horizon > 1``, returns
+        ``[batch, action_horizon, action_dim, n_bins]``.
 
         If config.use_prefill_hidden, prefill_hidden must be [batch, llm_hidden_size]
         (typically bfloat16/float32 upcast for matmul).
@@ -89,7 +94,10 @@ class TinyTrajectoryHead(nn.Module):
                 fused = self.hidden_proj(ph.float()).to(dtype=emb.dtype)
             emb = torch.cat([emb, fused], dim=-1)
         logits = self.net(emb)
-        return logits.view(-1, c.action_dim, c.n_bins)
+        logits = logits.view(-1, c.action_horizon, c.action_dim, c.n_bins)
+        if c.action_horizon == 1:
+            return logits[:, 0]
+        return logits
 
     @torch.no_grad()
     def predict(

@@ -10,10 +10,17 @@ build/
 .libero_config/
 .libero_config_main312/
 .libero_datasets/
+.venv_user/
+.cache/
+.libero/
 *.mp4
 *.avi
 outputs/
 wandb/
+artifacts/logs/readme_repro_*/
+artifacts/logs/*.log
+artifacts/specvla_checkpoints/
+artifacts/hf_upload/
 external/
 .pytest_cache/
 *.lock
@@ -21,3 +28,5 @@ data/
 checkpoints/
 *.pt
 *.bin
+
+.tmp_specvla/
