@@ -447,6 +447,7 @@ def _predict_prefix_cutoff_chunk(
     device: str,
     cutoff_tokens: int,
     collect_logits: bool = False,
+    force_action_prefix: bool = False,
 ) -> PredictionTrace:
     if device.startswith("cuda") and torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -456,6 +457,7 @@ def _predict_prefix_cutoff_chunk(
         cutoff_tokens=cutoff_tokens,
         early_stop_action_end=True,
         collect_logits=collect_logits,
+        force_action_prefix=force_action_prefix,
     )
     if device.startswith("cuda") and torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -1957,6 +1959,7 @@ def run_episode(
                                 device,
                                 cutoff_tokens=cutoff_tokens,
                                 collect_logits="_gatefull" in mode,
+                                force_action_prefix="_prefix" in mode,
                             )
                         if "_gatefull" in mode:
                             if adaptive_prefix_gate is None:

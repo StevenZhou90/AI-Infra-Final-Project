@@ -33,6 +33,7 @@ class _FakeTokenAdapter:
         self.cutoff_calls += 1
         assert kwargs["cutoff_tokens"] == 24
         assert kwargs["collect_logits"] is False
+        assert kwargs["force_action_prefix"] is False
         return PI0FastGenerationTrace(
             actions=torch.tensor([[[5.0, 6.0], [7.0, 8.0]]]),
             token_ids=torch.tensor([[10, 20, 30]]),
@@ -73,6 +74,33 @@ def test_prefix_cutoff_chunk_uses_no_logits_path_by_default() -> None:
     assert prediction.token_count == 3
     assert prediction.token_ids.tolist() == [[10, 20, 30]]
     assert prediction.stats["mode"] == "prefix_cutoff_no_logits"
+
+
+def test_prefix_cutoff_chunk_can_force_action_prefix() -> None:
+    class PrefixAdapter(_FakeTokenAdapter):
+        def predict_action_chunk_prefix_cutoff(self, batch, **kwargs):
+            self.cutoff_calls += 1
+            assert kwargs["force_action_prefix"] is True
+            return PI0FastGenerationTrace(
+                actions=torch.tensor([[[5.0, 6.0], [7.0, 8.0]]]),
+                token_ids=torch.tensor([[10, 20, 30]]),
+                logits=torch.empty((1, 0, 0)),
+                stats={"mode": "prefix_cutoff_prefix_no_logits", "action_end_token_id": 30},
+            )
+
+    adapter = PrefixAdapter()
+
+    prediction = _predict_prefix_cutoff_chunk(
+        adapter,
+        batch={},
+        postprocessor=lambda action: action,
+        device="cpu",
+        cutoff_tokens=24,
+        force_action_prefix=True,
+    )
+
+    assert adapter.cutoff_calls == 1
+    assert prediction.stats["mode"] == "prefix_cutoff_prefix_no_logits"
 
 
 def test_adapter_action_end_token_id_accepts_property_or_method() -> None:

@@ -119,6 +119,22 @@ def test_manifest_auto_compares_spec_candidate_to_target_eos() -> None:
     assert "--require-matched-steps" in manifest["gate_command"]
 
 
+def test_manifest_auto_validates_target_cutoff_candidate() -> None:
+    manifest = build_manifest(
+        _args(
+            speed_modes="baseline,target_eos,target_cutoff96",
+            candidate_mode="target_cutoff96",
+        ),
+        [],
+    )
+
+    assert manifest["reference_mode"] == "target_eos"
+    assert manifest["validation_modes"] == ["target_cutoff96_validate", "target_eos_validate"]
+    assert manifest["gate_validation_mode"] == "target_cutoff96_validate"
+    assert manifest["extra_gate_validation_modes"] == ["target_eos_validate"]
+    assert "target_cutoff96_validate" in manifest["gate_command"]
+
+
 def test_eval_metadata_extracts_pi05_policy_args() -> None:
     metadata = eval_metadata(["--policy-kind", "pi05", "--num-inference-steps=8", "--policy", "local/pi05"])
 

@@ -53,6 +53,8 @@ def eval_metadata(extra_args: list[str]) -> dict[str, str]:
 def default_validation_mode(candidate_mode: str) -> str:
     if candidate_mode.startswith("target_eos_prefix"):
         return "target_eos_prefix_validate"
+    if candidate_mode.startswith("target_cutoff") and "validate" not in candidate_mode:
+        return f"{candidate_mode}_validate"
     if candidate_mode == "target_eos":
         return "target_eos_validate"
     if candidate_mode.startswith("pattern_sd"):

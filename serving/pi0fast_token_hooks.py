@@ -573,6 +573,7 @@ class PI0FastTokenLogitAdapter:
         cutoff_tokens: int,
         early_stop_action_end: bool = True,
         collect_logits: bool = False,
+        force_action_prefix: bool = False,
     ) -> PI0FastGenerationTrace:
         """Decode a bounded FAST-token prefix, then append action-end if needed."""
 
@@ -580,6 +581,8 @@ class PI0FastTokenLogitAdapter:
         images, img_masks = self.policy._preprocess_images(batch)
         tokens, masks = self._language_tokens(batch)
         if collect_logits or not self.policy.config.use_kv_cache:
+            if force_action_prefix:
+                raise ValueError("Forced PI0-FAST action prefix is only supported on the no-logits cutoff path")
             if self.policy.config.use_kv_cache:
                 token_ids, logits, hidden_states = self.sample_actions_fast_kv_cache_with_logits(
                     images,
@@ -611,10 +614,11 @@ class PI0FastTokenLogitAdapter:
                 masks,
                 max_decoding_steps=cutoff_tokens,
                 temperature=0.0,
+                force_action_prefix=force_action_prefix,
             )
             logits = torch.empty((token_ids.shape[0], 0, 0), dtype=torch.float32, device=token_ids.device)
             hidden_states = None
-            mode = "prefix_cutoff_no_logits"
+            mode = "prefix_cutoff_prefix_no_logits" if force_action_prefix else "prefix_cutoff_no_logits"
         action_end = self._action_end_token_id()
         pre_append_tokens = int(token_ids.shape[1])
         ended = token_ids.shape[1] > 0 and bool(torch.all(token_ids[:, -1] == action_end))
@@ -631,6 +635,8 @@ class PI0FastTokenLogitAdapter:
             "forced_action_end": forced_end,
             "stopped_on_action_end": int(ended),
             "row_token_counts": getattr(self, "_last_action_end_row_token_counts", None),
+            "forced_action_prefix": int(bool(force_action_prefix)),
+            "forced_action_prefix_tokens": int(getattr(self, "_last_forced_action_prefix_token_count", 0)),
         }
         return PI0FastGenerationTrace(
             actions=actions,
@@ -3287,8 +3293,8 @@ class PI0FastTokenLogitAdapter:
             for idx in range(len(draft)):
                 logits_for_candidate = verify_logits_all[:, idx : idx + 1, :]
                 candidate_logits = logits_for_candidate[:, -1, :].float()
-                top_values, top_indices = torch.topk(candidate_logits, k=2, dim=-1)
-                predicted_candidate = int(top_indices[:, 0].item())
+                top_values, _top_indices = torch.topk(candidate_logits, k=2, dim=-1)
+                predicted_candidate = int(torch.argmax(candidate_logits, dim=-1).item())
                 margin = float((top_values[:, 0] - top_values[:, 1]).item())
                 block_min_margin = min(block_min_margin, margin)
                 verify_margin_checks += 1
@@ -3386,7 +3392,17 @@ class PI0FastTokenLogitAdapter:
                         and accepted < len(draft)
                         and int(correction_token.item()) == int(draft[accepted])
                     ):
-                        raise RuntimeError("Internal SD invariant failed: accepted prefix stopped before matching token")
+                        debug_predictions = [
+                            int(torch.argmax(verify_logits_all[:, i : i + 1, :][:, -1], dim=-1).item())
+                            for i in range(min(len(draft), 12))
+                        ]
+                        raise RuntimeError(
+                            "Internal SD invariant failed: accepted prefix stopped before matching token "
+                            f"accepted={accepted} accepted_emit={accepted_emit} "
+                            f"block_accepted={block_accepted} matched_prefix={matched_prefix} "
+                            f"draft={ [int(token) for token in draft[: min(len(draft), 12)]] } "
+                            f"pred={debug_predictions} action_end={action_end_token_id}"
+                        )
                     if len(debug_events) < 64:
                         debug_events.append(
                             {
