@@ -136,6 +136,8 @@ class TrajectorySpecStats:
             "chunk_anchor_calls": self.chunk_anchor_calls,
             "chunk_buffer_hits": self.chunk_buffer_hits,
             "chunk_buffered_actions": self.chunk_buffered_actions,
+            "unverified_action_shortcuts": self.fast_draft_calls + self.chunk_buffer_hits,
+            "unverified_draft_tokens": self.fast_draft_tokens,
             "chunk_refreshes": self.chunk_refreshes,
             "chunk_refresh_reasons": dict(sorted(self.chunk_refresh_reasons.items())),
             "chunk_smooth_actions": self.chunk_smooth_actions,

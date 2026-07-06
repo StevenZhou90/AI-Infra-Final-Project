@@ -135,6 +135,80 @@ def clone_kv(kv: PastKV) -> PastKV:
     return tuple((k.clone(), v.clone()) for k, v in kv)
 
 
+def repeat_kv_batch(kv: PastKV, batch_size: int) -> PastKV:
+    """Repeat a batch-1 KV cache across *batch_size* verification candidates."""
+    if kv is None or int(batch_size) == 1:
+        return clone_kv(kv)
+    if is_dynamic_cache(kv):
+        from transformers import DynamicCache
+
+        if not hasattr(kv, "key_cache") and hasattr(kv, "layers"):
+            cache_data = []
+            for layer in kv.layers:
+                keys = getattr(layer, "keys", None)
+                values = getattr(layer, "values", None)
+                sliding = getattr(layer, "_sliding_window_tensor", None)
+                if keys is None or values is None:
+                    continue
+                repeated = (keys.repeat_interleave(batch_size, dim=0), values.repeat_interleave(batch_size, dim=0))
+                if sliding is None:
+                    cache_data.append(repeated)
+                else:
+                    cache_data.append((*repeated, sliding.repeat_interleave(batch_size, dim=0)))
+            return DynamicCache(cache_data)
+
+        new = DynamicCache()
+        new.key_cache = [k.repeat_interleave(batch_size, dim=0).contiguous() for k in kv.key_cache]
+        new.value_cache = [v.repeat_interleave(batch_size, dim=0).contiguous() for v in kv.value_cache]
+        if hasattr(new, "_seen_tokens"):
+            new._seen_tokens = kv.get_seq_length()
+        return new
+    return tuple(
+        (
+            k.repeat_interleave(batch_size, dim=0).contiguous(),
+            v.repeat_interleave(batch_size, dim=0).contiguous(),
+        )
+        for k, v in kv
+    )
+
+
+def select_kv_batch(kv: PastKV, batch_idx: int) -> PastKV:
+    """Select one batch row from a batched KV cache."""
+    if kv is None:
+        return None
+    if is_dynamic_cache(kv):
+        from transformers import DynamicCache
+
+        if not hasattr(kv, "key_cache") and hasattr(kv, "layers"):
+            cache_data = []
+            for layer in kv.layers:
+                keys = getattr(layer, "keys", None)
+                values = getattr(layer, "values", None)
+                sliding = getattr(layer, "_sliding_window_tensor", None)
+                if keys is None or values is None:
+                    continue
+                selected = (
+                    keys[batch_idx : batch_idx + 1].contiguous(),
+                    values[batch_idx : batch_idx + 1].contiguous(),
+                )
+                if sliding is None:
+                    cache_data.append(selected)
+                else:
+                    cache_data.append((*selected, sliding[batch_idx : batch_idx + 1].contiguous()))
+            return DynamicCache(cache_data)
+
+        new = DynamicCache()
+        new.key_cache = [k[batch_idx : batch_idx + 1].contiguous() for k in kv.key_cache]
+        new.value_cache = [v[batch_idx : batch_idx + 1].contiguous() for v in kv.value_cache]
+        if hasattr(new, "_seen_tokens"):
+            new._seen_tokens = kv.get_seq_length()
+        return new
+    return tuple(
+        (k[batch_idx : batch_idx + 1].contiguous(), v[batch_idx : batch_idx + 1].contiguous())
+        for k, v in kv
+    )
+
+
 # ---------------------------------------------------------------------------
 # Cache entry and statistics
 # ---------------------------------------------------------------------------

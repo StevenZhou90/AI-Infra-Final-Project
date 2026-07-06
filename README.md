@@ -57,6 +57,243 @@ Selected-slice protocol:
 The best no-task-router configuration is the loose-smooth two-head direct chunk
 decoder: K=3 smooth head, K=2 complex head, and relaxed smooth-phase thresholds.
 
+### PI0-FAST Target-EOS Early Stop
+
+The strongest current PI0-FAST result is action-end early stopping over FAST
+tokens. This compares the fixed-budget PI0-FAST decode against stopping when
+the generated action text reaches `|`; validation showed the decoded continuous
+action chunk is unchanged.
+
+Observed 90-episode LIBERO result:
+
+| Decoder | Success | Avg ms/step | Speedup | Drop |
+| --- | ---: | ---: | ---: | ---: |
+| Fixed-budget PI0-FAST | `81/90` | `634.3` | `1.00x` | - |
+| Target-EOS early stop | `81/90` | `259.5` | `2.44x` | `0.0%` |
+
+For the stricter 120 matched-eval gate, use
+`scripts/run_robotics_spec_120_proof.py` to launch the canonical proof wrapper,
+or call `scripts/run_pi0fast_100_eval_gate.py` /
+`scripts/gate_pi0fast_target_eos.py` directly with the protocol in
+`docs/pi0fast_target_eos.md`.
+
+There is also a CPU-only synthetic check for the underlying draft-verify idea
+in `docs/robotics_spec_decode_synthetic.md`; it is useful for CI but does not
+replace the real LIBERO gate. Use `scripts/audit_robotics_spec_goal.py` to
+check both artifacts before making the final claim.
+
+For a no-checkpoint speculative candidate on the real PI0-FAST model, evaluate
+`pattern_sd_direct` with `target_eos` included as the early-stop reference. This
+candidate drafts from narrow robot action-token regularities and still verifies
+tokens with PI0-FAST before emission. Use
+`scripts/sweep_pi0fast_pattern_offline.py` or
+`scripts/eval_pi0fast_pattern_offline.py` on saved FAST-token traces to screen
+pattern settings before launching the simulator gate. Pass the selected sweep
+JSON via `scripts/run_pi0fast_100_eval_gate.py --pattern-sweep-json` so the
+manifest records the chosen row; `scripts/pattern_sweep_to_eval_args.py` is
+available for manual shell-arg extraction. The pattern sweep includes exact
+full-block KV reuse, bonus-token emission, dynamic lookahead, and guarded
+second-order action-token extrapolation options so the real run can evaluate
+recent speculative-decoding ideas without changing target-token outputs. It can
+also test a previous-chunk position prior, which drafts token `i` from token `i`
+of recent verified chunks in the same episode and still requires PI0-FAST to
+verify every emitted token. `--position-mode-histogram` adds a related
+per-position modal-token prior over recent verified chunks that share the current
+prefix; it is still exact because the target model verifies each emitted token.
+`--global-position-mode` is a more aggressive variant for the smaller robotics
+output distribution: it proposes modal tokens at the same absolute FAST position
+from bounded recent history even when the current prefix differs, and still relies
+on exact target verification before emission.
+It can also test prompt-lookup n-gram continuation with `--ngram-continuation`,
+which drafts from suffix matches in already verified FAST tokens and recent
+verified chunks. It can test an
+action-transition-histogram prior with `--action-transition-histogram`, which
+learns same-dimension token transitions from verified prefixes and recent
+chunks. It can also test an action-delta-histogram prior with
+`--action-delta-histogram`, which proposes tokens from frequent recent
+per-action-dimension FAST-token deltas in the current prefix and recent
+verified chunks. `--chunk-position-delta` tests a per-absolute-position delta
+mode over recent verified chunks; the high-level candidate pipeline sweeps
+`--action-delta-min-counts 1,2` and
+`--chunk-position-delta-min-counts 1,2` so repeated deltas can be preferred over
+single recent observations. `--action-trend-regression` fits a short regression line over
+the verified tokens for the current action dimension and drafts the projected
+next token; PI0-FAST or PI0.5 still verifies it before emission.
+`--action-prefix-lookup` drafts later dimensions of the current action vector
+from prior verified actions that share the already-emitted intra-action prefix,
+which exploits low-entropy robot action structure without changing exact
+verification.
+`--action-vector-suffix-lookup` is a stricter full-vector variant: once some
+dimensions of the current action are verified, it proposes the remaining suffix
+from prior full action vectors with the same prefix, and PI0-FAST or PI0.5 still
+verifies every token.
+`--chunk-length-stop` drafts the FAST stop token when recent verified chunks
+ended at the same token length, which targets the final `target_eos` verifier
+step without changing exactness.
+`--action-token-neighborhood` adds a
+small numeric neighborhood around smooth extrapolations, recent verified chunk
+positions, and other enabled robot-prior centers; this is intended for exact
+tree verification, where `x`, `x-1`, and `x+1` style candidates can be checked
+in one target pass.
+`--action-context-tree` adds a
+same-action-dimension context-tree histogram: it learns short verified
+same-dimension token histories and backs off by depth before the target model
+verifies the proposed continuation. `--action-dimension-mode` drafts the
+most common verified token for the current action dimension from the prefix and
+recent chunks, which targets held joints and gripper states without using an
+unverified model. `--hold-action-token` is the lower-latency version of that
+idea: it drafts the previous token from the same action dimension and lets the
+target model verify it. It can also test source-agreement
+drafting with `--min-source-agreements 1,2`, where threshold `2` prefers a token
+only when at least two configured cheap priors propose it. `--source-cooldown`
+screens an acceptance-aware source scheduler: after a source's verified token is
+rejected, the drafter temporarily skips that source and falls back to the next
+configured cheap prior. This is still exact because the target model verifies
+all emitted tokens.
+Offline scoring resets history on `(task, task_id, seed)` changes when trace
+shards include suite/task names, falling back to `(task_id, seed)` for older
+shards. Use the per-task sweep thresholds when
+passing a sweep JSON to avoid choosing a setting that only wins on aggregate
+trace statistics; use heldout sweep thresholds when the sweep was run with
+`--heldout-split task` for the canonical proof path. `task_seed` is still useful
+for episode-style previous-chunk experiments, but it can leave the same task in
+both ranking and heldout groups when several seeds are present. Sweep JSON now
+records rank/heldout task-key overlap so proof wrappers can require task-disjoint
+heldout evidence. Automatic grouped splits use
+`--heldout-val-fraction` as a fraction of task, seed, or task/seed groups.
+For source-specific priors, add `--pattern-min-metric NAME=VALUE` and
+`--pattern-min-heldout-metric NAME=VALUE`, for example
+`ngram_continuation_accepted_tokens=1`,
+`action_context_tree_accepted_tokens=1`,
+`action_transition_histogram_accepted_tokens=1`,
+`action_delta_histogram_accepted_tokens=1`,
+`chunk_position_delta_accepted_tokens=1`,
+`action_prefix_lookup_accepted_tokens=1`,
+`action_vector_suffix_lookup_accepted_tokens=1`,
+`action_vector_transition_accepted_tokens=1`,
+`action_repeat_vector_accepted_tokens=1`,
+`chunk_length_stop_accepted_tokens=1`,
+`action_token_neighborhood_accepted_tokens=1`,
+`position_mode_histogram_accepted_tokens=1`,
+`global_position_mode_accepted_tokens=1`,
+`action_dimension_mode_accepted_tokens=1`,
+`hold_action_token_accepted_tokens=1`, or
+`source_agreement_accepted_tokens=1`, so the selected row must show accepted
+tokens from the enabled prior before the real simulator gate starts. Prefer
+`min_task_*` source metrics, such as
+`min_task_ngram_continuation_accepted_tokens=1`,
+`min_task_action_context_tree_accepted_tokens=1`,
+`min_task_action_transition_histogram_accepted_tokens=1`,
+`min_task_action_delta_histogram_accepted_tokens=1`,
+`min_task_chunk_position_delta_accepted_tokens=1`,
+`min_task_action_prefix_lookup_accepted_tokens=1`,
+`min_task_action_vector_suffix_lookup_accepted_tokens=1`,
+`min_task_action_vector_transition_accepted_tokens=1`,
+`min_task_action_repeat_vector_accepted_tokens=1`,
+`min_task_chunk_length_stop_accepted_tokens=1`,
+`min_task_action_token_neighborhood_accepted_tokens=1`,
+`min_task_position_mode_histogram_accepted_tokens=1`,
+`min_task_global_position_mode_accepted_tokens=1`,
+`min_task_action_dimension_mode_accepted_tokens=1`,
+`min_task_hold_action_token_accepted_tokens=1`, or
+`min_task_source_agreement_accepted_tokens=1`, when the prior should work on
+every task in the offline split.
+With `--pattern-sweep-json`, `--pattern-auto-source-min-metrics` derives these
+accepted-token checks from the selected row's enabled optional sources and also
+requires matching heldout metrics when the row contains heldout data. Target
+anchored tree modes are held to the same standard with
+`tree_anchor_accepted_tokens=1` and
+`min_task_tree_anchor_accepted_tokens=1`. The candidate pipeline passes this
+gate-runner flag by default.
+When `--run-final-audit` is enabled, the 120-eval wrapper also passes
+`run_manifest.json` to the final audit. For sweep-selected pattern candidates
+the audit requires positive
+`pattern_sweep_selection.required_source_counts` for every required source, so
+capped sweeps cannot become final evidence if they skipped an enabled source
+family.
+The sweep grid is conditional: when an optional source is disabled, its
+history/top-k/context knobs are collapsed to the first provided value instead
+of creating duplicate equivalent rows. This keeps heldout ranking from being
+biased by repeated disabled-source configs and makes the default pipeline sweep
+more practical.
+Use `--source-priority-modes default,lookup_first,smooth_first` to let heldout
+sweeps choose whether prompt-lookup/previous-chunk priors or smooth action-token
+extrapolation should propose first; the selected row is replayed online via
+`--pattern-source-priority`.
+
+To collect fresh early-stop traces and stage the candidate gate in one command,
+use `scripts/run_pi0fast_pattern_candidate_pipeline.py`. It writes lightweight
+`target_eos` token trace shards, sweeps exact pattern settings with a heldout
+split, and invokes the 120-task wrapper with `--reference-mode target_eos` by
+default in gate dry-run mode. Trace shards record the resolved FAST action-end
+token, and offline sweeps infer it unless `--stop-token-ids` is supplied, so
+stop-aware priors are ranked against the same early-stop token used online. For
+PI0.5, pass `--policy-kind pi05` and any flow-step override after the same
+pipeline flags.
+The pipeline also bounds the default offline search with
+`--max-enabled-sources 4` and `--max-sweep-configs 4096`. The sweep prunes
+over-budget source combinations before evaluation and varies source settings
+fastest, so the cap covers many robot-prior ideas before deeper runtime variants.
+Sweep JSON records `evaluated_source_counts`, `evaluated_source_coverage`, and
+`evaluated_enabled_source_count_histogram`; inspect those fields before
+promoting a capped sweep row so the selected run did not accidentally skip an
+intended source family.
+The pipeline defaults `--pattern-required-source-coverage auto`, deriving the
+required families from enabled sweep modes and forwarding them to the gate
+runner. A capped sweep that never evaluated an enabled source family is rejected
+before the 120-task simulator run is staged.
+It also derives the pattern sweep train and heldout task-count gates from the
+planned suite/task-id coverage unless explicit `--pattern-min-task-count` or
+`--pattern-min-heldout-task-count` overrides are provided.
+Pattern proof runs additionally require the sweep heldout split to cover every
+requested suite, using `selection.heldout_suite_keys` in the sweep JSON and
+saved run manifest.
+The candidate gate defaults `--pattern-sweep-rank` to `0`, which auto-selects
+the first ranked sweep row that passes those train, heldout, and source-usage
+thresholds and records the actual selected rank in the manifest.
+
+For speculative PI0-FAST candidates, the wrapper defaults reference thresholds
+to the main gate thresholds, so a candidate must also meet the speedup,
+success-drop, and regression requirements versus `target_eos` early stop.
+
+The offline sweep also has an explicit `--tree-widths` knob for testing
+tree-style candidate verification inspired by newer traversal/tree
+speculative-decoding work. The candidate pipeline's default sweep is compact
+but includes `--tree-widths 1,4`, `--dynamic-tree-width both`, and
+`--tree-anchor-target-token both` plus
+`--tree-anchor-target-continuation both`; pass `--tree-widths 1` when selecting
+args for the lowest-risk chain verifier only. Rows with `tree_width > 1` now
+convert to `--pattern-tree-width` and use the online exact tree verifier, which
+batches several robot-prior candidates in one target pass and commits only the
+target-matching selected prefix. The continuation anchor always starts from the
+already-produced target greedy token and verifies only drafted futures after it.
+Treat this as experimental until the full 120-task gate validates it. The
+default sweep also includes
+`--action-trend-regression both`, `--action-delta-ngram both`,
+`--action-delta-min-counts 1,2`, and `--chunk-delta-template both` to test
+velocity-space prompt lookup over recent verified robot chunks, and
+`--chunk-prefix-retrieval both` for near-repeated verified chunks with small
+bounded prefix mismatches, and `--source-acceptance-bias both` to reorder cheap
+sources using recent verifier acceptance within the current decode.
+`--dynamic-tree-width both` adapts the number of
+verified tree candidates from recent target acceptance, following the lossless
+dynamic-draft-tree idea in EAGLE-2 but using observed verifier acceptance
+instead of learned confidence. Add
+`--action-token-neighborhood both` with `--tree-widths` greater than 1 to screen
+nearby quantized FAST-token candidates around smooth, recent-chunk, and
+enabled-prior centers. When a tree
+width greater than 1 is selected or
+passed manually, the wrapper auto-adds gate checks that require the selected
+tree width, nonzero tree verification, and zero unverified pattern-token
+shortcuts in candidate `trace_stats`.
+
+For PI0.5 experiments, compare speculative candidates against `target_eos`
+stop-token early-stop, not fixed-budget decode alone.
+When the wrapper is run with `--policy-kind pi05`, the gate JSON records
+`metadata.policy_kind=pi05` and the final audit command requires
+`--expected-policy-kind pi05`, so a PI0.5 result cannot be mistaken for a
+PI0-FAST artifact.
+
 ### Multi-GPU Serving Validation
 
 Local hardware check:
@@ -143,6 +380,37 @@ and speculative inference is slightly faster per control step, but the current
 R2 trajectory head is not quality-preserving on this smoke. Use the serving
 router/load-test numbers for the multi-GPU platform claim, and use this smoke as
 evidence that the real LIBERO runner is operational with honest gating.
+
+For any renewed OpenVLA/SpecVLA attempt, gate final artifacts with
+`scripts/gate_openvla_specvla.py`. It pairs AR and speculative rows by suite,
+task, trial, and seed, then requires the same strict result shape as the PI0
+gate: 120 matched evals, at least `2.0x` speedup, zero success drop, and zero
+baseline-success regressions. `scripts/audit_robotics_spec_goal.py` accepts that
+gate through `--openvla-gate`, so either a PI0-FAST gate or an OpenVLA gate can
+satisfy the real-robotics half of the objective.
+
+The OpenVLA 120-task wrapper enables matched-step and strict `spec_stats` checks
+by default. A final claim cannot rely on different control-step counts,
+`fast_draft_only`, chunk-buffer hits, relaxed fast-draft acceptances, or
+approximate tree depth greater than 1.
+`--allow-unverified-spec-shortcuts` is research-only and the wrapper requires
+`--skip-audit --skip-result-card` when it is used, so relaxed artifacts cannot
+be promoted into final objective evidence by accident.
+The final objective audit also requires those strict OpenVLA thresholds and
+zero shortcut counters by default when `--openvla-gate` is supplied.
+
+To launch or gate the OpenVLA path with the same artifact layout, use:
+
+```bash
+python scripts/run_openvla_120_eval_gate.py \
+  --config configs/libero_specvla_distributed.yaml \
+  --run-id openvla_specvla_120 \
+  --mode full \
+  --min-pairs 120 \
+  --min-speedup 2.0 \
+  --max-success-drop 0.0 \
+  --max-baseline-success-regressions 0
+```
 
 ## Quick Start
 
@@ -285,10 +553,11 @@ python -m venv --system-site-packages .venv-pi
 .venv-pi/bin/python -m pip install -e . --no-deps
 .venv-pi/bin/python -m pip install "lerobot[pi] @ git+https://github.com/huggingface/lerobot.git@v0.4.4"
 .venv-pi/bin/python -m pip install hf-libero==0.1.3 --no-deps
-.venv-pi/bin/python -m pip install hydra-core robomimic==0.2.0 robosuite==1.4.0 bddl==1.0.1 easydict thop mujoco tensorboardX imageio-ffmpeg egl_probe numba jupytext pytest
+sudo apt-get install -y libosmesa6 libegl1 libgl1-mesa-dri libglx-mesa0
+.venv-pi/bin/python -m pip install hydra-core robomimic==0.2.0 robosuite==1.4.0 bddl==1.0.1 easydict thop mujoco==2.3.7 "networkx>=3.2,<4" tensorboardX imageio-ffmpeg egl_probe numba jupytext pytest
 .venv-pi/bin/python -m pip install "numpy<2" "opencv-python<4.12" "opencv-python-headless<4.12" "matplotlib>=3.5.3" hf-egl-probe
 
-CUDA_VISIBLE_DEVICES=0 HF_HOME=.hf_cache MPLCONFIGDIR=/tmp/matplotlib-cache MUJOCO_GL=egl \
+CUDA_VISIBLE_DEVICES=0 HF_HOME=.hf_cache MPLCONFIGDIR=/tmp/matplotlib-cache MUJOCO_GL=osmesa \
 .venv-pi/bin/python scripts/run_pi0fast_chunk_eval.py \
   --policy lerobot/pi0fast-libero \
   --task libero_object \
@@ -356,6 +625,9 @@ Suite orchestration:
 - `scripts/run_published_sweep.py`: published-evaluation-style sweeps.
 - `scripts/run_libero_specvla_mirror.py`: SpecVLA-style LIBERO benchmark.
 - `scripts/run_libero_specvla_distributed.py`: multi-GPU LIBERO runner.
+- `scripts/gate_openvla_specvla.py`: strict matched AR-vs-SpecVLA gate.
+- `scripts/run_robotics_spec_120_proof.py`: canonical PI0/PI0.5/OpenVLA 120-task proof launcher.
+- `scripts/run_openvla_120_eval_gate.py`: OpenVLA run/gate/audit wrapper.
 - `scripts/run_pi0fast_chunk_eval.py`: pi0-FAST LIBERO chunk experiments.
 - `scripts/benchmark_pi0fast_serving_runtime.py`: pi0-FAST runtime benchmark.
 - `scripts/load_pi05_grpc.py`: gRPC service load test.

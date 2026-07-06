@@ -1,0 +1,87 @@
+from __future__ import annotations
+
+import torch
+
+from scripts.run_pi0fast_chunk_eval import (
+    _adapter_action_end_token_id,
+    _predict_prefix_cutoff_chunk,
+    _predict_target_eos_chunk,
+)
+from serving.pi0fast_token_hooks import PI0FastGenerationTrace
+
+
+class _FakeTokenAdapter:
+    def __init__(self) -> None:
+        self.action_end_calls = 0
+        self.cutoff_calls = 0
+        self.trace_calls = 0
+
+    def predict_action_chunk_action_end(self, batch, **_kwargs):
+        self.action_end_calls += 1
+        return PI0FastGenerationTrace(
+            actions=torch.tensor([[[1.0, 2.0], [3.0, 4.0]]]),
+            token_ids=torch.tensor([[10, 20, 30]]),
+            logits=torch.empty((1, 0, 0)),
+            stats={"mode": "action_end_no_logits", "action_end_token_id": 30},
+        )
+
+    def predict_action_chunk_with_trace(self, batch, early_stop_action_end=False):
+        self.trace_calls += 1
+        raise AssertionError("target_eos speed path should not collect logits")
+
+    def predict_action_chunk_prefix_cutoff(self, batch, **kwargs):
+        self.cutoff_calls += 1
+        assert kwargs["cutoff_tokens"] == 24
+        assert kwargs["collect_logits"] is False
+        return PI0FastGenerationTrace(
+            actions=torch.tensor([[[5.0, 6.0], [7.0, 8.0]]]),
+            token_ids=torch.tensor([[10, 20, 30]]),
+            logits=torch.empty((1, 0, 0)),
+            stats={"mode": "prefix_cutoff_no_logits", "action_end_token_id": 30},
+        )
+
+
+def test_target_eos_chunk_uses_no_logits_action_end_path() -> None:
+    adapter = _FakeTokenAdapter()
+
+    prediction = _predict_target_eos_chunk(
+        adapter,
+        batch={},
+        postprocessor=lambda action: action,
+        device="cpu",
+    )
+
+    assert adapter.action_end_calls == 1
+    assert adapter.trace_calls == 0
+    assert prediction.token_count == 3
+    assert prediction.token_ids.tolist() == [[10, 20, 30]]
+    assert prediction.stats["mode"] == "action_end_no_logits"
+
+
+def test_prefix_cutoff_chunk_uses_no_logits_path_by_default() -> None:
+    adapter = _FakeTokenAdapter()
+
+    prediction = _predict_prefix_cutoff_chunk(
+        adapter,
+        batch={},
+        postprocessor=lambda action: action,
+        device="cpu",
+        cutoff_tokens=24,
+    )
+
+    assert adapter.cutoff_calls == 1
+    assert prediction.token_count == 3
+    assert prediction.token_ids.tolist() == [[10, 20, 30]]
+    assert prediction.stats["mode"] == "prefix_cutoff_no_logits"
+
+
+def test_adapter_action_end_token_id_accepts_property_or_method() -> None:
+    class PropertyAdapter:
+        action_end_token_id = 123
+
+    class MethodAdapter:
+        def action_end_token_id(self):
+            return 456
+
+    assert _adapter_action_end_token_id(PropertyAdapter()) == 123
+    assert _adapter_action_end_token_id(MethodAdapter()) == 456

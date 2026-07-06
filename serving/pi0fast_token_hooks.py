@@ -16,7 +16,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from serving.kv_cache_manager import clone_kv, trim_kv
+from serving.kv_cache_manager import clone_kv, repeat_kv_batch, select_kv_batch, trim_kv
 from serving.pi0fast_block_gate import block_gate_features
 from serving.pi0fast_prefix_gate import PREFIX_GATE_FEATURES, action_feature_values
 
@@ -103,6 +103,10 @@ class PI0FastTokenLogitAdapter:
             token_ids=token_ids,
             logits=logits,
             hidden_states=hidden_states,
+            stats={
+                "action_end_token_id": self._action_end_token_id(),
+                "early_stop_action_end": int(bool(early_stop_action_end)),
+            },
         )
 
     @torch.no_grad()
@@ -111,6 +115,10 @@ class PI0FastTokenLogitAdapter:
         batch: dict[str, torch.Tensor],
         temperature: float | None = None,
         max_decoding_steps: int | None = None,
+        constrained_action_vocab: bool = False,
+        constrained_action_vocab_size: int | None = None,
+        constrained_text_vocab_size: int | None = None,
+        force_action_prefix: bool = False,
     ) -> PI0FastGenerationTrace:
         """Serving-oriented greedy decode that stops on the FAST action-end token.
 
@@ -125,7 +133,22 @@ class PI0FastTokenLogitAdapter:
         decode_temperature = self.policy.config.temperature if temperature is None else temperature
         max_steps = max_decoding_steps or self.policy.config.max_decoding_steps
 
-        if self.policy.config.use_kv_cache:
+        if constrained_action_vocab and not self.policy.config.use_kv_cache:
+            raise ValueError("Constrained PI0-FAST action-vocab decode requires KV cache")
+
+        if constrained_action_vocab:
+            token_ids = self.sample_actions_fast_kv_cache_action_end_constrained(
+                images,
+                img_masks,
+                tokens,
+                masks,
+                max_decoding_steps=max_steps,
+                temperature=decode_temperature,
+                action_vocab_size=constrained_action_vocab_size,
+                text_vocab_size=constrained_text_vocab_size,
+            )
+            mode = "action_end_constrained_no_logits"
+        elif self.policy.config.use_kv_cache:
             token_ids = self.sample_actions_fast_kv_cache_action_end(
                 images,
                 img_masks,
@@ -133,7 +156,9 @@ class PI0FastTokenLogitAdapter:
                 masks,
                 max_decoding_steps=max_steps,
                 temperature=decode_temperature,
+                force_action_prefix=force_action_prefix,
             )
+            mode = "action_end_prefix_no_logits" if force_action_prefix else "action_end_no_logits"
         else:
             token_ids, _logits, _hidden = self.sample_actions_fast_with_logits(
                 images,
@@ -144,6 +169,7 @@ class PI0FastTokenLogitAdapter:
                 temperature=decode_temperature,
                 early_stop_action_end=True,
             )
+            mode = "action_end_no_logits"
 
         actions = self._detokenize_generated_actions(token_ids)
         empty_logits = torch.empty((token_ids.shape[0], 0, 0), dtype=torch.float32, device=token_ids.device)
@@ -152,10 +178,17 @@ class PI0FastTokenLogitAdapter:
             token_ids=token_ids,
             logits=empty_logits,
             stats={
-                "mode": "action_end_no_logits",
+                "mode": mode,
                 "emitted_tokens": int(token_ids.shape[1]),
                 "row_token_counts": getattr(self, "_last_action_end_row_token_counts", None),
                 "stopped_on_action_end": int(token_ids.shape[1]) < int(max_steps),
+                "action_end_token_id": self._action_end_token_id(),
+                "constrained_action_vocab": int(bool(constrained_action_vocab)),
+                "constrained_candidate_size": int(getattr(self, "_last_constrained_candidate_size", 0)),
+                "constrained_action_vocab_size": int(getattr(self, "_last_constrained_action_vocab_size", 0)),
+                "constrained_text_vocab_size": int(getattr(self, "_last_constrained_text_vocab_size", 0)),
+                "forced_action_prefix": int(bool(force_action_prefix)),
+                "forced_action_prefix_tokens": int(getattr(self, "_last_forced_action_prefix_token_count", 0)),
             },
         )
 
@@ -306,7 +339,21 @@ class PI0FastTokenLogitAdapter:
         drafter: Any,
         lookahead: int = 8,
         reuse_full_blocks: bool = False,
+        min_verify_margin: float = 0.0,
         verify_from_scratch: bool = False,
+        emit_bonus_token: bool = False,
+        dynamic_lookahead: bool = False,
+        min_lookahead: int = 1,
+        lookahead_growth: int = 1,
+        lookahead_shrink: int = 4,
+        tree_width: int = 1,
+        tree_branch_width: int = 4,
+        dynamic_tree_width: bool = False,
+        min_tree_width: int = 1,
+        tree_width_growth: int = 1,
+        tree_width_shrink: int = 1,
+        tree_anchor_target_token: bool = False,
+        tree_anchor_target_continuation: bool = False,
         early_stop_action_end: bool = False,
     ) -> PI0FastGenerationTrace:
         """Return a PI0-FAST action chunk decoded with exact n-gram speculation."""
@@ -324,7 +371,21 @@ class PI0FastTokenLogitAdapter:
             lookahead=lookahead,
             temperature=0.0,
             reuse_full_blocks=reuse_full_blocks,
+            min_verify_margin=min_verify_margin,
             verify_from_scratch=verify_from_scratch,
+            emit_bonus_token=emit_bonus_token,
+            dynamic_lookahead=dynamic_lookahead,
+            min_lookahead=min_lookahead,
+            lookahead_growth=lookahead_growth,
+            lookahead_shrink=lookahead_shrink,
+            tree_width=tree_width,
+            tree_branch_width=tree_branch_width,
+            dynamic_tree_width=dynamic_tree_width,
+            min_tree_width=min_tree_width,
+            tree_width_growth=tree_width_growth,
+            tree_width_shrink=tree_width_shrink,
+            tree_anchor_target_token=tree_anchor_target_token,
+            tree_anchor_target_continuation=tree_anchor_target_continuation,
             early_stop_action_end=early_stop_action_end,
         )
         actions = self._detokenize_generated_actions(token_ids)
@@ -511,28 +572,66 @@ class PI0FastTokenLogitAdapter:
         batch: dict[str, torch.Tensor],
         cutoff_tokens: int,
         early_stop_action_end: bool = True,
+        collect_logits: bool = False,
     ) -> PI0FastGenerationTrace:
         """Decode a bounded FAST-token prefix, then append action-end if needed."""
 
         self.policy.eval()
         images, img_masks = self.policy._preprocess_images(batch)
         tokens, masks = self._language_tokens(batch)
-        token_ids, logits, hidden_states = self.sample_actions_fast_kv_cache_with_logits(
-            images,
-            img_masks,
-            tokens,
-            masks,
-            max_decoding_steps=cutoff_tokens,
-            temperature=0.0,
-            return_hidden_states=False,
-            early_stop_action_end=early_stop_action_end,
-        )
+        if collect_logits or not self.policy.config.use_kv_cache:
+            if self.policy.config.use_kv_cache:
+                token_ids, logits, hidden_states = self.sample_actions_fast_kv_cache_with_logits(
+                    images,
+                    img_masks,
+                    tokens,
+                    masks,
+                    max_decoding_steps=cutoff_tokens,
+                    temperature=0.0,
+                    return_hidden_states=False,
+                    early_stop_action_end=early_stop_action_end,
+                )
+            else:
+                token_ids, logits, hidden_states = self.sample_actions_fast_with_logits(
+                    images,
+                    img_masks,
+                    tokens,
+                    masks,
+                    max_decoding_steps=cutoff_tokens,
+                    temperature=0.0,
+                    return_hidden_states=False,
+                    early_stop_action_end=early_stop_action_end,
+                )
+            mode = "prefix_cutoff_with_logits"
+        else:
+            token_ids = self.sample_actions_fast_kv_cache_action_end(
+                images,
+                img_masks,
+                tokens,
+                masks,
+                max_decoding_steps=cutoff_tokens,
+                temperature=0.0,
+            )
+            logits = torch.empty((token_ids.shape[0], 0, 0), dtype=torch.float32, device=token_ids.device)
+            hidden_states = None
+            mode = "prefix_cutoff_no_logits"
         action_end = self._action_end_token_id()
-        if token_ids.shape[1] == 0 or int(token_ids[0, -1].item()) != action_end:
-            eos = torch.tensor([[action_end]], dtype=token_ids.dtype, device=token_ids.device)
+        pre_append_tokens = int(token_ids.shape[1])
+        ended = token_ids.shape[1] > 0 and bool(torch.all(token_ids[:, -1] == action_end))
+        forced_end = int(not ended)
+        if forced_end:
+            eos = torch.full((token_ids.shape[0], 1), action_end, dtype=token_ids.dtype, device=token_ids.device)
             token_ids = torch.cat([token_ids, eos], dim=1)
         actions = self._detokenize_generated_actions(token_ids)
-        stats = {"cutoff_tokens": int(cutoff_tokens), "emitted_tokens": int(token_ids.shape[1])}
+        stats = {
+            "mode": mode,
+            "cutoff_tokens": int(cutoff_tokens),
+            "emitted_tokens": int(token_ids.shape[1]),
+            "pre_append_tokens": pre_append_tokens,
+            "forced_action_end": forced_end,
+            "stopped_on_action_end": int(ended),
+            "row_token_counts": getattr(self, "_last_action_end_row_token_counts", None),
+        }
         return PI0FastGenerationTrace(
             actions=actions,
             token_ids=token_ids,
@@ -1015,6 +1114,7 @@ class PI0FastTokenLogitAdapter:
         masks,
         max_decoding_steps: int | None = None,
         temperature: float = 0.0,
+        force_action_prefix: bool = False,
     ) -> torch.Tensor:
         """KV-cache FAST decode with per-row action-end compaction.
 
@@ -1029,6 +1129,18 @@ class PI0FastTokenLogitAdapter:
         device = tokens.device
         lm_head = self.model.paligemma_with_expert.paligemma.lm_head
         action_end_token_id = self._action_end_token_id()
+        prefix_tokens = None
+        if force_action_prefix:
+            if temperature != 0.0:
+                raise ValueError("Forced PI0-FAST action prefix currently supports greedy temperature=0 only")
+            prefix_tokens = torch.as_tensor(
+                self.model._paligemma_tokenizer.encode("Action: ", add_special_tokens=False),
+                dtype=torch.long,
+                device=device,
+            )
+            if prefix_tokens.numel() == 0:
+                raise RuntimeError("Could not resolve PI0-FAST Action prefix tokens")
+        self._last_forced_action_prefix_token_count = int(prefix_tokens.numel()) if prefix_tokens is not None else 0
 
         bos_token = torch.full(
             (bsize, 1),
@@ -1057,12 +1169,21 @@ class PI0FastTokenLogitAdapter:
             use_cache=True,
             adarms_cond=[None, None],
         )
-        next_token = self._select_next_token(lm_head(prefix_out[:, -1:, :]), temperature)
         generated = torch.full((bsize, max_decoding_steps), action_end_token_id, dtype=torch.long, device=device)
-        generated[:, 0] = next_token.squeeze(-1)
         current_pad_mask = prefix_pad_masks
         active_indices = torch.arange(bsize, dtype=torch.long, device=device)
-        emitted_lengths = torch.ones((bsize,), dtype=torch.long, device=device)
+        emitted_lengths = torch.zeros((bsize,), dtype=torch.long, device=device)
+
+        if prefix_tokens is not None:
+            next_token = prefix_tokens[0].view(1, 1).expand(bsize, 1)
+            generated[:, 0] = next_token.squeeze(-1)
+            emitted_lengths[:] = 1
+            loop_start = 1
+        else:
+            next_token = self._select_next_token(lm_head(prefix_out[:, -1:, :]), temperature)
+            generated[:, 0] = next_token.squeeze(-1)
+            emitted_lengths[:] = 1
+            loop_start = 1
 
         finished = next_token.squeeze(-1) == action_end_token_id
         if bool(torch.all(finished)):
@@ -1074,6 +1195,183 @@ class PI0FastTokenLogitAdapter:
             current_pad_mask = current_pad_mask[keep]
             next_token = next_token[keep]
             active_indices = active_indices[keep]
+
+        for t in range(loop_start, max_decoding_steps):
+            next_token_emb = self.model.paligemma_with_expert.embed_language_tokens(next_token)
+            next_token_emb = next_token_emb * math.sqrt(next_token_emb.shape[-1])
+            next_token_emb = next_token_emb.to(dtype=prefix_embs.dtype)
+            active_bsize = int(active_indices.numel())
+            current_pad_mask = torch.cat(
+                [current_pad_mask, torch.ones((active_bsize, 1), dtype=torch.bool, device=device)],
+                dim=1,
+            )
+            current_position_ids = (torch.sum(current_pad_mask, dim=1, keepdim=True) - 1).long()
+            step_att_mask = self.model._prepare_attention_masks_4d(
+                current_pad_mask.unsqueeze(1),
+                dtype=next_token_emb.dtype,
+            )
+            (step_out, _), past_key_values = self.model.paligemma_with_expert.forward(
+                attention_mask=step_att_mask,
+                position_ids=current_position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=[next_token_emb, None],
+                use_cache=True,
+                adarms_cond=[None, None],
+            )
+            if prefix_tokens is not None and t < int(prefix_tokens.numel()):
+                next_token = prefix_tokens[t].view(1, 1).expand(active_bsize, 1)
+            else:
+                next_token = self._select_next_token(lm_head(step_out[:, -1:, :]), temperature)
+            selected = next_token.squeeze(-1)
+            generated[active_indices, t] = selected
+            emitted_lengths[active_indices] = t + 1
+            finished = selected == action_end_token_id
+            if bool(torch.all(finished)):
+                max_len = int(emitted_lengths.max().item())
+                self._last_action_end_row_token_counts = emitted_lengths.detach().cpu().tolist()
+                return generated[:, :max_len]
+            if bool(torch.any(finished)):
+                keep = torch.nonzero(~finished, as_tuple=False).flatten()
+                past_key_values = past_key_values.batch_select_indices(keep)
+                current_pad_mask = current_pad_mask[keep]
+                next_token = next_token[keep]
+                active_indices = active_indices[keep]
+
+        self._last_action_end_row_token_counts = emitted_lengths.detach().cpu().tolist()
+        return generated
+
+    @torch.no_grad()
+    def sample_actions_fast_kv_cache_action_end_constrained(
+        self,
+        images,
+        img_masks,
+        tokens,
+        masks,
+        max_decoding_steps: int | None = None,
+        temperature: float = 0.0,
+        action_vocab_size: int | None = None,
+        text_vocab_size: int | None = None,
+    ) -> torch.Tensor:
+        """KV-cache FAST decode using the known PI0-FAST action-token support.
+
+        PI0-FAST action chunks are emitted as ``Action: `` followed by FAST BPE
+        action tokens and the ``|`` action-end marker.  This path avoids the
+        257k-way language-model head on every decode step: it forces the fixed
+        text prefix and computes argmax only over the FAST action-token IDs plus
+        the action-end token.  It is intended to be paired with validation
+        against the full-vocabulary target decode before use as a proof mode.
+        """
+
+        if temperature != 0.0:
+            raise ValueError("Constrained PI0-FAST decode currently supports greedy temperature=0 only")
+        if max_decoding_steps is None:
+            max_decoding_steps = self.model.config.max_action_tokens
+        bsize = tokens.shape[0]
+        device = tokens.device
+        lm_head = self.model.paligemma_with_expert.paligemma.lm_head
+        action_end_token_id = self._action_end_token_id()
+        prefix_tokens = torch.as_tensor(
+            self.model._paligemma_tokenizer.encode("Action: ", add_special_tokens=False),
+            dtype=torch.long,
+            device=device,
+        )
+        if prefix_tokens.numel() == 0:
+            raise RuntimeError("Could not resolve PI0-FAST Action prefix tokens")
+
+        # The public FAST tokenizer reports a 1024-token BPE vocab, but the
+        # PI0-FAST target occasionally emits nearby PaliGemma tokens that map
+        # to larger raw action-token IDs.  LeRobot's relaxed FAST decoder still
+        # consumes those IDs.  The target can also emit low text/special tokens
+        # inside the action chunk, so exact constrained decoding needs both a
+        # high FAST-action band and a small low-token band.
+        paligemma_vocab_size = int(self.model._paligemma_tokenizer.vocab_size)
+        if action_vocab_size is None:
+            action_vocab_size = max(int(getattr(self.policy.action_tokenizer, "vocab_size", 1024)), 8192)
+        if text_vocab_size is None:
+            text_vocab_size = 8192
+        action_vocab_size = max(int(getattr(self.policy.action_tokenizer, "vocab_size", 1024)), int(action_vocab_size))
+        text_vocab_size = min(paligemma_vocab_size, max(0, int(text_vocab_size)))
+        candidate_cache_key = (
+            int(action_vocab_size),
+            int(text_vocab_size),
+            str(device),
+            str(lm_head.weight.dtype),
+            int(lm_head.weight.data_ptr()),
+        )
+        cached = getattr(self, "_constrained_lm_head_cache", None)
+        if cached is None or cached.get("key") != candidate_cache_key:
+            action_token_ids = (
+                paligemma_vocab_size
+                - 1
+                - int(self.policy.config.fast_skip_tokens)
+                - torch.arange(action_vocab_size, dtype=torch.long, device=device)
+            )
+            action_token_ids = action_token_ids[(action_token_ids >= 0) & (action_token_ids < paligemma_vocab_size)]
+            text_token_ids = torch.arange(text_vocab_size, dtype=torch.long, device=device)
+            candidate_ids = torch.cat(
+                [
+                    text_token_ids,
+                    action_token_ids,
+                    prefix_tokens,
+                    torch.tensor([action_end_token_id], dtype=torch.long, device=device),
+                ],
+                dim=0,
+            )
+            candidate_weight = lm_head.weight.index_select(0, candidate_ids).contiguous()
+            cached = {
+                "key": candidate_cache_key,
+                "candidate_ids": candidate_ids,
+                "candidate_weight": candidate_weight,
+                "candidate_size": int(candidate_ids.numel()),
+                "action_vocab_size": int(action_vocab_size),
+                "text_vocab_size": int(text_vocab_size),
+            }
+            self._constrained_lm_head_cache = cached
+        candidate_ids = cached["candidate_ids"]
+        candidate_weight = cached["candidate_weight"]
+        self._last_constrained_candidate_size = int(candidate_ids.numel())
+        self._last_constrained_action_vocab_size = int(cached["action_vocab_size"])
+        self._last_constrained_text_vocab_size = int(cached["text_vocab_size"])
+
+        def restricted_next(hidden: torch.Tensor) -> torch.Tensor:
+            logits = F.linear(hidden, candidate_weight)
+            local = torch.argmax(logits[:, -1, :], dim=-1)
+            return candidate_ids.index_select(0, local).unsqueeze(-1)
+
+        bos_token = torch.full(
+            (bsize, 1),
+            self.model._paligemma_tokenizer.bos_token_id,
+            dtype=torch.long,
+            device=device,
+        )
+        tokens_in = torch.cat([tokens, bos_token], dim=1)
+        masks_in = torch.cat([masks, torch.ones((bsize, 1), dtype=torch.bool, device=device)], dim=1)
+        prefix_embs, prefix_pad_masks, prefix_att_masks, _total_t_images, _ = self.model.embed_prefix_fast(
+            images,
+            img_masks,
+            tokens_in,
+            masks_in,
+            fast_action_tokens=None,
+            fast_action_masks=None,
+        )
+        prefix_embs = self._match_model_precision(prefix_embs)
+        position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        att_4d = self.model._prepare_attention_masks_4d(prefix_att_masks, dtype=prefix_embs.dtype)
+        (_prefix_out, _), past_key_values = self.model.paligemma_with_expert.forward(
+            attention_mask=att_4d,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+            adarms_cond=[None, None],
+        )
+
+        next_token = prefix_tokens[0].view(1, 1).expand(bsize, 1)
+        generated = torch.full((bsize, max_decoding_steps), action_end_token_id, dtype=torch.long, device=device)
+        generated[:, 0] = next_token.squeeze(-1)
+        current_pad_mask = prefix_pad_masks
+        active_indices = torch.arange(bsize, dtype=torch.long, device=device)
+        emitted_lengths = torch.ones((bsize,), dtype=torch.long, device=device)
 
         for t in range(1, max_decoding_steps):
             next_token_emb = self.model.paligemma_with_expert.embed_language_tokens(next_token)
@@ -1097,7 +1395,10 @@ class PI0FastTokenLogitAdapter:
                 use_cache=True,
                 adarms_cond=[None, None],
             )
-            next_token = self._select_next_token(lm_head(step_out[:, -1:, :]), temperature)
+            if t < int(prefix_tokens.numel()):
+                next_token = prefix_tokens[t].view(1, 1).expand(active_bsize, 1)
+            else:
+                next_token = restricted_next(step_out[:, -1:, :])
             selected = next_token.squeeze(-1)
             generated[active_indices, t] = selected
             emitted_lengths[active_indices] = t + 1
@@ -1128,15 +1429,30 @@ class PI0FastTokenLogitAdapter:
         lookahead: int = 8,
         temperature: float = 0.0,
         reuse_full_blocks: bool = False,
+        min_verify_margin: float = 0.0,
         verify_from_scratch: bool = False,
+        emit_bonus_token: bool = False,
+        dynamic_lookahead: bool = False,
+        min_lookahead: int = 1,
+        lookahead_growth: int = 1,
+        lookahead_shrink: int = 4,
+        tree_width: int = 1,
+        tree_branch_width: int = 4,
+        dynamic_tree_width: bool = False,
+        min_tree_width: int = 1,
+        tree_width_growth: int = 1,
+        tree_width_shrink: int = 1,
+        tree_anchor_target_token: bool = False,
+        tree_anchor_target_continuation: bool = False,
         early_stop_action_end: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         """Greedy exact FAST-token decode with n-gram speculative verification.
 
         This is a conservative exact-SD path: accepted drafted tokens are added
         to the target KV cache, while mismatches fall back to the target token.
-        It does not emit the unprocessed bonus token, so the generated token
-        stream remains straightforward to reason about.
+        With ``emit_bonus_token`` enabled, a fully accepted block also emits the
+        verifier's next greedy token. That token is processed by the next
+        verify pass, matching standard greedy speculative decoding.
         """
 
         if temperature != 0.0:
@@ -1146,6 +1462,8 @@ class PI0FastTokenLogitAdapter:
         bsize = tokens.shape[0]
         if bsize != 1:
             raise ValueError("ngram speculative PI0-FAST decode currently supports batch size 1")
+        if int(tree_width) > 1 and verify_from_scratch:
+            raise ValueError("PI0-FAST tree speculation requires cached verification; disable verify_from_scratch")
 
         device = tokens.device
         lm_head = self.model.paligemma_with_expert.paligemma.lm_head
@@ -1186,9 +1504,121 @@ class PI0FastTokenLogitAdapter:
         fallback_forwards = 0
         replay_forwards = 0
         full_block_reuses = 0
+        margin_block_rejects = 0
+        verify_margin_checks = 0
+        verify_margin_min = float("inf")
+        verify_margin_sum = 0.0
+        bonus_tokens = 0
+        pending_verifies = 0
+        pending_corrections = 0
+        pending_processes = 0
+        pending_unprocessed_token: torch.Tensor | None = None
         drafted_tokens = 0
         accepted_tokens = 0
         debug_events: list[dict[str, Any]] = []
+        max_lookahead = max(1, int(lookahead))
+        current_lookahead = max_lookahead
+        min_dynamic_lookahead = max(1, min(int(min_lookahead), max_lookahead))
+        lookahead_values: list[int] = []
+        max_tree_width = max(1, int(tree_width))
+        current_tree_width = max(
+            1,
+            min(max_tree_width, int(min_tree_width) if dynamic_tree_width else max_tree_width),
+        )
+        tree_width_values: list[int] = []
+        max_tree_branch_width = max(1, int(tree_branch_width))
+        tree_verifies = 0
+        tree_candidates = 0
+        tree_accepted_tokens = 0
+        tree_anchor_verifies = 0
+        tree_anchor_candidates = 0
+        tree_anchor_accepted_tokens = 0
+        tree_first_token_checks = 0
+        tree_first_token_misses = 0
+        second_order_action_extrapolation_drafted_tokens = 0
+        second_order_action_extrapolation_accepted_tokens = 0
+        previous_chunk_position_drafted_tokens = 0
+        previous_chunk_position_accepted_tokens = 0
+        chunk_prefix_retrieval_drafted_tokens = 0
+        chunk_prefix_retrieval_accepted_tokens = 0
+        chunk_length_stop_drafted_tokens = 0
+        chunk_length_stop_accepted_tokens = 0
+        position_mode_histogram_drafted_tokens = 0
+        position_mode_histogram_accepted_tokens = 0
+        global_position_mode_drafted_tokens = 0
+        global_position_mode_accepted_tokens = 0
+        action_dimension_mode_drafted_tokens = 0
+        action_dimension_mode_accepted_tokens = 0
+        hold_action_token_drafted_tokens = 0
+        hold_action_token_accepted_tokens = 0
+        ngram_continuation_drafted_tokens = 0
+        ngram_continuation_accepted_tokens = 0
+        source_agreement_drafted_tokens = 0
+        source_agreement_accepted_tokens = 0
+        action_trend_regression_drafted_tokens = 0
+        action_trend_regression_accepted_tokens = 0
+        action_prefix_lookup_drafted_tokens = 0
+        action_prefix_lookup_accepted_tokens = 0
+        action_vector_transition_drafted_tokens = 0
+        action_vector_transition_accepted_tokens = 0
+        action_repeat_vector_drafted_tokens = 0
+        action_repeat_vector_accepted_tokens = 0
+        action_token_neighborhood_drafted_tokens = 0
+        action_token_neighborhood_accepted_tokens = 0
+        action_context_tree_drafted_tokens = 0
+        action_context_tree_accepted_tokens = 0
+        action_transition_histogram_drafted_tokens = 0
+        action_transition_histogram_accepted_tokens = 0
+        action_delta_histogram_drafted_tokens = 0
+        action_delta_histogram_accepted_tokens = 0
+        action_delta_ngram_drafted_tokens = 0
+        action_delta_ngram_accepted_tokens = 0
+        chunk_delta_template_drafted_tokens = 0
+        chunk_delta_template_accepted_tokens = 0
+        chunk_position_delta_drafted_tokens = 0
+        chunk_position_delta_accepted_tokens = 0
+
+        def source_count(sources: list[str], source: str, limit: int | None = None) -> int:
+            values = sources if limit is None else sources[: max(int(limit), 0)]
+            return sum(1 for value in values if value == source)
+
+        def last_draft_sources() -> list[str]:
+            if hasattr(drafter, "last_draft_sources"):
+                return [str(value) for value in drafter.last_draft_sources()]
+            return []
+
+        def last_many_sources() -> list[list[str]]:
+            if hasattr(drafter, "last_many_sources"):
+                return [[str(value) for value in row] for row in drafter.last_many_sources()]
+            return []
+
+        def record_source_feedback(sources: list[str], accepted: int) -> None:
+            if hasattr(drafter, "record_source_feedback"):
+                drafter.record_source_feedback(sources, accepted)
+
+        def record_source_miss() -> None:
+            if hasattr(drafter, "record_source_miss"):
+                drafter.record_source_miss()
+
+        def source_cooldown_stats() -> dict[str, Any]:
+            if hasattr(drafter, "source_cooldown_stats"):
+                return dict(drafter.source_cooldown_stats())
+            return {}
+
+        def update_dynamic_lookahead(*, accepted: int, drafted: int, miss: bool = False) -> None:
+            nonlocal current_lookahead
+            if not dynamic_lookahead:
+                return
+            if miss or accepted < drafted:
+                current_lookahead = max(
+                    min_dynamic_lookahead,
+                    current_lookahead - max(int(lookahead_shrink), 1),
+                )
+            else:
+                current_lookahead = min(
+                    max_lookahead,
+                    current_lookahead + max(int(lookahead_growth), 1),
+                )
 
         def advance_one(
             next_token: torch.Tensor,
@@ -1226,12 +1656,752 @@ class PI0FastTokenLogitAdapter:
                 replay_forwards += 1
             return lm_head(step_out[:, -1:, :])
 
+        def process_pending_one() -> torch.Tensor:
+            nonlocal pending_unprocessed_token, current_pad_mask, past_key_values
+            nonlocal target_forwards, fallback_forwards, pending_processes
+            if pending_unprocessed_token is None:
+                raise RuntimeError("No pending token to process")
+            token = pending_unprocessed_token
+            token_emb = self.model.paligemma_with_expert.embed_language_tokens(token)
+            token_emb = token_emb * math.sqrt(token_emb.shape[-1])
+            token_emb = token_emb.to(dtype=prefix_embs.dtype)
+            current_pad_mask = torch.cat(
+                [current_pad_mask, torch.ones((bsize, 1), dtype=torch.bool, device=device)],
+                dim=1,
+            )
+            current_position_ids = (torch.sum(current_pad_mask, dim=1, keepdim=True) - 1).long()
+            step_att_mask = self.model._prepare_attention_masks_4d(
+                current_pad_mask.unsqueeze(1),
+                dtype=token_emb.dtype,
+            )
+            (step_out, _), past_key_values = self._forward_prefix_language_model(
+                attention_mask=step_att_mask,
+                position_ids=current_position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=token_emb,
+                use_cache=True,
+                cache_position=torch.tensor([current_pad_mask.shape[1] - 1], device=device, dtype=torch.long),
+            )
+            pending_unprocessed_token = None
+            pending_processes += 1
+            target_forwards += 1
+            fallback_forwards += 1
+            return lm_head(step_out[:, -1:, :])
+
+        def verify_candidate_batch(
+            candidate_rows: list[list[int]],
+            *,
+            prepend_prev_logits: bool,
+        ) -> tuple[torch.Tensor, Any, torch.Tensor, list[int]]:
+            nonlocal target_forwards, verify_forwards, tree_verifies, tree_candidates
+            if not candidate_rows:
+                raise ValueError("verify_candidate_batch requires at least one candidate")
+            lengths = [len(row) for row in candidate_rows]
+            max_len = max(lengths)
+            batch_candidates = len(candidate_rows)
+            padded_rows = [row + [row[-1]] * (max_len - len(row)) for row in candidate_rows]
+            candidate_tensor = torch.tensor(padded_rows, dtype=torch.long, device=device)
+            old_mask_len = current_pad_mask.shape[1]
+            verify_past_key_values = repeat_kv_batch(past_key_values, batch_candidates)
+            candidate_embs = self.model.paligemma_with_expert.embed_language_tokens(candidate_tensor)
+            candidate_embs = candidate_embs * math.sqrt(candidate_embs.shape[-1])
+            candidate_embs = candidate_embs.to(dtype=prefix_embs.dtype)
+            verify_pad_mask = torch.cat(
+                [
+                    current_pad_mask.repeat(batch_candidates, 1),
+                    torch.ones((batch_candidates, max_len), dtype=torch.bool, device=device),
+                ],
+                dim=1,
+            )
+            verify_mask = torch.zeros(
+                (batch_candidates, max_len, old_mask_len + max_len),
+                dtype=torch.bool,
+                device=device,
+            )
+            for row in range(max_len):
+                verify_mask[:, row, : old_mask_len + row + 1] = verify_pad_mask[:, : old_mask_len + row + 1]
+            verify_att_mask = self.model._prepare_attention_masks_4d(verify_mask, dtype=candidate_embs.dtype)
+            position_start = int(torch.sum(current_pad_mask, dim=1).item())
+            verify_position_ids = torch.arange(
+                position_start,
+                position_start + max_len,
+                device=device,
+                dtype=torch.long,
+            ).unsqueeze(0).repeat(batch_candidates, 1)
+            (verify_out, _), verify_kv = self._forward_prefix_language_model(
+                attention_mask=verify_att_mask,
+                position_ids=verify_position_ids,
+                past_key_values=verify_past_key_values,
+                inputs_embeds=candidate_embs,
+                use_cache=True,
+                cache_position=verify_position_ids[0],
+            )
+            verify_logits = lm_head(verify_out)
+            target_forwards += 1
+            verify_forwards += 1
+            tree_verifies += 1
+            tree_candidates += batch_candidates
+            if prepend_prev_logits:
+                return torch.cat([prev_logits.repeat(batch_candidates, 1, 1), verify_logits], dim=1), verify_kv, verify_pad_mask, lengths
+            return verify_logits, verify_kv, verify_pad_mask, lengths
+
+        if hasattr(drafter, "reset_source_feedback"):
+            drafter.reset_source_feedback()
+
         while len(generated_tokens) < max_decoding_steps:
             remaining = max_decoding_steps - len(generated_tokens)
+            block_lookahead = current_lookahead if dynamic_lookahead else max_lookahead
+            block_lookahead = max(1, min(int(block_lookahead), remaining))
+            lookahead_values.append(block_lookahead)
+            block_tree_width = current_tree_width if dynamic_tree_width else max_tree_width
+            block_tree_width = max(1, min(max_tree_width, int(block_tree_width)))
+            tree_width_values.append(block_tree_width)
+            if pending_unprocessed_token is not None:
+                if action_end_token_id is not None and int(pending_unprocessed_token.item()) == action_end_token_id:
+                    break
+                if block_tree_width > 1 and hasattr(drafter, "draft_many"):
+                    raw_future_rows = drafter.draft_many(
+                        generated_tokens,
+                        lookahead=block_lookahead,
+                        max_candidates=block_tree_width,
+                        branch_width=max_tree_branch_width,
+                    )
+                    raw_future_sources = last_many_sources()
+                    future_rows: list[list[int]] = []
+                    future_sources: list[list[str]] = []
+                    for row_idx, row in enumerate(raw_future_rows):
+                        if not row:
+                            continue
+                        future_rows.append([int(token) for token in row[:remaining]])
+                        sources = raw_future_sources[row_idx] if row_idx < len(raw_future_sources) else []
+                        future_sources.append(sources[: len(future_rows[-1])])
+                    if not future_rows:
+                        update_dynamic_lookahead(accepted=0, drafted=0, miss=True)
+                        if dynamic_tree_width:
+                            current_tree_width = max(
+                                1,
+                                current_tree_width - max(int(tree_width_shrink), 1),
+                            )
+                        record_source_miss()
+                        prev_logits = process_pending_one()
+                        continue
+
+                    pending_value = int(pending_unprocessed_token.item())
+                    candidate_rows = [[pending_value, *future] for future in future_rows]
+                    drafted_tokens += sum(len(future) for future in future_rows)
+                    second_order_action_extrapolation_drafted_tokens += sum(
+                        source_count(sources, "second_order_action_extrapolation")
+                        for sources in future_sources
+                    )
+                    previous_chunk_position_drafted_tokens += sum(
+                        source_count(sources, "previous_chunk_position") for sources in future_sources
+                    )
+                    chunk_prefix_retrieval_drafted_tokens += sum(
+                        source_count(sources, "chunk_prefix_retrieval") for sources in future_sources
+                    )
+                    chunk_length_stop_drafted_tokens += sum(
+                        source_count(sources, "chunk_length_stop") for sources in future_sources
+                    )
+                    position_mode_histogram_drafted_tokens += sum(
+                        source_count(sources, "position_mode_histogram") for sources in future_sources
+                    )
+                    global_position_mode_drafted_tokens += sum(
+                        source_count(sources, "global_position_mode") for sources in future_sources
+                    )
+                    action_dimension_mode_drafted_tokens += sum(
+                        source_count(sources, "action_dimension_mode") for sources in future_sources
+                    )
+                    hold_action_token_drafted_tokens += sum(
+                        source_count(sources, "hold_action_token") for sources in future_sources
+                    )
+                    ngram_continuation_drafted_tokens += sum(
+                        source_count(sources, "ngram_continuation") for sources in future_sources
+                    )
+                    source_agreement_drafted_tokens += sum(
+                        source_count(sources, "source_agreement") for sources in future_sources
+                    )
+                    action_trend_regression_drafted_tokens += sum(
+                        source_count(sources, "action_trend_regression") for sources in future_sources
+                    )
+                    action_prefix_lookup_drafted_tokens += sum(
+                        source_count(sources, "action_prefix_lookup") for sources in future_sources
+                    )
+                    action_vector_transition_drafted_tokens += sum(
+                        source_count(sources, "action_vector_transition") for sources in future_sources
+                    )
+                    action_repeat_vector_drafted_tokens += sum(
+                        source_count(sources, "action_repeat_vector") for sources in future_sources
+                    )
+                    action_token_neighborhood_drafted_tokens += sum(
+                        source_count(sources, "action_token_neighborhood") for sources in future_sources
+                    )
+                    action_context_tree_drafted_tokens += sum(
+                        source_count(sources, "action_context_tree") for sources in future_sources
+                    )
+                    action_transition_histogram_drafted_tokens += sum(
+                        source_count(sources, "action_transition_histogram") for sources in future_sources
+                    )
+                    action_delta_histogram_drafted_tokens += sum(
+                        source_count(sources, "action_delta_histogram") for sources in future_sources
+                    )
+                    action_delta_ngram_drafted_tokens += sum(
+                        source_count(sources, "action_delta_ngram") for sources in future_sources
+                    )
+                    chunk_position_delta_drafted_tokens += sum(
+                        source_count(sources, "chunk_position_delta") for sources in future_sources
+                    )
+                    chunk_delta_template_drafted_tokens += sum(
+                        source_count(sources, "chunk_delta_template") for sources in future_sources
+                    )
+                    old_mask_len = current_pad_mask.shape[1]
+                    future_logits_all, verify_kv, verify_pad_mask, _candidate_lengths = verify_candidate_batch(
+                        candidate_rows,
+                        prepend_prev_logits=False,
+                    )
+                    pending_verifies += 1
+
+                    best_idx = 0
+                    future_accepted = -1
+                    for row_idx, future_candidate in enumerate(future_rows):
+                        accepted = 0
+                        for idx, token in enumerate(future_candidate):
+                            predicted_future = int(
+                                torch.argmax(
+                                    future_logits_all[row_idx : row_idx + 1, idx : idx + 1, :][:, -1],
+                                    dim=-1,
+                                ).item()
+                            )
+                            if predicted_future != int(token):
+                                break
+                            accepted += 1
+                        if accepted > future_accepted:
+                            best_idx = row_idx
+                            future_accepted = accepted
+                            if accepted == len(future_candidate):
+                                break
+
+                    future = future_rows[best_idx]
+                    future_logits_all = future_logits_all[best_idx : best_idx + 1]
+                    verify_kv = select_kv_batch(verify_kv, best_idx)
+                    verify_pad_mask = verify_pad_mask[best_idx : best_idx + 1]
+                    future_accepted = max(future_accepted, 0)
+                    if len(debug_events) < 64:
+                        debug_events.append(
+                            {
+                                "pos": len(generated_tokens),
+                                "kind": "pending_tree_verify",
+                                "candidates": len(future_rows),
+                                "future_len": len(future),
+                                "accepted": future_accepted,
+                            }
+                        )
+                    accepted_emit = future_accepted
+                    if action_end_token_id is not None:
+                        for idx in range(future_accepted):
+                            if int(future[idx]) == action_end_token_id:
+                                accepted_emit = idx + 1
+                                break
+                    for idx in range(accepted_emit):
+                        logits_for_token = future_logits_all[:, idx : idx + 1, :]
+                        logits_by_step.append(logits_for_token)
+                        generated_tokens.append(int(future[idx]))
+                    accepted_tokens += accepted_emit
+                    tree_accepted_tokens += accepted_emit
+                    if best_idx < len(future_sources):
+                        record_source_feedback(future_sources[best_idx], future_accepted)
+                        second_order_action_extrapolation_accepted_tokens += source_count(
+                            future_sources[best_idx],
+                            "second_order_action_extrapolation",
+                            accepted_emit,
+                        )
+                        previous_chunk_position_accepted_tokens += source_count(
+                            future_sources[best_idx],
+                            "previous_chunk_position",
+                            accepted_emit,
+                        )
+                        chunk_prefix_retrieval_accepted_tokens += source_count(
+                            future_sources[best_idx],
+                            "chunk_prefix_retrieval",
+                            accepted_emit,
+                        )
+                        chunk_length_stop_accepted_tokens += source_count(
+                            future_sources[best_idx],
+                            "chunk_length_stop",
+                            accepted_emit,
+                        )
+                        position_mode_histogram_accepted_tokens += source_count(
+                            future_sources[best_idx],
+                            "position_mode_histogram",
+                            accepted_emit,
+                        )
+                        global_position_mode_accepted_tokens += source_count(
+                            future_sources[best_idx],
+                            "global_position_mode",
+                            accepted_emit,
+                        )
+                        action_dimension_mode_accepted_tokens += source_count(
+                            future_sources[best_idx],
+                            "action_dimension_mode",
+                            accepted_emit,
+                        )
+                        hold_action_token_accepted_tokens += source_count(
+                            future_sources[best_idx],
+                            "hold_action_token",
+                            accepted_emit,
+                        )
+                        ngram_continuation_accepted_tokens += source_count(
+                            future_sources[best_idx],
+                            "ngram_continuation",
+                            accepted_emit,
+                        )
+                        source_agreement_accepted_tokens += source_count(
+                            future_sources[best_idx],
+                            "source_agreement",
+                            accepted_emit,
+                        )
+                        action_trend_regression_accepted_tokens += source_count(
+                            future_sources[best_idx],
+                            "action_trend_regression",
+                            accepted_emit,
+                        )
+                        action_prefix_lookup_accepted_tokens += source_count(
+                            future_sources[best_idx],
+                            "action_prefix_lookup",
+                            accepted_emit,
+                        )
+                        action_vector_transition_accepted_tokens += source_count(
+                            future_sources[best_idx],
+                            "action_vector_transition",
+                            accepted_emit,
+                        )
+                        action_repeat_vector_accepted_tokens += source_count(
+                            future_sources[best_idx],
+                            "action_repeat_vector",
+                            accepted_emit,
+                        )
+                        action_token_neighborhood_accepted_tokens += source_count(
+                            future_sources[best_idx],
+                            "action_token_neighborhood",
+                            accepted_emit,
+                        )
+                        action_context_tree_accepted_tokens += source_count(
+                            future_sources[best_idx],
+                            "action_context_tree",
+                            accepted_emit,
+                        )
+                        action_transition_histogram_accepted_tokens += source_count(
+                            future_sources[best_idx],
+                            "action_transition_histogram",
+                            accepted_emit,
+                        )
+                        action_delta_histogram_accepted_tokens += source_count(
+                            future_sources[best_idx],
+                            "action_delta_histogram",
+                            accepted_emit,
+                        )
+                        action_delta_ngram_accepted_tokens += source_count(
+                            future_sources[best_idx],
+                            "action_delta_ngram",
+                            accepted_emit,
+                        )
+                        chunk_position_delta_accepted_tokens += source_count(
+                            future_sources[best_idx],
+                            "chunk_position_delta",
+                            accepted_emit,
+                        )
+                        chunk_delta_template_accepted_tokens += source_count(
+                            future_sources[best_idx],
+                            "chunk_delta_template",
+                            accepted_emit,
+                        )
+                    else:
+                        record_source_miss()
+                    update_dynamic_lookahead(accepted=future_accepted, drafted=len(future))
+                    if dynamic_tree_width:
+                        if future_accepted == len(future):
+                            current_tree_width = min(
+                                max_tree_width,
+                                current_tree_width + max(int(tree_width_growth), 1),
+                            )
+                        else:
+                            current_tree_width = max(
+                                1,
+                                current_tree_width - max(int(tree_width_shrink), 1),
+                            )
+
+                    keep_len = old_mask_len + 1 + accepted_emit
+                    past_key_values = trim_kv(verify_kv, keep_len)
+                    current_pad_mask = verify_pad_mask[:, :keep_len].contiguous()
+                    pending_unprocessed_token = None
+
+                    if len(generated_tokens) >= max_decoding_steps:
+                        break
+                    if action_end_token_id is not None and generated_tokens and generated_tokens[-1] == action_end_token_id:
+                        break
+                    if future_accepted == len(future):
+                        full_block_reuses += 1
+                        bonus_logits = future_logits_all[:, len(future) : len(future) + 1, :]
+                        if emit_bonus_token and bonus_logits.shape[1] == 1 and len(generated_tokens) < max_decoding_steps:
+                            bonus_token = torch.argmax(bonus_logits[:, -1], dim=-1, keepdim=True)
+                            logits_by_step.append(bonus_logits)
+                            generated_tokens.append(int(bonus_token.item()))
+                            bonus_tokens += 1
+                            pending_unprocessed_token = bonus_token
+                            prev_logits = bonus_logits
+                            if action_end_token_id is not None and int(bonus_token.item()) == action_end_token_id:
+                                break
+                        else:
+                            prev_logits = bonus_logits
+                    else:
+                        correction_logits = future_logits_all[:, future_accepted : future_accepted + 1, :]
+                        correction_token = torch.argmax(correction_logits[:, -1], dim=-1, keepdim=True)
+                        logits_by_step.append(correction_logits)
+                        generated_tokens.append(int(correction_token.item()))
+                        pending_corrections += 1
+                        pending_unprocessed_token = correction_token
+                        prev_logits = correction_logits
+                        if action_end_token_id is not None and int(correction_token.item()) == action_end_token_id:
+                            break
+                    continue
+                future = drafter.draft(generated_tokens, lookahead=block_lookahead)
+                future_sources = last_draft_sources()
+                future = future[:remaining]
+                future_sources = future_sources[: len(future)]
+                if not future:
+                    update_dynamic_lookahead(accepted=0, drafted=0, miss=True)
+                    record_source_miss()
+                    prev_logits = process_pending_one()
+                    continue
+
+                candidate = [int(pending_unprocessed_token.item()), *[int(token) for token in future]]
+                candidate_tensor = torch.tensor([candidate], dtype=torch.long, device=device)
+                drafted_tokens += len(future)
+                second_order_action_extrapolation_drafted_tokens += source_count(
+                    future_sources,
+                    "second_order_action_extrapolation",
+                )
+                previous_chunk_position_drafted_tokens += source_count(
+                    future_sources,
+                    "previous_chunk_position",
+                )
+                chunk_prefix_retrieval_drafted_tokens += source_count(
+                    future_sources,
+                    "chunk_prefix_retrieval",
+                )
+                chunk_length_stop_drafted_tokens += source_count(
+                    future_sources,
+                    "chunk_length_stop",
+                )
+                position_mode_histogram_drafted_tokens += source_count(
+                    future_sources,
+                    "position_mode_histogram",
+                )
+                global_position_mode_drafted_tokens += source_count(
+                    future_sources,
+                    "global_position_mode",
+                )
+                action_dimension_mode_drafted_tokens += source_count(
+                    future_sources,
+                    "action_dimension_mode",
+                )
+                hold_action_token_drafted_tokens += source_count(
+                    future_sources,
+                    "hold_action_token",
+                )
+                ngram_continuation_drafted_tokens += source_count(
+                    future_sources,
+                    "ngram_continuation",
+                )
+                source_agreement_drafted_tokens += source_count(
+                    future_sources,
+                    "source_agreement",
+                )
+                action_trend_regression_drafted_tokens += source_count(
+                    future_sources,
+                    "action_trend_regression",
+                )
+                action_prefix_lookup_drafted_tokens += source_count(
+                    future_sources,
+                    "action_prefix_lookup",
+                )
+                action_vector_transition_drafted_tokens += source_count(
+                    future_sources,
+                    "action_vector_transition",
+                )
+                action_repeat_vector_drafted_tokens += source_count(
+                    future_sources,
+                    "action_repeat_vector",
+                )
+                action_token_neighborhood_drafted_tokens += source_count(
+                    future_sources,
+                    "action_token_neighborhood",
+                )
+                action_context_tree_drafted_tokens += source_count(
+                    future_sources,
+                    "action_context_tree",
+                )
+                action_transition_histogram_drafted_tokens += source_count(
+                    future_sources,
+                    "action_transition_histogram",
+                )
+                action_delta_histogram_drafted_tokens += source_count(
+                    future_sources,
+                    "action_delta_histogram",
+                )
+                action_delta_ngram_drafted_tokens += source_count(
+                    future_sources,
+                    "action_delta_ngram",
+                )
+                chunk_position_delta_drafted_tokens += source_count(
+                    future_sources,
+                    "chunk_position_delta",
+                )
+                chunk_delta_template_drafted_tokens += source_count(
+                    future_sources,
+                    "chunk_delta_template",
+                )
+                old_mask_len = current_pad_mask.shape[1]
+                if verify_from_scratch:
+                    full_fast_tokens = torch.tensor(
+                        [generated_tokens + [int(token) for token in future]],
+                        dtype=torch.long,
+                        device=device,
+                    )
+                    full_fast_masks = torch.ones_like(full_fast_tokens, dtype=torch.bool)
+                    full_embs, full_pad_masks, full_att_masks, _total_t_images, num_fast_embs = self.model.embed_prefix_fast(
+                        images,
+                        img_masks,
+                        tokens,
+                        masks,
+                        fast_action_tokens=full_fast_tokens,
+                        fast_action_masks=full_fast_masks,
+                    )
+                    full_embs = self._match_model_precision(full_embs)
+                    full_position_ids = torch.cumsum(full_pad_masks, dim=1) - 1
+                    full_att_4d = self.model._prepare_attention_masks_4d(full_att_masks, dtype=full_embs.dtype)
+                    (verify_out, _), verify_kv = self._forward_prefix_language_model(
+                        attention_mask=full_att_4d,
+                        position_ids=full_position_ids,
+                        past_key_values=None,
+                        inputs_embeds=full_embs,
+                        use_cache=True,
+                        cache_position=torch.arange(full_embs.shape[1], device=device, dtype=torch.long),
+                    )
+                    bos_hidden_idx = verify_out.shape[1] - num_fast_embs - 1
+                    start = bos_hidden_idx + len(generated_tokens)
+                    future_logits_all = lm_head(verify_out[:, start : start + len(future) + 1, :])
+                    verify_pad_mask = full_pad_masks
+                else:
+                    verify_past_key_values = clone_kv(past_key_values)
+                    candidate_embs = self.model.paligemma_with_expert.embed_language_tokens(candidate_tensor)
+                    candidate_embs = candidate_embs * math.sqrt(candidate_embs.shape[-1])
+                    candidate_embs = candidate_embs.to(dtype=prefix_embs.dtype)
+                    verify_pad_mask = torch.cat(
+                        [current_pad_mask, torch.ones((bsize, len(candidate)), dtype=torch.bool, device=device)],
+                        dim=1,
+                    )
+                    verify_mask = torch.zeros(
+                        (bsize, len(candidate), old_mask_len + len(candidate)),
+                        dtype=torch.bool,
+                        device=device,
+                    )
+                    for row in range(len(candidate)):
+                        verify_mask[:, row, : old_mask_len + row + 1] = verify_pad_mask[:, : old_mask_len + row + 1]
+                    verify_att_mask = self.model._prepare_attention_masks_4d(verify_mask, dtype=candidate_embs.dtype)
+                    position_start = int(torch.sum(current_pad_mask, dim=1).item())
+                    verify_position_ids = torch.arange(
+                        position_start,
+                        position_start + len(candidate),
+                        device=device,
+                        dtype=torch.long,
+                    ).unsqueeze(0)
+                    (verify_out, _), verify_kv = self._forward_prefix_language_model(
+                        attention_mask=verify_att_mask,
+                        position_ids=verify_position_ids,
+                        past_key_values=verify_past_key_values,
+                        inputs_embeds=candidate_embs,
+                        use_cache=True,
+                        cache_position=verify_position_ids.squeeze(0),
+                    )
+                    future_logits_all = lm_head(verify_out)
+                target_forwards += 1
+                verify_forwards += 1
+                pending_verifies += 1
+
+                future_accepted = 0
+                for idx, token in enumerate(future):
+                    predicted_future = int(torch.argmax(future_logits_all[:, idx : idx + 1, :][:, -1], dim=-1).item())
+                    if predicted_future != int(token):
+                        break
+                    future_accepted += 1
+                if len(debug_events) < 64:
+                    debug_events.append(
+                        {
+                            "pos": len(generated_tokens),
+                            "kind": "pending_verify",
+                            "future_len": len(future),
+                            "accepted": future_accepted,
+                        }
+                    )
+                accepted_emit = future_accepted
+                if action_end_token_id is not None:
+                    for idx in range(future_accepted):
+                        if int(future[idx]) == action_end_token_id:
+                            accepted_emit = idx + 1
+                            break
+                for idx in range(accepted_emit):
+                    logits_for_token = future_logits_all[:, idx : idx + 1, :]
+                    logits_by_step.append(logits_for_token)
+                    generated_tokens.append(int(future[idx]))
+                accepted_tokens += accepted_emit
+                record_source_feedback(future_sources, future_accepted)
+                second_order_action_extrapolation_accepted_tokens += source_count(
+                    future_sources,
+                    "second_order_action_extrapolation",
+                    accepted_emit,
+                )
+                previous_chunk_position_accepted_tokens += source_count(
+                    future_sources,
+                    "previous_chunk_position",
+                    accepted_emit,
+                )
+                chunk_prefix_retrieval_accepted_tokens += source_count(
+                    future_sources,
+                    "chunk_prefix_retrieval",
+                    accepted_emit,
+                )
+                chunk_length_stop_accepted_tokens += source_count(
+                    future_sources,
+                    "chunk_length_stop",
+                    accepted_emit,
+                )
+                position_mode_histogram_accepted_tokens += source_count(
+                    future_sources,
+                    "position_mode_histogram",
+                    accepted_emit,
+                )
+                global_position_mode_accepted_tokens += source_count(
+                    future_sources,
+                    "global_position_mode",
+                    accepted_emit,
+                )
+                action_dimension_mode_accepted_tokens += source_count(
+                    future_sources,
+                    "action_dimension_mode",
+                    accepted_emit,
+                )
+                hold_action_token_accepted_tokens += source_count(
+                    future_sources,
+                    "hold_action_token",
+                    accepted_emit,
+                )
+                ngram_continuation_accepted_tokens += source_count(
+                    future_sources,
+                    "ngram_continuation",
+                    accepted_emit,
+                )
+                source_agreement_accepted_tokens += source_count(
+                    future_sources,
+                    "source_agreement",
+                    accepted_emit,
+                )
+                action_trend_regression_accepted_tokens += source_count(
+                    future_sources,
+                    "action_trend_regression",
+                    accepted_emit,
+                )
+                action_prefix_lookup_accepted_tokens += source_count(
+                    future_sources,
+                    "action_prefix_lookup",
+                    accepted_emit,
+                )
+                action_vector_transition_accepted_tokens += source_count(
+                    future_sources,
+                    "action_vector_transition",
+                    accepted_emit,
+                )
+                action_repeat_vector_accepted_tokens += source_count(
+                    future_sources,
+                    "action_repeat_vector",
+                    accepted_emit,
+                )
+                action_token_neighborhood_accepted_tokens += source_count(
+                    future_sources,
+                    "action_token_neighborhood",
+                    accepted_emit,
+                )
+                action_context_tree_accepted_tokens += source_count(
+                    future_sources,
+                    "action_context_tree",
+                    accepted_emit,
+                )
+                action_transition_histogram_accepted_tokens += source_count(
+                    future_sources,
+                    "action_transition_histogram",
+                    accepted_emit,
+                )
+                action_delta_histogram_accepted_tokens += source_count(
+                    future_sources,
+                    "action_delta_histogram",
+                    accepted_emit,
+                )
+                action_delta_ngram_accepted_tokens += source_count(
+                    future_sources,
+                    "action_delta_ngram",
+                    accepted_emit,
+                )
+                chunk_position_delta_accepted_tokens += source_count(
+                    future_sources,
+                    "chunk_position_delta",
+                    accepted_emit,
+                )
+                chunk_delta_template_accepted_tokens += source_count(
+                    future_sources,
+                    "chunk_delta_template",
+                    accepted_emit,
+                )
+                update_dynamic_lookahead(accepted=future_accepted, drafted=len(future))
+
+                keep_len = old_mask_len + 1 + accepted_emit
+                past_key_values = trim_kv(verify_kv, keep_len)
+                current_pad_mask = verify_pad_mask[:, :keep_len].contiguous()
+                pending_unprocessed_token = None
+
+                if len(generated_tokens) >= max_decoding_steps:
+                    break
+                if action_end_token_id is not None and generated_tokens and generated_tokens[-1] == action_end_token_id:
+                    break
+                if future_accepted == len(future):
+                    full_block_reuses += 1
+                    bonus_logits = future_logits_all[:, len(future) : len(future) + 1, :]
+                    if emit_bonus_token and bonus_logits.shape[1] == 1 and len(generated_tokens) < max_decoding_steps:
+                        bonus_token = torch.argmax(bonus_logits[:, -1], dim=-1, keepdim=True)
+                        logits_by_step.append(bonus_logits)
+                        generated_tokens.append(int(bonus_token.item()))
+                        bonus_tokens += 1
+                        pending_unprocessed_token = bonus_token
+                        prev_logits = bonus_logits
+                        if action_end_token_id is not None and int(bonus_token.item()) == action_end_token_id:
+                            break
+                    else:
+                        prev_logits = bonus_logits
+                else:
+                    correction_logits = future_logits_all[:, future_accepted : future_accepted + 1, :]
+                    correction_token = torch.argmax(correction_logits[:, -1], dim=-1, keepdim=True)
+                    logits_by_step.append(correction_logits)
+                    generated_tokens.append(int(correction_token.item()))
+                    pending_corrections += 1
+                    pending_unprocessed_token = correction_token
+                    prev_logits = correction_logits
+                    if action_end_token_id is not None and int(correction_token.item()) == action_end_token_id:
+                        break
+                continue
+
             target_next = torch.argmax(prev_logits[:, -1], dim=-1, keepdim=True)
             if action_end_token_id is not None and int(target_next.item()) == action_end_token_id:
                 logits_by_step.append(prev_logits)
                 generated_tokens.append(int(target_next.item()))
+                pending_unprocessed_token = target_next
                 if len(debug_events) < 64:
                     debug_events.append(
                         {
@@ -1239,9 +2409,698 @@ class PI0FastTokenLogitAdapter:
                             "kind": "action_end",
                             "token": int(target_next.item()),
                         }
-                    )
+                )
                 break
-            draft = drafter.draft(generated_tokens, lookahead=min(lookahead, remaining))
+            if block_tree_width > 1 and hasattr(drafter, "draft_many"):
+                target_token_value = int(target_next.item())
+                force_anchor = bool(
+                    tree_anchor_target_continuation and remaining > 1 and block_lookahead > 1
+                )
+                if force_anchor:
+                    raw_draft_rows = [[target_token_value + 1]]
+                    raw_draft_sources = [[]]
+                else:
+                    raw_draft_rows = drafter.draft_many(
+                        generated_tokens,
+                        lookahead=block_lookahead,
+                        max_candidates=block_tree_width,
+                        branch_width=max_tree_branch_width,
+                    )
+                    raw_draft_sources = last_many_sources()
+                if raw_draft_rows and not force_anchor:
+                    tree_first_token_checks += 1
+                draft_rows: list[list[int]] = []
+                draft_sources: list[list[str]] = []
+                for row_idx, row in enumerate(raw_draft_rows):
+                    if not row or int(row[0]) != target_token_value:
+                        continue
+                    draft_rows.append([int(token) for token in row[:remaining]])
+                    sources = raw_draft_sources[row_idx] if row_idx < len(raw_draft_sources) else []
+                    draft_sources.append(sources[: len(draft_rows[-1])])
+                if not draft_rows:
+                    if raw_draft_rows and not force_anchor:
+                        tree_first_token_misses += 1
+                    if (
+                        (tree_anchor_target_token or force_anchor)
+                        and raw_draft_rows
+                        and remaining > 1
+                        and block_lookahead > 1
+                    ):
+                        anchor_lookahead = max(1, min(block_lookahead - 1, remaining - 1))
+                        anchor_prefix = [*generated_tokens, target_token_value]
+                        raw_anchor_rows = drafter.draft_many(
+                            anchor_prefix,
+                            lookahead=anchor_lookahead,
+                            max_candidates=block_tree_width,
+                            branch_width=max_tree_branch_width,
+                        )
+                        raw_anchor_sources = last_many_sources()
+                        anchor_future_rows: list[list[int]] = []
+                        anchor_future_sources: list[list[str]] = []
+                        for row_idx, row in enumerate(raw_anchor_rows):
+                            future = [int(token) for token in row[: remaining - 1]]
+                            if not future:
+                                continue
+                            anchor_future_rows.append(future)
+                            sources = raw_anchor_sources[row_idx] if row_idx < len(raw_anchor_sources) else []
+                            anchor_future_sources.append(sources[: len(future)])
+                        if anchor_future_rows:
+                            if raw_draft_sources:
+                                record_source_feedback(raw_draft_sources[0], 0)
+                            drafted_tokens += sum(len(row) for row in anchor_future_rows)
+                            second_order_action_extrapolation_drafted_tokens += sum(
+                                source_count(sources, "second_order_action_extrapolation")
+                                for sources in anchor_future_sources
+                            )
+                            previous_chunk_position_drafted_tokens += sum(
+                                source_count(sources, "previous_chunk_position")
+                                for sources in anchor_future_sources
+                            )
+                            chunk_prefix_retrieval_drafted_tokens += sum(
+                                source_count(sources, "chunk_prefix_retrieval")
+                                for sources in anchor_future_sources
+                            )
+                            chunk_length_stop_drafted_tokens += sum(
+                                source_count(sources, "chunk_length_stop")
+                                for sources in anchor_future_sources
+                            )
+                            position_mode_histogram_drafted_tokens += sum(
+                                source_count(sources, "position_mode_histogram")
+                                for sources in anchor_future_sources
+                            )
+                            global_position_mode_drafted_tokens += sum(
+                                source_count(sources, "global_position_mode")
+                                for sources in anchor_future_sources
+                            )
+                            action_dimension_mode_drafted_tokens += sum(
+                                source_count(sources, "action_dimension_mode")
+                                for sources in anchor_future_sources
+                            )
+                            hold_action_token_drafted_tokens += sum(
+                                source_count(sources, "hold_action_token") for sources in anchor_future_sources
+                            )
+                            ngram_continuation_drafted_tokens += sum(
+                                source_count(sources, "ngram_continuation") for sources in anchor_future_sources
+                            )
+                            source_agreement_drafted_tokens += sum(
+                                source_count(sources, "source_agreement") for sources in anchor_future_sources
+                            )
+                            action_trend_regression_drafted_tokens += sum(
+                                source_count(sources, "action_trend_regression")
+                                for sources in anchor_future_sources
+                            )
+                            action_prefix_lookup_drafted_tokens += sum(
+                                source_count(sources, "action_prefix_lookup")
+                                for sources in anchor_future_sources
+                            )
+                            action_vector_transition_drafted_tokens += sum(
+                                source_count(sources, "action_vector_transition")
+                                for sources in anchor_future_sources
+                            )
+                            action_repeat_vector_drafted_tokens += sum(
+                                source_count(sources, "action_repeat_vector")
+                                for sources in anchor_future_sources
+                            )
+                            action_token_neighborhood_drafted_tokens += sum(
+                                source_count(sources, "action_token_neighborhood")
+                                for sources in anchor_future_sources
+                            )
+                            action_context_tree_drafted_tokens += sum(
+                                source_count(sources, "action_context_tree") for sources in anchor_future_sources
+                            )
+                            action_transition_histogram_drafted_tokens += sum(
+                                source_count(sources, "action_transition_histogram")
+                                for sources in anchor_future_sources
+                            )
+                            action_delta_histogram_drafted_tokens += sum(
+                                source_count(sources, "action_delta_histogram")
+                                for sources in anchor_future_sources
+                            )
+                            action_delta_ngram_drafted_tokens += sum(
+                                source_count(sources, "action_delta_ngram")
+                                for sources in anchor_future_sources
+                            )
+                            chunk_position_delta_drafted_tokens += sum(
+                                source_count(sources, "chunk_position_delta")
+                                for sources in anchor_future_sources
+                            )
+                            chunk_delta_template_drafted_tokens += sum(
+                                source_count(sources, "chunk_delta_template")
+                                for sources in anchor_future_sources
+                            )
+                            old_mask_len = current_pad_mask.shape[1]
+                            anchor_rows = [[target_token_value, *future] for future in anchor_future_rows]
+                            verify_logits_all, verify_kv, verify_pad_mask, _candidate_lengths = verify_candidate_batch(
+                                anchor_rows,
+                                prepend_prev_logits=True,
+                            )
+                            tree_anchor_verifies += 1
+                            tree_anchor_candidates += len(anchor_future_rows)
+                            best_idx = 0
+                            future_accepted = -1
+                            for row_idx, future in enumerate(anchor_future_rows):
+                                accepted_prefix = 0
+                                for idx, token in enumerate(future):
+                                    logits_for_candidate = verify_logits_all[
+                                        row_idx : row_idx + 1,
+                                        idx + 1 : idx + 2,
+                                        :,
+                                    ]
+                                    predicted_candidate = int(
+                                        torch.argmax(logits_for_candidate[:, -1], dim=-1).item()
+                                    )
+                                    if predicted_candidate != int(token):
+                                        break
+                                    accepted_prefix += 1
+                                if accepted_prefix > future_accepted:
+                                    best_idx = row_idx
+                                    future_accepted = accepted_prefix
+                                    if accepted_prefix == len(future):
+                                        break
+
+                            future = anchor_future_rows[best_idx]
+                            future_source_row = (
+                                anchor_future_sources[best_idx] if best_idx < len(anchor_future_sources) else []
+                            )
+                            verify_logits_all = verify_logits_all[best_idx : best_idx + 1]
+                            verify_kv = select_kv_batch(verify_kv, best_idx)
+                            verify_pad_mask = verify_pad_mask[best_idx : best_idx + 1]
+                            future_accepted = max(future_accepted, 0)
+                            if len(debug_events) < 64:
+                                debug_events.append(
+                                    {
+                                        "pos": len(generated_tokens),
+                                        "kind": "tree_anchor_verify",
+                                        "candidates": len(anchor_future_rows),
+                                        "future_len": len(future),
+                                        "accepted": future_accepted,
+                                    }
+                                )
+
+                            logits_by_step.append(verify_logits_all[:, 0:1, :])
+                            generated_tokens.append(target_token_value)
+                            accepted_emit = future_accepted
+                            if action_end_token_id is not None:
+                                for idx in range(future_accepted):
+                                    if int(future[idx]) == action_end_token_id:
+                                        accepted_emit = idx + 1
+                                        break
+                            for idx in range(accepted_emit):
+                                logits_for_token = verify_logits_all[:, idx + 1 : idx + 2, :]
+                                logits_by_step.append(logits_for_token)
+                                generated_tokens.append(int(future[idx]))
+
+                            keep_len = old_mask_len + 1 + accepted_emit
+                            past_key_values = trim_kv(verify_kv, keep_len)
+                            current_pad_mask = verify_pad_mask[:, :keep_len].contiguous()
+                            accepted_tokens += accepted_emit
+                            tree_accepted_tokens += accepted_emit
+                            tree_anchor_accepted_tokens += accepted_emit
+                            record_source_feedback(future_source_row, future_accepted)
+                            second_order_action_extrapolation_accepted_tokens += source_count(
+                                future_source_row,
+                                "second_order_action_extrapolation",
+                                accepted_emit,
+                            )
+                            previous_chunk_position_accepted_tokens += source_count(
+                                future_source_row,
+                                "previous_chunk_position",
+                                accepted_emit,
+                            )
+                            chunk_prefix_retrieval_accepted_tokens += source_count(
+                                future_source_row,
+                                "chunk_prefix_retrieval",
+                                accepted_emit,
+                            )
+                            chunk_length_stop_accepted_tokens += source_count(
+                                future_source_row,
+                                "chunk_length_stop",
+                                accepted_emit,
+                            )
+                            position_mode_histogram_accepted_tokens += source_count(
+                                future_source_row,
+                                "position_mode_histogram",
+                                accepted_emit,
+                            )
+                            global_position_mode_accepted_tokens += source_count(
+                                future_source_row,
+                                "global_position_mode",
+                                accepted_emit,
+                            )
+                            action_dimension_mode_accepted_tokens += source_count(
+                                future_source_row,
+                                "action_dimension_mode",
+                                accepted_emit,
+                            )
+                            hold_action_token_accepted_tokens += source_count(
+                                future_source_row,
+                                "hold_action_token",
+                                accepted_emit,
+                            )
+                            ngram_continuation_accepted_tokens += source_count(
+                                future_source_row,
+                                "ngram_continuation",
+                                accepted_emit,
+                            )
+                            source_agreement_accepted_tokens += source_count(
+                                future_source_row,
+                                "source_agreement",
+                                accepted_emit,
+                            )
+                            action_trend_regression_accepted_tokens += source_count(
+                                future_source_row,
+                                "action_trend_regression",
+                                accepted_emit,
+                            )
+                            action_prefix_lookup_accepted_tokens += source_count(
+                                future_source_row,
+                                "action_prefix_lookup",
+                                accepted_emit,
+                            )
+                            action_vector_transition_accepted_tokens += source_count(
+                                future_source_row,
+                                "action_vector_transition",
+                                accepted_emit,
+                            )
+                            action_repeat_vector_accepted_tokens += source_count(
+                                future_source_row,
+                                "action_repeat_vector",
+                                accepted_emit,
+                            )
+                            action_token_neighborhood_accepted_tokens += source_count(
+                                future_source_row,
+                                "action_token_neighborhood",
+                                accepted_emit,
+                            )
+                            action_context_tree_accepted_tokens += source_count(
+                                future_source_row,
+                                "action_context_tree",
+                                accepted_emit,
+                            )
+                            action_transition_histogram_accepted_tokens += source_count(
+                                future_source_row,
+                                "action_transition_histogram",
+                                accepted_emit,
+                            )
+                            action_delta_histogram_accepted_tokens += source_count(
+                                future_source_row,
+                                "action_delta_histogram",
+                                accepted_emit,
+                            )
+                            action_delta_ngram_accepted_tokens += source_count(
+                                future_source_row,
+                                "action_delta_ngram",
+                                accepted_emit,
+                            )
+                            chunk_position_delta_accepted_tokens += source_count(
+                                future_source_row,
+                                "chunk_position_delta",
+                                accepted_emit,
+                            )
+                            chunk_delta_template_accepted_tokens += source_count(
+                                future_source_row,
+                                "chunk_delta_template",
+                                accepted_emit,
+                            )
+                            update_dynamic_lookahead(accepted=future_accepted, drafted=len(future))
+                            if dynamic_tree_width:
+                                if future_accepted == len(future):
+                                    current_tree_width = min(
+                                        max_tree_width,
+                                        current_tree_width + max(int(tree_width_growth), 1),
+                                    )
+                                else:
+                                    current_tree_width = max(
+                                        1,
+                                        current_tree_width - max(int(tree_width_shrink), 1),
+                                    )
+                            pending_unprocessed_token = None
+                            if len(generated_tokens) >= max_decoding_steps:
+                                break
+                            if (
+                                action_end_token_id is not None
+                                and generated_tokens
+                                and generated_tokens[-1] == action_end_token_id
+                            ):
+                                break
+                            if future_accepted == len(future):
+                                full_block_reuses += 1
+                                bonus_logits = verify_logits_all[
+                                    :,
+                                    1 + future_accepted : 2 + future_accepted,
+                                    :,
+                                ]
+                                if (
+                                    emit_bonus_token
+                                    and bonus_logits.shape[1] == 1
+                                    and len(generated_tokens) < max_decoding_steps
+                                ):
+                                    bonus_token = torch.argmax(bonus_logits[:, -1], dim=-1, keepdim=True)
+                                    logits_by_step.append(bonus_logits)
+                                    generated_tokens.append(int(bonus_token.item()))
+                                    bonus_tokens += 1
+                                    pending_unprocessed_token = bonus_token
+                                    prev_logits = bonus_logits
+                                    if action_end_token_id is not None and int(bonus_token.item()) == action_end_token_id:
+                                        break
+                                else:
+                                    prev_logits = bonus_logits
+                            else:
+                                correction_logits = verify_logits_all[
+                                    :,
+                                    1 + future_accepted : 2 + future_accepted,
+                                    :,
+                                ]
+                                correction_token = torch.argmax(correction_logits[:, -1], dim=-1, keepdim=True)
+                                if (
+                                    future_accepted < len(future)
+                                    and int(correction_token.item()) == int(future[future_accepted])
+                                ):
+                                    raise RuntimeError(
+                                        "Internal SD invariant failed: anchored prefix stopped before matching token"
+                                    )
+                                logits_by_step.append(correction_logits)
+                                generated_tokens.append(int(correction_token.item()))
+                                pending_corrections += 1
+                                pending_unprocessed_token = correction_token
+                                prev_logits = correction_logits
+                                if action_end_token_id is not None and int(correction_token.item()) == action_end_token_id:
+                                    break
+                            continue
+                    if len(debug_events) < 64:
+                        debug_events.append(
+                            {
+                                "pos": len(generated_tokens),
+                                "kind": "tree_fallback",
+                                "token": target_token_value,
+                            }
+                    )
+                    update_dynamic_lookahead(accepted=0, drafted=0, miss=True)
+                    if dynamic_tree_width:
+                        current_tree_width = max(1, current_tree_width - max(int(tree_width_shrink), 1))
+                    if raw_draft_sources:
+                        record_source_feedback(raw_draft_sources[0], 0)
+                    else:
+                        record_source_miss()
+                    prev_logits = advance_one(target_next, prev_logits, fallback=True)
+                    continue
+
+                drafted_tokens += sum(len(row) for row in draft_rows)
+                second_order_action_extrapolation_drafted_tokens += sum(
+                    source_count(sources, "second_order_action_extrapolation") for sources in draft_sources
+                )
+                previous_chunk_position_drafted_tokens += sum(
+                    source_count(sources, "previous_chunk_position") for sources in draft_sources
+                )
+                chunk_prefix_retrieval_drafted_tokens += sum(
+                    source_count(sources, "chunk_prefix_retrieval") for sources in draft_sources
+                )
+                chunk_length_stop_drafted_tokens += sum(
+                    source_count(sources, "chunk_length_stop") for sources in draft_sources
+                )
+                position_mode_histogram_drafted_tokens += sum(
+                    source_count(sources, "position_mode_histogram") for sources in draft_sources
+                )
+                global_position_mode_drafted_tokens += sum(
+                    source_count(sources, "global_position_mode") for sources in draft_sources
+                )
+                action_dimension_mode_drafted_tokens += sum(
+                    source_count(sources, "action_dimension_mode") for sources in draft_sources
+                )
+                hold_action_token_drafted_tokens += sum(
+                    source_count(sources, "hold_action_token") for sources in draft_sources
+                )
+                ngram_continuation_drafted_tokens += sum(
+                    source_count(sources, "ngram_continuation") for sources in draft_sources
+                )
+                source_agreement_drafted_tokens += sum(
+                    source_count(sources, "source_agreement") for sources in draft_sources
+                )
+                action_trend_regression_drafted_tokens += sum(
+                    source_count(sources, "action_trend_regression") for sources in draft_sources
+                )
+                action_prefix_lookup_drafted_tokens += sum(
+                    source_count(sources, "action_prefix_lookup") for sources in draft_sources
+                )
+                action_vector_transition_drafted_tokens += sum(
+                    source_count(sources, "action_vector_transition") for sources in draft_sources
+                )
+                action_repeat_vector_drafted_tokens += sum(
+                    source_count(sources, "action_repeat_vector") for sources in draft_sources
+                )
+                action_token_neighborhood_drafted_tokens += sum(
+                    source_count(sources, "action_token_neighborhood") for sources in draft_sources
+                )
+                action_context_tree_drafted_tokens += sum(
+                    source_count(sources, "action_context_tree") for sources in draft_sources
+                )
+                action_transition_histogram_drafted_tokens += sum(
+                    source_count(sources, "action_transition_histogram") for sources in draft_sources
+                )
+                action_delta_histogram_drafted_tokens += sum(
+                    source_count(sources, "action_delta_histogram") for sources in draft_sources
+                )
+                action_delta_ngram_drafted_tokens += sum(
+                    source_count(sources, "action_delta_ngram") for sources in draft_sources
+                )
+                chunk_position_delta_drafted_tokens += sum(
+                    source_count(sources, "chunk_position_delta") for sources in draft_sources
+                )
+                chunk_delta_template_drafted_tokens += sum(
+                    source_count(sources, "chunk_delta_template") for sources in draft_sources
+                )
+                old_mask_len = current_pad_mask.shape[1]
+                verify_logits_all, verify_kv, verify_pad_mask, _candidate_lengths = verify_candidate_batch(
+                    draft_rows,
+                    prepend_prev_logits=True,
+                )
+                best_idx = 0
+                block_accepted = -1
+                for row_idx, candidate in enumerate(draft_rows):
+                    accepted_prefix = 0
+                    for idx, token in enumerate(candidate):
+                        logits_for_candidate = verify_logits_all[row_idx : row_idx + 1, idx : idx + 1, :]
+                        predicted_candidate = int(torch.argmax(logits_for_candidate[:, -1], dim=-1).item())
+                        if predicted_candidate != int(token):
+                            break
+                        accepted_prefix += 1
+                    if accepted_prefix > block_accepted:
+                        best_idx = row_idx
+                        block_accepted = accepted_prefix
+                        if accepted_prefix == len(candidate):
+                            break
+
+                draft = draft_rows[best_idx]
+                draft_source_row = draft_sources[best_idx] if best_idx < len(draft_sources) else []
+                verify_logits_all = verify_logits_all[best_idx : best_idx + 1]
+                verify_kv = select_kv_batch(verify_kv, best_idx)
+                verify_pad_mask = verify_pad_mask[best_idx : best_idx + 1]
+                block_accepted = min(max(block_accepted, 0), remaining)
+                if len(debug_events) < 64:
+                    debug_events.append(
+                        {
+                            "pos": len(generated_tokens),
+                            "kind": "tree_verify",
+                            "candidates": len(draft_rows),
+                            "draft_len": len(draft),
+                            "accepted": block_accepted,
+                            "draft": [int(token) for token in draft[: min(len(draft), 12)]],
+                        }
+                    )
+                accepted = 0
+                accepted_emit = block_accepted
+                if action_end_token_id is not None:
+                    for idx in range(block_accepted):
+                        if int(draft[idx]) == action_end_token_id:
+                            accepted_emit = idx + 1
+                            break
+                if reuse_full_blocks and block_accepted == len(draft):
+                    full_block_reuses += 1
+                    for idx in range(accepted_emit):
+                        logits_for_token = verify_logits_all[:, idx : idx + 1, :]
+                        logits_by_step.append(logits_for_token)
+                        generated_tokens.append(int(draft[idx]))
+                    accepted = accepted_emit
+                    keep_len = old_mask_len + accepted
+                    past_key_values = trim_kv(verify_kv, keep_len)
+                    current_pad_mask = verify_pad_mask[:, :keep_len].contiguous()
+                    if (
+                        emit_bonus_token
+                        and accepted == len(draft)
+                        and len(generated_tokens) < max_decoding_steps
+                        and (
+                            action_end_token_id is None
+                            or not generated_tokens
+                            or generated_tokens[-1] != action_end_token_id
+                        )
+                    ):
+                        bonus_logits = verify_logits_all[:, accepted : accepted + 1, :]
+                        bonus_token = torch.argmax(bonus_logits[:, -1], dim=-1, keepdim=True)
+                        logits_by_step.append(bonus_logits)
+                        generated_tokens.append(int(bonus_token.item()))
+                        bonus_tokens += 1
+                        pending_unprocessed_token = bonus_token
+                        prev_logits = bonus_logits
+                    else:
+                        prev_logits = verify_logits_all[:, accepted : accepted + 1, :]
+                else:
+                    accepted = accepted_emit
+                    for idx in range(accepted):
+                        logits_for_token = verify_logits_all[:, idx : idx + 1, :]
+                        logits_by_step.append(logits_for_token)
+                        generated_tokens.append(int(draft[idx]))
+
+                    keep_len = old_mask_len + accepted
+                    past_key_values = trim_kv(verify_kv, keep_len)
+                    current_pad_mask = verify_pad_mask[:, :keep_len].contiguous()
+
+                    if (
+                        len(generated_tokens) < max_decoding_steps
+                        and (
+                            action_end_token_id is None
+                            or not generated_tokens
+                            or generated_tokens[-1] != action_end_token_id
+                        )
+                    ):
+                        correction_logits = verify_logits_all[:, accepted : accepted + 1, :]
+                        correction_token = torch.argmax(correction_logits[:, -1], dim=-1, keepdim=True)
+                        if accepted < len(draft) and int(correction_token.item()) == int(draft[accepted]):
+                            raise RuntimeError("Internal SD invariant failed: tree prefix stopped before matching token")
+                        if len(debug_events) < 64:
+                            debug_events.append(
+                                {
+                                    "pos": len(generated_tokens),
+                                    "kind": "tree_correction",
+                                    "accepted": accepted,
+                                    "token": int(correction_token.item()),
+                                    "rejected_draft": int(draft[accepted]) if accepted < len(draft) else None,
+                                }
+                            )
+                        prev_logits = advance_one(correction_token, correction_logits, fallback=True)
+                accepted_tokens += accepted
+                tree_accepted_tokens += accepted
+                record_source_feedback(draft_source_row, block_accepted)
+                second_order_action_extrapolation_accepted_tokens += source_count(
+                    draft_source_row,
+                    "second_order_action_extrapolation",
+                    accepted,
+                )
+                previous_chunk_position_accepted_tokens += source_count(
+                    draft_source_row,
+                    "previous_chunk_position",
+                    accepted,
+                )
+                chunk_prefix_retrieval_accepted_tokens += source_count(
+                    draft_source_row,
+                    "chunk_prefix_retrieval",
+                    accepted,
+                )
+                chunk_length_stop_accepted_tokens += source_count(
+                    draft_source_row,
+                    "chunk_length_stop",
+                    accepted,
+                )
+                position_mode_histogram_accepted_tokens += source_count(
+                    draft_source_row,
+                    "position_mode_histogram",
+                    accepted,
+                )
+                global_position_mode_accepted_tokens += source_count(
+                    draft_source_row,
+                    "global_position_mode",
+                    accepted,
+                )
+                action_dimension_mode_accepted_tokens += source_count(
+                    draft_source_row,
+                    "action_dimension_mode",
+                    accepted,
+                )
+                hold_action_token_accepted_tokens += source_count(
+                    draft_source_row,
+                    "hold_action_token",
+                    accepted,
+                )
+                ngram_continuation_accepted_tokens += source_count(
+                    draft_source_row,
+                    "ngram_continuation",
+                    accepted,
+                )
+                source_agreement_accepted_tokens += source_count(
+                    draft_source_row,
+                    "source_agreement",
+                    accepted,
+                )
+                action_trend_regression_accepted_tokens += source_count(
+                    draft_source_row,
+                    "action_trend_regression",
+                    accepted,
+                )
+                action_prefix_lookup_accepted_tokens += source_count(
+                    draft_source_row,
+                    "action_prefix_lookup",
+                    accepted,
+                )
+                action_vector_transition_accepted_tokens += source_count(
+                    draft_source_row,
+                    "action_vector_transition",
+                    accepted,
+                )
+                action_repeat_vector_accepted_tokens += source_count(
+                    draft_source_row,
+                    "action_repeat_vector",
+                    accepted,
+                )
+                action_token_neighborhood_accepted_tokens += source_count(
+                    draft_source_row,
+                    "action_token_neighborhood",
+                    accepted,
+                )
+                action_context_tree_accepted_tokens += source_count(
+                    draft_source_row,
+                    "action_context_tree",
+                    accepted,
+                )
+                action_transition_histogram_accepted_tokens += source_count(
+                    draft_source_row,
+                    "action_transition_histogram",
+                    accepted,
+                )
+                action_delta_histogram_accepted_tokens += source_count(
+                    draft_source_row,
+                    "action_delta_histogram",
+                    accepted,
+                )
+                action_delta_ngram_accepted_tokens += source_count(
+                    draft_source_row,
+                    "action_delta_ngram",
+                    accepted,
+                )
+                chunk_position_delta_accepted_tokens += source_count(
+                    draft_source_row,
+                    "chunk_position_delta",
+                    accepted,
+                )
+                chunk_delta_template_accepted_tokens += source_count(
+                    draft_source_row,
+                    "chunk_delta_template",
+                    accepted,
+                )
+                update_dynamic_lookahead(accepted=block_accepted, drafted=len(draft))
+                if dynamic_tree_width:
+                    if block_accepted == len(draft):
+                        current_tree_width = min(
+                            max_tree_width,
+                            current_tree_width + max(int(tree_width_growth), 1),
+                        )
+                    else:
+                        current_tree_width = max(1, current_tree_width - max(int(tree_width_shrink), 1))
+                if len(generated_tokens) >= max_decoding_steps:
+                    break
+                if action_end_token_id is not None and generated_tokens and generated_tokens[-1] == action_end_token_id:
+                    break
+                continue
+            draft = drafter.draft(generated_tokens, lookahead=block_lookahead)
+            draft_sources = last_draft_sources()
             if not draft or int(draft[0]) != int(target_next.item()):
                 if len(debug_events) < 64:
                     debug_events.append(
@@ -1252,12 +3111,104 @@ class PI0FastTokenLogitAdapter:
                             "draft0": int(draft[0]) if draft else None,
                         }
                     )
+                update_dynamic_lookahead(accepted=0, drafted=len(draft), miss=True)
+                if dynamic_tree_width:
+                    current_tree_width = max(1, current_tree_width - max(int(tree_width_shrink), 1))
+                if draft_sources:
+                    record_source_feedback(draft_sources, 0)
+                else:
+                    record_source_miss()
                 prev_logits = advance_one(target_next, prev_logits, fallback=True)
                 continue
 
             draft = draft[:remaining]
+            draft_sources = draft_sources[: len(draft)]
             draft_tensor = torch.tensor([draft], dtype=torch.long, device=device)
             drafted_tokens += len(draft)
+            second_order_action_extrapolation_drafted_tokens += source_count(
+                draft_sources,
+                "second_order_action_extrapolation",
+            )
+            previous_chunk_position_drafted_tokens += source_count(
+                draft_sources,
+                "previous_chunk_position",
+            )
+            chunk_prefix_retrieval_drafted_tokens += source_count(
+                draft_sources,
+                "chunk_prefix_retrieval",
+            )
+            chunk_length_stop_drafted_tokens += source_count(
+                draft_sources,
+                "chunk_length_stop",
+            )
+            position_mode_histogram_drafted_tokens += source_count(
+                draft_sources,
+                "position_mode_histogram",
+            )
+            global_position_mode_drafted_tokens += source_count(
+                draft_sources,
+                "global_position_mode",
+            )
+            action_dimension_mode_drafted_tokens += source_count(
+                draft_sources,
+                "action_dimension_mode",
+            )
+            hold_action_token_drafted_tokens += source_count(
+                draft_sources,
+                "hold_action_token",
+            )
+            ngram_continuation_drafted_tokens += source_count(
+                draft_sources,
+                "ngram_continuation",
+            )
+            source_agreement_drafted_tokens += source_count(
+                draft_sources,
+                "source_agreement",
+            )
+            action_trend_regression_drafted_tokens += source_count(
+                draft_sources,
+                "action_trend_regression",
+            )
+            action_prefix_lookup_drafted_tokens += source_count(
+                draft_sources,
+                "action_prefix_lookup",
+            )
+            action_vector_transition_drafted_tokens += source_count(
+                draft_sources,
+                "action_vector_transition",
+            )
+            action_repeat_vector_drafted_tokens += source_count(
+                draft_sources,
+                "action_repeat_vector",
+            )
+            action_token_neighborhood_drafted_tokens += source_count(
+                draft_sources,
+                "action_token_neighborhood",
+            )
+            action_context_tree_drafted_tokens += source_count(
+                draft_sources,
+                "action_context_tree",
+            )
+            action_transition_histogram_drafted_tokens += source_count(
+                draft_sources,
+                "action_transition_histogram",
+            )
+            action_delta_histogram_drafted_tokens += source_count(
+                draft_sources,
+                "action_delta_histogram",
+            )
+            action_delta_ngram_drafted_tokens += source_count(
+                draft_sources,
+                "action_delta_ngram",
+            )
+            chunk_position_delta_drafted_tokens += source_count(
+                draft_sources,
+                "chunk_position_delta",
+            )
+            chunk_delta_template_drafted_tokens += source_count(
+                draft_sources,
+                "chunk_delta_template",
+            )
             old_mask_len = current_pad_mask.shape[1]
             generated_before_verify = list(generated_tokens)
             if verify_from_scratch:
@@ -1329,12 +3280,33 @@ class PI0FastTokenLogitAdapter:
             verify_forwards += 1
 
             block_accepted = 0
+            matched_prefix = 0
+            block_min_margin = float("inf")
+            block_margin_ok = True
+            margin_rejected_block = False
             for idx in range(len(draft)):
                 logits_for_candidate = verify_logits_all[:, idx : idx + 1, :]
-                predicted_candidate = int(torch.argmax(logits_for_candidate[:, -1], dim=-1).item())
+                candidate_logits = logits_for_candidate[:, -1, :].float()
+                top_values, top_indices = torch.topk(candidate_logits, k=2, dim=-1)
+                predicted_candidate = int(top_indices[:, 0].item())
+                margin = float((top_values[:, 0] - top_values[:, 1]).item())
+                block_min_margin = min(block_min_margin, margin)
+                verify_margin_checks += 1
+                verify_margin_min = min(verify_margin_min, margin)
+                verify_margin_sum += margin
                 if predicted_candidate != int(draft[idx]):
                     break
+                matched_prefix += 1
+                if float(min_verify_margin) > 0.0 and margin < float(min_verify_margin):
+                    block_margin_ok = False
+                    break
                 block_accepted += 1
+            if float(min_verify_margin) > 0.0 and (
+                block_accepted != len(draft) or matched_prefix != len(draft) or not block_margin_ok
+            ):
+                margin_block_rejects += 1
+                margin_rejected_block = True
+                block_accepted = 0
             block_accepted = min(block_accepted, remaining)
             if len(debug_events) < 64:
                 debug_events.append(
@@ -1343,6 +3315,8 @@ class PI0FastTokenLogitAdapter:
                         "kind": "verify",
                         "draft_len": len(draft),
                         "accepted": block_accepted,
+                        "matched_prefix": matched_prefix,
+                        "min_margin": block_min_margin if block_min_margin != float("inf") else None,
                         "draft": [int(token) for token in draft[: min(len(draft), 12)]],
                     }
                 )
@@ -1367,7 +3341,25 @@ class PI0FastTokenLogitAdapter:
                     keep_len = old_mask_len + accepted
                     past_key_values = trim_kv(verify_kv, keep_len)
                     current_pad_mask = verify_pad_mask[:, :keep_len].contiguous()
-                prev_logits = verify_logits_all[:, accepted : accepted + 1, :]
+                if (
+                    emit_bonus_token
+                    and accepted == len(draft)
+                    and len(generated_tokens) < max_decoding_steps
+                    and (
+                        action_end_token_id is None
+                        or not generated_tokens
+                        or generated_tokens[-1] != action_end_token_id
+                    )
+                ):
+                    bonus_logits = verify_logits_all[:, accepted : accepted + 1, :]
+                    bonus_token = torch.argmax(bonus_logits[:, -1], dim=-1, keepdim=True)
+                    logits_by_step.append(bonus_logits)
+                    generated_tokens.append(int(bonus_token.item()))
+                    bonus_tokens += 1
+                    pending_unprocessed_token = bonus_token
+                    prev_logits = bonus_logits
+                else:
+                    prev_logits = verify_logits_all[:, accepted : accepted + 1, :]
             else:
                 accepted = accepted_emit
                 for idx in range(accepted):
@@ -1389,7 +3381,11 @@ class PI0FastTokenLogitAdapter:
                 ):
                     correction_logits = verify_logits_all[:, accepted : accepted + 1, :]
                     correction_token = torch.argmax(correction_logits[:, -1], dim=-1, keepdim=True)
-                    if accepted < len(draft) and int(correction_token.item()) == int(draft[accepted]):
+                    if (
+                        not margin_rejected_block
+                        and accepted < len(draft)
+                        and int(correction_token.item()) == int(draft[accepted])
+                    ):
                         raise RuntimeError("Internal SD invariant failed: accepted prefix stopped before matching token")
                     if len(debug_events) < 64:
                         debug_events.append(
@@ -1403,12 +3399,143 @@ class PI0FastTokenLogitAdapter:
                         )
                     prev_logits = advance_one(correction_token, correction_logits, fallback=True)
             accepted_tokens += accepted
+            record_source_feedback(draft_sources, block_accepted)
+            second_order_action_extrapolation_accepted_tokens += source_count(
+                draft_sources,
+                "second_order_action_extrapolation",
+                accepted,
+            )
+            previous_chunk_position_accepted_tokens += source_count(
+                draft_sources,
+                "previous_chunk_position",
+                accepted,
+            )
+            chunk_prefix_retrieval_accepted_tokens += source_count(
+                draft_sources,
+                "chunk_prefix_retrieval",
+                accepted,
+            )
+            chunk_length_stop_accepted_tokens += source_count(
+                draft_sources,
+                "chunk_length_stop",
+                accepted,
+            )
+            position_mode_histogram_accepted_tokens += source_count(
+                draft_sources,
+                "position_mode_histogram",
+                accepted,
+            )
+            global_position_mode_accepted_tokens += source_count(
+                draft_sources,
+                "global_position_mode",
+                accepted,
+            )
+            action_dimension_mode_accepted_tokens += source_count(
+                draft_sources,
+                "action_dimension_mode",
+                accepted,
+            )
+            hold_action_token_accepted_tokens += source_count(
+                draft_sources,
+                "hold_action_token",
+                accepted,
+            )
+            ngram_continuation_accepted_tokens += source_count(
+                draft_sources,
+                "ngram_continuation",
+                accepted,
+            )
+            source_agreement_accepted_tokens += source_count(
+                draft_sources,
+                "source_agreement",
+                accepted,
+            )
+            action_trend_regression_accepted_tokens += source_count(
+                draft_sources,
+                "action_trend_regression",
+                accepted,
+            )
+            action_prefix_lookup_accepted_tokens += source_count(
+                draft_sources,
+                "action_prefix_lookup",
+                accepted,
+            )
+            action_vector_transition_accepted_tokens += source_count(
+                draft_sources,
+                "action_vector_transition",
+                accepted,
+            )
+            action_repeat_vector_accepted_tokens += source_count(
+                draft_sources,
+                "action_repeat_vector",
+                accepted,
+            )
+            action_token_neighborhood_accepted_tokens += source_count(
+                draft_sources,
+                "action_token_neighborhood",
+                accepted,
+            )
+            action_context_tree_accepted_tokens += source_count(
+                draft_sources,
+                "action_context_tree",
+                accepted,
+            )
+            action_transition_histogram_accepted_tokens += source_count(
+                draft_sources,
+                "action_transition_histogram",
+                accepted,
+            )
+            action_delta_histogram_accepted_tokens += source_count(
+                draft_sources,
+                "action_delta_histogram",
+                accepted,
+            )
+            action_delta_ngram_accepted_tokens += source_count(
+                draft_sources,
+                "action_delta_ngram",
+                accepted,
+            )
+            chunk_position_delta_accepted_tokens += source_count(
+                draft_sources,
+                "chunk_position_delta",
+                accepted,
+            )
+            chunk_delta_template_accepted_tokens += source_count(
+                draft_sources,
+                "chunk_delta_template",
+                accepted,
+            )
+            update_dynamic_lookahead(accepted=block_accepted, drafted=len(draft))
+            if dynamic_tree_width:
+                if block_accepted == len(draft):
+                    current_tree_width = min(max_tree_width, current_tree_width + max(int(tree_width_growth), 1))
+                else:
+                    current_tree_width = max(1, current_tree_width - max(int(tree_width_shrink), 1))
             if len(generated_tokens) >= max_decoding_steps:
                 break
             if action_end_token_id is not None and generated_tokens and generated_tokens[-1] == action_end_token_id:
                 break
 
+        if len(logits_by_step) != len(generated_tokens):
+            raise RuntimeError(
+                "Internal SD invariant failed: logits/token length mismatch "
+                f"({len(logits_by_step)} logits for {len(generated_tokens)} tokens)"
+            )
+        cached_generated_tokens = len(generated_tokens) - (1 if pending_unprocessed_token is not None else 0)
+        expected_mask_len = prefix_pad_masks.shape[1] + cached_generated_tokens
+        if current_pad_mask.shape[1] != expected_mask_len:
+            raise RuntimeError(
+                "Internal SD invariant failed: cache mask/token length mismatch "
+                f"({current_pad_mask.shape[1]} mask positions, expected {expected_mask_len})"
+            )
+
         generated = torch.tensor([generated_tokens[:max_decoding_steps]], dtype=torch.long, device=device)
+        logits = torch.cat(logits_by_step, dim=1)
+        if logits.shape[1] != generated.shape[1]:
+            raise RuntimeError(
+                "Internal SD invariant failed: returned logits/generated length mismatch "
+                f"({logits.shape[1]} logits for {generated.shape[1]} tokens)"
+            )
         stats = {
             "prefix_hidden": prefix_out[:, -1, :].detach().float(),
             "target_forwards": target_forwards,
@@ -1416,15 +3543,139 @@ class PI0FastTokenLogitAdapter:
             "fallback_forwards": fallback_forwards,
             "replay_forwards": replay_forwards,
             "full_block_reuses": full_block_reuses,
+            "bonus_tokens": bonus_tokens,
+            "pending_verifies": pending_verifies,
+            "pending_corrections": pending_corrections,
+            "pending_processes": pending_processes,
+            "pending_token_at_return": pending_unprocessed_token is not None,
             "reuse_full_blocks": reuse_full_blocks,
+            "min_verify_margin": float(min_verify_margin),
+            "margin_block_rejects": margin_block_rejects,
+            "verify_margin_checks": verify_margin_checks,
+            "verify_margin_min": 0.0 if verify_margin_min == float("inf") else verify_margin_min,
+            "verify_margin_mean": verify_margin_sum / max(verify_margin_checks, 1),
             "verify_from_scratch": verify_from_scratch,
+            "emit_bonus_token": emit_bonus_token,
+            "dynamic_lookahead": dynamic_lookahead,
+            "min_lookahead": min_dynamic_lookahead,
+            "max_lookahead": max_lookahead,
+            "final_lookahead": current_lookahead,
+            "mean_lookahead": sum(lookahead_values) / max(len(lookahead_values), 1),
+            "tree_width": max_tree_width,
+            "tree_branch_width": max_tree_branch_width,
+            "dynamic_tree_width": dynamic_tree_width,
+            "min_tree_width": max(1, min(max_tree_width, int(min_tree_width))),
+            "final_tree_width": current_tree_width,
+            "tree_width_growth": max(int(tree_width_growth), 1),
+            "tree_width_shrink": max(int(tree_width_shrink), 1),
+            "tree_anchor_target_token": tree_anchor_target_token,
+            "tree_anchor_target_continuation": tree_anchor_target_continuation,
+            "mean_tree_width": sum(tree_width_values) / max(len(tree_width_values), 1),
+            "tree_verifies": tree_verifies,
+            "tree_candidates": tree_candidates,
+            "tree_accepted_tokens": tree_accepted_tokens,
+            "tree_anchor_verifies": tree_anchor_verifies,
+            "tree_anchor_candidates": tree_anchor_candidates,
+            "tree_anchor_accepted_tokens": tree_anchor_accepted_tokens,
+            "tree_anchor_acceptance_rate": tree_anchor_accepted_tokens / max(tree_anchor_candidates, 1),
+            "tree_first_token_checks": tree_first_token_checks,
+            "tree_first_token_misses": tree_first_token_misses,
+            "tree_first_token_miss_rate": tree_first_token_misses / max(tree_first_token_checks, 1),
+            "mean_tree_candidates": tree_candidates / max(tree_verifies, 1),
+            "second_order_action_extrapolation_drafted_tokens": second_order_action_extrapolation_drafted_tokens,
+            "second_order_action_extrapolation_accepted_tokens": second_order_action_extrapolation_accepted_tokens,
+            "second_order_action_extrapolation_acceptance_rate": (
+                second_order_action_extrapolation_accepted_tokens
+                / max(second_order_action_extrapolation_drafted_tokens, 1)
+            ),
+            "previous_chunk_position_drafted_tokens": previous_chunk_position_drafted_tokens,
+            "previous_chunk_position_accepted_tokens": previous_chunk_position_accepted_tokens,
+            "previous_chunk_position_acceptance_rate": previous_chunk_position_accepted_tokens
+            / max(previous_chunk_position_drafted_tokens, 1),
+            "chunk_prefix_retrieval_drafted_tokens": chunk_prefix_retrieval_drafted_tokens,
+            "chunk_prefix_retrieval_accepted_tokens": chunk_prefix_retrieval_accepted_tokens,
+            "chunk_prefix_retrieval_acceptance_rate": chunk_prefix_retrieval_accepted_tokens
+            / max(chunk_prefix_retrieval_drafted_tokens, 1),
+            "chunk_length_stop_drafted_tokens": chunk_length_stop_drafted_tokens,
+            "chunk_length_stop_accepted_tokens": chunk_length_stop_accepted_tokens,
+            "chunk_length_stop_acceptance_rate": chunk_length_stop_accepted_tokens
+            / max(chunk_length_stop_drafted_tokens, 1),
+            "action_token_neighborhood_drafted_tokens": action_token_neighborhood_drafted_tokens,
+            "action_token_neighborhood_accepted_tokens": action_token_neighborhood_accepted_tokens,
+            "action_token_neighborhood_acceptance_rate": action_token_neighborhood_accepted_tokens
+            / max(action_token_neighborhood_drafted_tokens, 1),
+            "position_mode_histogram_drafted_tokens": position_mode_histogram_drafted_tokens,
+            "position_mode_histogram_accepted_tokens": position_mode_histogram_accepted_tokens,
+            "position_mode_histogram_acceptance_rate": position_mode_histogram_accepted_tokens
+            / max(position_mode_histogram_drafted_tokens, 1),
+            "global_position_mode_drafted_tokens": global_position_mode_drafted_tokens,
+            "global_position_mode_accepted_tokens": global_position_mode_accepted_tokens,
+            "global_position_mode_acceptance_rate": global_position_mode_accepted_tokens
+            / max(global_position_mode_drafted_tokens, 1),
+            "action_dimension_mode_drafted_tokens": action_dimension_mode_drafted_tokens,
+            "action_dimension_mode_accepted_tokens": action_dimension_mode_accepted_tokens,
+            "action_dimension_mode_acceptance_rate": action_dimension_mode_accepted_tokens
+            / max(action_dimension_mode_drafted_tokens, 1),
+            "hold_action_token_drafted_tokens": hold_action_token_drafted_tokens,
+            "hold_action_token_accepted_tokens": hold_action_token_accepted_tokens,
+            "hold_action_token_acceptance_rate": hold_action_token_accepted_tokens
+            / max(hold_action_token_drafted_tokens, 1),
+            "ngram_continuation_drafted_tokens": ngram_continuation_drafted_tokens,
+            "ngram_continuation_accepted_tokens": ngram_continuation_accepted_tokens,
+            "ngram_continuation_acceptance_rate": ngram_continuation_accepted_tokens
+            / max(ngram_continuation_drafted_tokens, 1),
+            "source_agreement_drafted_tokens": source_agreement_drafted_tokens,
+            "source_agreement_accepted_tokens": source_agreement_accepted_tokens,
+            "source_agreement_acceptance_rate": source_agreement_accepted_tokens
+            / max(source_agreement_drafted_tokens, 1),
+            "action_trend_regression_drafted_tokens": action_trend_regression_drafted_tokens,
+            "action_trend_regression_accepted_tokens": action_trend_regression_accepted_tokens,
+            "action_trend_regression_acceptance_rate": action_trend_regression_accepted_tokens
+            / max(action_trend_regression_drafted_tokens, 1),
+            "action_prefix_lookup_drafted_tokens": action_prefix_lookup_drafted_tokens,
+            "action_prefix_lookup_accepted_tokens": action_prefix_lookup_accepted_tokens,
+            "action_prefix_lookup_acceptance_rate": action_prefix_lookup_accepted_tokens
+            / max(action_prefix_lookup_drafted_tokens, 1),
+            "action_vector_transition_drafted_tokens": action_vector_transition_drafted_tokens,
+            "action_vector_transition_accepted_tokens": action_vector_transition_accepted_tokens,
+            "action_vector_transition_acceptance_rate": action_vector_transition_accepted_tokens
+            / max(action_vector_transition_drafted_tokens, 1),
+            "action_repeat_vector_drafted_tokens": action_repeat_vector_drafted_tokens,
+            "action_repeat_vector_accepted_tokens": action_repeat_vector_accepted_tokens,
+            "action_repeat_vector_acceptance_rate": action_repeat_vector_accepted_tokens
+            / max(action_repeat_vector_drafted_tokens, 1),
+            "action_context_tree_drafted_tokens": action_context_tree_drafted_tokens,
+            "action_context_tree_accepted_tokens": action_context_tree_accepted_tokens,
+            "action_context_tree_acceptance_rate": action_context_tree_accepted_tokens
+            / max(action_context_tree_drafted_tokens, 1),
+            "action_transition_histogram_drafted_tokens": action_transition_histogram_drafted_tokens,
+            "action_transition_histogram_accepted_tokens": action_transition_histogram_accepted_tokens,
+            "action_transition_histogram_acceptance_rate": action_transition_histogram_accepted_tokens
+            / max(action_transition_histogram_drafted_tokens, 1),
+            "action_delta_histogram_drafted_tokens": action_delta_histogram_drafted_tokens,
+            "action_delta_histogram_accepted_tokens": action_delta_histogram_accepted_tokens,
+            "action_delta_histogram_acceptance_rate": action_delta_histogram_accepted_tokens
+            / max(action_delta_histogram_drafted_tokens, 1),
+            "action_delta_ngram_drafted_tokens": action_delta_ngram_drafted_tokens,
+            "action_delta_ngram_accepted_tokens": action_delta_ngram_accepted_tokens,
+            "action_delta_ngram_acceptance_rate": action_delta_ngram_accepted_tokens
+            / max(action_delta_ngram_drafted_tokens, 1),
+            "chunk_position_delta_drafted_tokens": chunk_position_delta_drafted_tokens,
+            "chunk_position_delta_accepted_tokens": chunk_position_delta_accepted_tokens,
+            "chunk_position_delta_acceptance_rate": chunk_position_delta_accepted_tokens
+            / max(chunk_position_delta_drafted_tokens, 1),
+            "chunk_delta_template_drafted_tokens": chunk_delta_template_drafted_tokens,
+            "chunk_delta_template_accepted_tokens": chunk_delta_template_accepted_tokens,
+            "chunk_delta_template_acceptance_rate": chunk_delta_template_accepted_tokens
+            / max(chunk_delta_template_drafted_tokens, 1),
             "drafted_tokens": drafted_tokens,
             "accepted_tokens": accepted_tokens,
             "acceptance_rate": accepted_tokens / max(drafted_tokens, 1),
             "tokens_per_target_forward": len(generated_tokens) / max(target_forwards, 1),
+            **source_cooldown_stats(),
             "debug_events": debug_events,
         }
-        return generated, torch.cat(logits_by_step, dim=1), stats
+        return generated, logits, stats
 
     @torch.no_grad()
     def sample_actions_fast_medusa_speculative(
@@ -3046,25 +5297,16 @@ class PI0FastTokenLogitAdapter:
         use_cache: bool,
         cache_position: torch.Tensor | None = None,
     ) -> tuple[list[torch.Tensor | None], Any]:
-        """Run the prefix-only PaliGemma language model with explicit cache positions.
+        """Run the prefix-only PaliGemma path used by LeRobot's target decoder."""
 
-        LeRobot's ``PI0FastPaliGemma.forward`` does not expose ``cache_position``.
-        Speculative verification depends on batched cache updates after partial
-        acceptance, so we bypass the thin wrapper here and call the underlying
-        PiGemma/Gemma model directly.
-        """
-
-        language_model = self.model.paligemma_with_expert.paligemma.model.language_model
-        output = language_model.forward(
-            inputs_embeds=inputs_embeds,
+        return self.model.paligemma_with_expert.forward(
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
+            inputs_embeds=[inputs_embeds, None],
             use_cache=use_cache,
-            cache_position=cache_position,
-            adarms_cond=None,
+            adarms_cond=[None, None],
         )
-        return [output.last_hidden_state, None], output.past_key_values
 
     @staticmethod
     def _select_next_token(logits: torch.Tensor, temperature: float) -> torch.Tensor:

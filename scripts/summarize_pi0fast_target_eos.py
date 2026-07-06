@@ -7,7 +7,7 @@ from pathlib import Path
 
 def _load_rows(root: Path) -> list[dict]:
     rows: list[dict] = []
-    for path in sorted(root.glob("*/*/metrics.jsonl")):
+    for path in sorted(root.rglob("metrics.jsonl")):
         rows.extend(json.loads(line) for line in path.read_text().splitlines() if line.strip())
     return rows
 
