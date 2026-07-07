@@ -361,6 +361,8 @@ def _predict_target_eos_chunk(
     stop_on_action_chars: bool = False,
     action_char_min_chars: int | None = None,
     action_char_plateau_tokens: int = 0,
+    action_char_stable_checks: int = 0,
+    action_char_stable_tolerance: float = 0.0,
 ) -> PredictionTrace:
     if stop_on_action_chars and hasattr(token_adapter, "prepare_action_char_length_lookup"):
         token_adapter.prepare_action_char_length_lookup(device=device)
@@ -381,6 +383,8 @@ def _predict_target_eos_chunk(
             stop_on_action_chars=stop_on_action_chars,
             action_char_min_chars=action_char_min_chars,
             action_char_plateau_tokens=action_char_plateau_tokens,
+            action_char_stable_checks=action_char_stable_checks,
+            action_char_stable_tolerance=action_char_stable_tolerance,
         )
     else:
         trace = token_adapter.predict_action_chunk_action_end(
@@ -389,6 +393,8 @@ def _predict_target_eos_chunk(
             stop_on_action_chars=stop_on_action_chars,
             action_char_min_chars=action_char_min_chars,
             action_char_plateau_tokens=action_char_plateau_tokens,
+            action_char_stable_checks=action_char_stable_checks,
+            action_char_stable_tolerance=action_char_stable_tolerance,
         )
     if device.startswith("cuda") and torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -1101,6 +1107,8 @@ def run_episode(
     target_eos_constrained_full_head_prefix_tokens: int,
     target_eos_action_char_min_chars: int | None,
     target_eos_action_char_plateau_tokens: int,
+    target_eos_action_char_stable_checks: int,
+    target_eos_action_char_stable_tolerance: float,
     token_trace_sink: TokenTraceSink | None,
     device: str,
     use_amp: bool,
@@ -2119,6 +2127,8 @@ def run_episode(
                                 stop_on_action_chars="_charstop" in mode,
                                 action_char_min_chars=target_eos_action_char_min_chars,
                                 action_char_plateau_tokens=target_eos_action_char_plateau_tokens,
+                                action_char_stable_checks=target_eos_action_char_stable_checks,
+                                action_char_stable_tolerance=target_eos_action_char_stable_tolerance,
                             )
                         controller.stats.record_trace_stats(prediction.stats)
                     else:
@@ -2498,6 +2508,21 @@ def parse_args() -> argparse.Namespace:
             "If positive, target_eos_charstop may stop once decoded FAST-character count has not increased "
             "for this many generated tokens after the minimum character count."
         ),
+    )
+    parser.add_argument(
+        "--target-eos-action-char-stable-checks",
+        type=int,
+        default=0,
+        help=(
+            "If positive, target_eos_charstop plateau stops require this many consecutive equal "
+            "detokenized-action snapshots at decoded FAST-character increments."
+        ),
+    )
+    parser.add_argument(
+        "--target-eos-action-char-stable-tolerance",
+        type=float,
+        default=0.0,
+        help="Maximum action delta considered stable for --target-eos-action-char-stable-checks.",
     )
     parser.add_argument(
         "--num-inference-steps",
@@ -3544,6 +3569,8 @@ def main() -> None:
                         None if args.target_eos_action_char_min_chars < 0 else args.target_eos_action_char_min_chars
                     ),
                     target_eos_action_char_plateau_tokens=args.target_eos_action_char_plateau_tokens,
+                    target_eos_action_char_stable_checks=args.target_eos_action_char_stable_checks,
+                    target_eos_action_char_stable_tolerance=args.target_eos_action_char_stable_tolerance,
                     token_trace_sink=token_trace_sink,
                     device=str(device),
                     use_amp=args.use_amp,
@@ -3580,6 +3607,8 @@ def main() -> None:
         "target_eos_constrained_full_head_prefix_tokens": args.target_eos_constrained_full_head_prefix_tokens,
         "target_eos_action_char_min_chars": args.target_eos_action_char_min_chars,
         "target_eos_action_char_plateau_tokens": args.target_eos_action_char_plateau_tokens,
+        "target_eos_action_char_stable_checks": args.target_eos_action_char_stable_checks,
+        "target_eos_action_char_stable_tolerance": args.target_eos_action_char_stable_tolerance,
         "num_inference_steps": args.num_inference_steps,
         "task": args.task,
         "task_id": args.task_id,

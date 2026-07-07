@@ -135,6 +135,10 @@ class _CharStopPolicy:
         mapping = {90: 0, 91: 1, 92: 2}
         return tokens.new_tensor([mapping.get(int(token.item()), 10_000) for token in tokens])
 
+    def detokenize_actions(self, token_ids: torch.Tensor, *, action_horizon: int, action_dim: int) -> torch.Tensor:
+        action_token_count = torch.isin(token_ids.cpu(), torch.tensor([90, 91, 92])).sum(dim=1).float()
+        return action_token_count.view(-1, 1, 1).expand(-1, action_horizon, action_dim).clone()
+
 
 def test_pi0fast_action_end_decode_can_stop_after_action_chars() -> None:
     adapter = PI0FastTokenLogitAdapter(_CharStopPolicy())
@@ -202,6 +206,65 @@ def test_pi0fast_action_char_plateau_can_stop_after_decoded_chars_stabilize() ->
     assert adapter._last_action_char_stop_count == 1
     assert adapter._last_action_char_plateau_stop_count == 1
     assert adapter._last_action_char_count_mean == 4.0
+
+
+def test_pi0fast_action_char_stability_guard_blocks_unstable_plateau() -> None:
+    policy = _CharStopPolicy()
+    policy.config.n_action_steps = 3
+    policy.model._targets = [90, 80, 80, 91, 80, 80, 92]
+    adapter = PI0FastTokenLogitAdapter(policy)
+    adapter._match_model_precision = lambda tensor: tensor
+    adapter._action_key = lambda: "action"
+
+    token_ids = adapter.sample_actions_fast_kv_cache_action_end(
+        images=torch.empty(1),
+        img_masks=torch.empty(1),
+        tokens=torch.zeros((1, 2), dtype=torch.long),
+        masks=torch.ones((1, 2), dtype=torch.bool),
+        max_decoding_steps=8,
+        stop_on_action_chars=True,
+        action_char_min_chars=4,
+        action_char_plateau_tokens=2,
+        action_char_stable_checks=1,
+    )
+
+    assert token_ids.tolist() == [[90, 80, 80, 91, 80, 80, 92, 99]]
+    assert adapter._last_action_char_target == 12
+    assert adapter._last_action_char_plateau_stop_count == 0
+    assert adapter._last_action_char_plateau_stability_block_count == 1
+    assert adapter._last_action_char_stable_snapshot_count_mean == 3.0
+    assert adapter._last_action_char_stable_count_mean == 0.0
+    assert adapter._last_action_char_count_mean == 12.0
+
+
+def test_pi0fast_action_char_stability_guard_allows_stable_plateau() -> None:
+    policy = _CharStopPolicy()
+    policy.config.n_action_steps = 3
+    policy.model._targets = [90, 91, 80, 80, 92]
+    adapter = PI0FastTokenLogitAdapter(policy)
+    adapter._match_model_precision = lambda tensor: tensor
+    adapter._action_key = lambda: "action"
+    adapter._detokenize_generated_actions = lambda token_ids: torch.zeros((1, 3, 4), dtype=torch.float32)
+
+    token_ids = adapter.sample_actions_fast_kv_cache_action_end(
+        images=torch.empty(1),
+        img_masks=torch.empty(1),
+        tokens=torch.zeros((1, 2), dtype=torch.long),
+        masks=torch.ones((1, 2), dtype=torch.bool),
+        max_decoding_steps=8,
+        stop_on_action_chars=True,
+        action_char_min_chars=4,
+        action_char_plateau_tokens=2,
+        action_char_stable_checks=1,
+    )
+
+    assert token_ids.tolist() == [[90, 91, 80, 80, 99]]
+    assert adapter._last_action_char_target == 12
+    assert adapter._last_action_char_plateau_stop_count == 1
+    assert adapter._last_action_char_plateau_stability_block_count == 0
+    assert adapter._last_action_char_stable_snapshot_count_mean == 2.0
+    assert adapter._last_action_char_stable_count_mean == 1.0
+    assert adapter._last_action_char_count_mean == 8.0
 
 
 class _BranchingDrafter:

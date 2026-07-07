@@ -190,6 +190,8 @@ class PI0FastTokenLogitAdapter:
         stop_on_action_chars: bool = False,
         action_char_min_chars: int | None = None,
         action_char_plateau_tokens: int = 0,
+        action_char_stable_checks: int = 0,
+        action_char_stable_tolerance: float = 0.0,
     ) -> PI0FastGenerationTrace:
         """Serving-oriented greedy decode that stops on the FAST action-end token.
 
@@ -235,6 +237,8 @@ class PI0FastTokenLogitAdapter:
                 stop_on_action_chars=stop_on_action_chars,
                 action_char_min_chars=action_char_min_chars,
                 action_char_plateau_tokens=action_char_plateau_tokens,
+                action_char_stable_checks=action_char_stable_checks,
+                action_char_stable_tolerance=action_char_stable_tolerance,
             )
             mode = "action_end_prefix_no_logits" if force_action_prefix else "action_end_no_logits"
         else:
@@ -289,9 +293,18 @@ class PI0FastTokenLogitAdapter:
                 "action_char_target": int(getattr(self, "_last_action_char_target", 0)),
                 "action_char_min_chars": int(getattr(self, "_last_action_char_min_chars", 0)),
                 "action_char_plateau_tokens": int(getattr(self, "_last_action_char_plateau_tokens", 0)),
+                "action_char_stable_checks": int(getattr(self, "_last_action_char_stable_checks", 0)),
+                "action_char_stable_tolerance": float(getattr(self, "_last_action_char_stable_tolerance", 0.0)),
                 "action_char_stop_count": int(getattr(self, "_last_action_char_stop_count", 0)),
                 "action_char_plateau_stop_count": int(getattr(self, "_last_action_char_plateau_stop_count", 0)),
+                "action_char_plateau_stability_block_count": int(
+                    getattr(self, "_last_action_char_plateau_stability_block_count", 0)
+                ),
                 "action_char_count_mean": float(getattr(self, "_last_action_char_count_mean", 0.0)),
+                "action_char_stable_snapshot_count_mean": float(
+                    getattr(self, "_last_action_char_stable_snapshot_count_mean", 0.0)
+                ),
+                "action_char_stable_count_mean": float(getattr(self, "_last_action_char_stable_count_mean", 0.0)),
                 "action_char_lookup_raw_limit": int(getattr(self, "_action_char_length_raw_limit", 0)),
             },
         )
@@ -1234,6 +1247,8 @@ class PI0FastTokenLogitAdapter:
         stop_on_action_chars: bool = False,
         action_char_min_chars: int | None = None,
         action_char_plateau_tokens: int = 0,
+        action_char_stable_checks: int = 0,
+        action_char_stable_tolerance: float = 0.0,
     ) -> torch.Tensor:
         """KV-cache FAST decode with per-row action-end compaction.
 
@@ -1257,12 +1272,19 @@ class PI0FastTokenLogitAdapter:
         action_char_min_chars = int(action_char_target if action_char_min_chars is None else action_char_min_chars)
         action_char_min_chars = max(0, int(action_char_min_chars))
         action_char_plateau_tokens = max(0, int(action_char_plateau_tokens))
+        action_char_stable_checks = max(0, int(action_char_stable_checks))
+        action_char_stable_tolerance = max(0.0, float(action_char_stable_tolerance))
         self._last_action_char_target = int(action_char_target)
         self._last_action_char_min_chars = int(action_char_min_chars if stop_on_action_chars else 0)
         self._last_action_char_plateau_tokens = int(action_char_plateau_tokens if stop_on_action_chars else 0)
+        self._last_action_char_stable_checks = int(action_char_stable_checks if stop_on_action_chars else 0)
+        self._last_action_char_stable_tolerance = float(action_char_stable_tolerance if stop_on_action_chars else 0.0)
         self._last_action_char_stop_count = 0
         self._last_action_char_plateau_stop_count = 0
+        self._last_action_char_plateau_stability_block_count = 0
         self._last_action_char_count_mean = 0.0
+        self._last_action_char_stable_snapshot_count_mean = 0.0
+        self._last_action_char_stable_count_mean = 0.0
         action_char_lookup = self.prepare_action_char_length_lookup(device) if stop_on_action_chars else None
         prefix_tokens = None
         if force_action_prefix:
@@ -1311,8 +1333,38 @@ class PI0FastTokenLogitAdapter:
         emitted_lengths = torch.zeros((bsize,), dtype=torch.long, device=device)
         action_char_counts = torch.zeros((bsize,), dtype=torch.long, device=device)
         last_action_char_increment_lengths = torch.zeros((bsize,), dtype=torch.long, device=device)
+        action_stable_counts = torch.zeros((bsize,), dtype=torch.long, device=device)
+        action_stable_snapshot_counts = torch.zeros((bsize,), dtype=torch.long, device=device)
+        previous_action_snapshots: list[torch.Tensor | None] = [None] * bsize
         stopped_by_chars = torch.zeros((bsize,), dtype=torch.bool, device=device)
         stopped_by_char_plateau = torch.zeros((bsize,), dtype=torch.bool, device=device)
+        blocked_by_char_plateau_stability = torch.zeros((bsize,), dtype=torch.bool, device=device)
+
+        def token_ids_with_action_end(row_idx: int) -> torch.Tensor:
+            length = max(int(emitted_lengths[row_idx].item()), 1)
+            token_ids = generated[row_idx : row_idx + 1, :length]
+            if int(token_ids[0, -1].item()) != action_end_token_id:
+                eos = torch.full((1, 1), action_end_token_id, dtype=token_ids.dtype, device=token_ids.device)
+                token_ids = torch.cat([token_ids, eos], dim=1)
+            return token_ids
+
+        def record_action_stability(row_indices: torch.Tensor) -> None:
+            if action_char_stable_checks <= 0:
+                return
+            for row_idx in row_indices.detach().cpu().tolist():
+                token_ids = token_ids_with_action_end(int(row_idx))
+                actions = self._detokenize_generated_actions(token_ids).detach().float().cpu()
+                previous = previous_action_snapshots[int(row_idx)]
+                if previous is None:
+                    action_stable_counts[int(row_idx)] = 0
+                else:
+                    max_delta = float(torch.max(torch.abs(actions - previous)).item())
+                    if max_delta <= action_char_stable_tolerance:
+                        action_stable_counts[int(row_idx)] += 1
+                    else:
+                        action_stable_counts[int(row_idx)] = 0
+                previous_action_snapshots[int(row_idx)] = actions
+                action_stable_snapshot_counts[int(row_idx)] += 1
 
         def record_action_chars(selected: torch.Tensor) -> torch.Tensor:
             if action_char_lookup is None:
@@ -1323,12 +1375,13 @@ class PI0FastTokenLogitAdapter:
             if bool(torch.any(incremented)):
                 incremented_rows = active_indices[incremented]
                 last_action_char_increment_lengths[incremented_rows] = emitted_lengths[incremented_rows]
+                record_action_stability(incremented_rows)
             reached_target = action_char_counts[active_indices] >= int(action_char_target)
             if action_char_target <= 0:
                 reached_target = torch.zeros_like(reached_target, dtype=torch.bool)
-            plateau = torch.zeros_like(reached_target, dtype=torch.bool)
+            plateau_candidate = torch.zeros_like(reached_target, dtype=torch.bool)
             if action_char_plateau_tokens > 0:
-                plateau = (
+                plateau_candidate = (
                     (action_char_counts[active_indices] >= int(action_char_min_chars))
                     & (last_action_char_increment_lengths[active_indices] > 0)
                     & (
@@ -1336,6 +1389,12 @@ class PI0FastTokenLogitAdapter:
                         >= int(action_char_plateau_tokens)
                     )
                 )
+            plateau = plateau_candidate
+            if action_char_stable_checks > 0:
+                stable_enough = action_stable_counts[active_indices] >= int(action_char_stable_checks)
+                blocked = plateau_candidate & ~stable_enough
+                blocked_by_char_plateau_stability[active_indices] |= blocked
+                plateau = plateau_candidate & stable_enough
             reached = reached_target | plateau
             stopped_by_chars[active_indices] |= reached
             stopped_by_char_plateau[active_indices] |= plateau
@@ -1346,7 +1405,14 @@ class PI0FastTokenLogitAdapter:
             if stop_on_action_chars:
                 self._last_action_char_stop_count = int(stopped_by_chars.sum().item())
                 self._last_action_char_plateau_stop_count = int(stopped_by_char_plateau.sum().item())
+                self._last_action_char_plateau_stability_block_count = int(
+                    blocked_by_char_plateau_stability.sum().item()
+                )
                 self._last_action_char_count_mean = float(action_char_counts.float().mean().item())
+                self._last_action_char_stable_snapshot_count_mean = float(
+                    action_stable_snapshot_counts.float().mean().item()
+                )
+                self._last_action_char_stable_count_mean = float(action_stable_counts.float().mean().item())
                 return generated[:, : min(int(max_len) + 1, generated_width)]
             return generated[:, : int(max_len)]
 
@@ -1418,7 +1484,14 @@ class PI0FastTokenLogitAdapter:
         if stop_on_action_chars:
             self._last_action_char_stop_count = int(stopped_by_chars.sum().item())
             self._last_action_char_plateau_stop_count = int(stopped_by_char_plateau.sum().item())
+            self._last_action_char_plateau_stability_block_count = int(
+                blocked_by_char_plateau_stability.sum().item()
+            )
             self._last_action_char_count_mean = float(action_char_counts.float().mean().item())
+            self._last_action_char_stable_snapshot_count_mean = float(
+                action_stable_snapshot_counts.float().mean().item()
+            )
+            self._last_action_char_stable_count_mean = float(action_stable_counts.float().mean().item())
         return generated
 
     @torch.no_grad()
