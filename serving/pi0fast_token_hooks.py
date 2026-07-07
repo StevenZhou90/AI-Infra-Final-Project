@@ -355,6 +355,9 @@ class PI0FastTokenLogitAdapter:
         tree_anchor_target_token: bool = False,
         tree_anchor_target_continuation: bool = False,
         early_stop_action_end: bool = False,
+        replay_accepted_cache: bool = False,
+        resync_accepted_cache: bool = False,
+        diagnose_verify_alignment: bool = False,
     ) -> PI0FastGenerationTrace:
         """Return a PI0-FAST action chunk decoded with exact n-gram speculation."""
 
@@ -387,6 +390,9 @@ class PI0FastTokenLogitAdapter:
             tree_anchor_target_token=tree_anchor_target_token,
             tree_anchor_target_continuation=tree_anchor_target_continuation,
             early_stop_action_end=early_stop_action_end,
+            replay_accepted_cache=replay_accepted_cache,
+            resync_accepted_cache=resync_accepted_cache,
+            diagnose_verify_alignment=diagnose_verify_alignment,
         )
         actions = self._detokenize_generated_actions(token_ids)
         return PI0FastGenerationTrace(actions=actions, token_ids=token_ids, logits=logits, stats=stats)
@@ -1451,6 +1457,9 @@ class PI0FastTokenLogitAdapter:
         tree_anchor_target_token: bool = False,
         tree_anchor_target_continuation: bool = False,
         early_stop_action_end: bool = False,
+        replay_accepted_cache: bool = False,
+        resync_accepted_cache: bool = False,
+        diagnose_verify_alignment: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         """Greedy exact FAST-token decode with n-gram speculative verification.
 
@@ -1509,6 +1518,7 @@ class PI0FastTokenLogitAdapter:
         verify_forwards = 0
         fallback_forwards = 0
         replay_forwards = 0
+        resync_forwards = 0
         full_block_reuses = 0
         margin_block_rejects = 0
         verify_margin_checks = 0
@@ -1541,6 +1551,19 @@ class PI0FastTokenLogitAdapter:
         tree_anchor_accepted_tokens = 0
         tree_first_token_checks = 0
         tree_first_token_misses = 0
+        verify_alignment_blocks = 0
+        verify_alignment_checks = 0
+        verify_alignment_argmax_mismatches = 0
+        verify_alignment_blocks_with_mismatch = 0
+        verify_alignment_false_accepts = 0
+        verify_alignment_accept_disagreements = 0
+        verify_alignment_first_mismatch_min = float("inf")
+        verify_alignment_first_mismatch_sum = 0.0
+        verify_alignment_forwards = 0
+        verify_alignment_batched_accept_sum = 0
+        verify_alignment_step_accept_sum = 0
+        verify_alignment_correction_checks = 0
+        verify_alignment_correction_mismatches = 0
         second_order_action_extrapolation_drafted_tokens = 0
         second_order_action_extrapolation_accepted_tokens = 0
         previous_chunk_position_drafted_tokens = 0
@@ -1662,6 +1685,64 @@ class PI0FastTokenLogitAdapter:
                 replay_forwards += 1
             return lm_head(step_out[:, -1:, :])
 
+        def replay_one(next_token: torch.Tensor) -> torch.Tensor:
+            nonlocal current_pad_mask, past_key_values, target_forwards, replay_forwards
+            next_token_emb = self.model.paligemma_with_expert.embed_language_tokens(next_token)
+            next_token_emb = next_token_emb * math.sqrt(next_token_emb.shape[-1])
+            next_token_emb = next_token_emb.to(dtype=prefix_embs.dtype)
+            current_pad_mask = torch.cat(
+                [current_pad_mask, torch.ones((bsize, 1), dtype=torch.bool, device=device)],
+                dim=1,
+            )
+            current_position_ids = (torch.sum(current_pad_mask, dim=1, keepdim=True) - 1).long()
+            step_att_mask = self.model._prepare_attention_masks_4d(
+                current_pad_mask.unsqueeze(1),
+                dtype=next_token_emb.dtype,
+            )
+            (step_out, _), past_key_values = self._forward_prefix_language_model(
+                attention_mask=step_att_mask,
+                position_ids=current_position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=next_token_emb,
+                use_cache=True,
+                cache_position=torch.tensor([current_pad_mask.shape[1] - 1], device=device, dtype=torch.long),
+            )
+            target_forwards += 1
+            replay_forwards += 1
+            return lm_head(step_out[:, -1:, :])
+
+        def diagnostic_stepwise_logits(candidate_tokens: list[int], steps: int) -> torch.Tensor:
+            nonlocal verify_alignment_forwards
+            steps = max(int(steps), 1)
+            diag_past = clone_kv(past_key_values)
+            diag_pad = current_pad_mask.clone()
+            step_logits = [prev_logits.detach()]
+            for token in candidate_tokens[: steps - 1]:
+                token_tensor = torch.tensor([[int(token)]], dtype=torch.long, device=device)
+                token_emb = self.model.paligemma_with_expert.embed_language_tokens(token_tensor)
+                token_emb = token_emb * math.sqrt(token_emb.shape[-1])
+                token_emb = token_emb.to(dtype=prefix_embs.dtype)
+                diag_pad = torch.cat(
+                    [diag_pad, torch.ones((bsize, 1), dtype=torch.bool, device=device)],
+                    dim=1,
+                )
+                position_ids = (torch.sum(diag_pad, dim=1, keepdim=True) - 1).long()
+                att_mask = self.model._prepare_attention_masks_4d(
+                    diag_pad.unsqueeze(1),
+                    dtype=token_emb.dtype,
+                )
+                (step_out, _), diag_past = self._forward_prefix_language_model(
+                    attention_mask=att_mask,
+                    position_ids=position_ids,
+                    past_key_values=diag_past,
+                    inputs_embeds=token_emb,
+                    use_cache=True,
+                    cache_position=torch.tensor([diag_pad.shape[1] - 1], device=device, dtype=torch.long),
+                )
+                verify_alignment_forwards += 1
+                step_logits.append(lm_head(step_out[:, -1:, :]).detach())
+            return torch.cat(step_logits, dim=1)
+
         def process_pending_one() -> torch.Tensor:
             nonlocal pending_unprocessed_token, current_pad_mask, past_key_values
             nonlocal target_forwards, fallback_forwards, pending_processes
@@ -1693,6 +1774,36 @@ class PI0FastTokenLogitAdapter:
             target_forwards += 1
             fallback_forwards += 1
             return lm_head(step_out[:, -1:, :])
+
+        def resync_from_generated() -> torch.Tensor:
+            nonlocal current_pad_mask, past_key_values, target_forwards, resync_forwards
+            if not generated_tokens:
+                raise RuntimeError("Cannot resync pattern_sd cache before any generated token")
+            full_fast_tokens = torch.tensor([generated_tokens], dtype=torch.long, device=device)
+            full_fast_masks = torch.ones_like(full_fast_tokens, dtype=torch.bool)
+            full_embs, full_pad_masks, full_att_masks, _total_t_images, _num_fast_embs = self.model.embed_prefix_fast(
+                images,
+                img_masks,
+                tokens,
+                masks,
+                fast_action_tokens=full_fast_tokens,
+                fast_action_masks=full_fast_masks,
+            )
+            full_embs = self._match_model_precision(full_embs)
+            full_position_ids = torch.cumsum(full_pad_masks, dim=1) - 1
+            full_att_4d = self.model._prepare_attention_masks_4d(full_att_masks, dtype=full_embs.dtype)
+            (full_out, _), past_key_values = self._forward_prefix_language_model(
+                attention_mask=full_att_4d,
+                position_ids=full_position_ids,
+                past_key_values=None,
+                inputs_embeds=full_embs,
+                use_cache=True,
+                cache_position=torch.arange(full_embs.shape[1], device=device, dtype=torch.long),
+            )
+            current_pad_mask = full_pad_masks
+            target_forwards += 1
+            resync_forwards += 1
+            return lm_head(full_out[:, -1:, :])
 
         def verify_candidate_batch(
             candidate_rows: list[list[int]],
@@ -3285,6 +3396,40 @@ class PI0FastTokenLogitAdapter:
             target_forwards += 1
             verify_forwards += 1
 
+            diagnostic_step_accept: int | None = None
+            diagnostic_batched_pred: torch.Tensor | None = None
+            diagnostic_stepwise_pred: torch.Tensor | None = None
+            if diagnose_verify_alignment:
+                align_len = min(int(verify_logits_all.shape[1]), len(draft) + 1)
+                if align_len > 0:
+                    verify_alignment_blocks += 1
+                    verify_alignment_checks += align_len
+                    stepwise_logits_all = diagnostic_stepwise_logits(
+                        [int(token) for token in draft],
+                        align_len,
+                    )
+                    batched_pred = torch.argmax(verify_logits_all[:, :align_len, :].float(), dim=-1)
+                    stepwise_pred = torch.argmax(stepwise_logits_all[:, :align_len, :].float(), dim=-1)
+                    diagnostic_batched_pred = batched_pred
+                    diagnostic_stepwise_pred = stepwise_pred
+                    mismatch_mask = batched_pred != stepwise_pred
+                    mismatches = int(torch.sum(mismatch_mask).item())
+                    verify_alignment_argmax_mismatches += mismatches
+                    if mismatches > 0:
+                        verify_alignment_blocks_with_mismatch += 1
+                        mismatch_positions = torch.nonzero(mismatch_mask[0], as_tuple=False).flatten()
+                        first_mismatch = int(mismatch_positions[0].item())
+                        verify_alignment_first_mismatch_min = min(
+                            verify_alignment_first_mismatch_min,
+                            first_mismatch,
+                        )
+                        verify_alignment_first_mismatch_sum += first_mismatch
+                    diagnostic_step_accept = 0
+                    for idx in range(min(len(draft), align_len)):
+                        if int(stepwise_pred[0, idx].item()) != int(draft[idx]):
+                            break
+                        diagnostic_step_accept += 1
+
             block_accepted = 0
             matched_prefix = 0
             block_min_margin = float("inf")
@@ -3314,6 +3459,37 @@ class PI0FastTokenLogitAdapter:
                 margin_rejected_block = True
                 block_accepted = 0
             block_accepted = min(block_accepted, remaining)
+            if diagnostic_step_accept is not None:
+                diagnostic_step_accept = min(diagnostic_step_accept, remaining)
+                verify_alignment_batched_accept_sum += block_accepted
+                verify_alignment_step_accept_sum += diagnostic_step_accept
+                if block_accepted != diagnostic_step_accept:
+                    verify_alignment_accept_disagreements += 1
+                if block_accepted > diagnostic_step_accept:
+                    verify_alignment_false_accepts += 1
+                batched_correction_for_debug = None
+                stepwise_correction_for_debug = None
+                if diagnostic_batched_pred is not None and diagnostic_stepwise_pred is not None:
+                    correction_idx = min(block_accepted, int(diagnostic_batched_pred.shape[1]) - 1)
+                    verify_alignment_correction_checks += 1
+                    batched_correction = int(diagnostic_batched_pred[0, correction_idx].item())
+                    stepwise_correction = int(diagnostic_stepwise_pred[0, correction_idx].item())
+                    batched_correction_for_debug = batched_correction
+                    stepwise_correction_for_debug = stepwise_correction
+                    if batched_correction != stepwise_correction:
+                        verify_alignment_correction_mismatches += 1
+                if len(debug_events) < 64:
+                    debug_events.append(
+                        {
+                            "pos": len(generated_tokens),
+                            "kind": "verify_alignment",
+                            "draft_len": len(draft),
+                            "batched_accept": block_accepted,
+                            "step_accept": diagnostic_step_accept,
+                            "batched_correction": batched_correction_for_debug,
+                            "step_correction": stepwise_correction_for_debug,
+                        }
+                    )
             if len(debug_events) < 64:
                 debug_events.append(
                     {
@@ -3333,20 +3509,28 @@ class PI0FastTokenLogitAdapter:
                     if int(draft[idx]) == action_end_token_id:
                         accepted_emit = idx + 1
                         break
-            if reuse_full_blocks and block_accepted == len(draft):
+            if reuse_full_blocks and block_accepted == len(draft) and not replay_accepted_cache:
                 full_block_reuses += 1
                 for idx in range(accepted_emit):
                     logits_for_token = verify_logits_all[:, idx : idx + 1, :]
                     logits_by_step.append(logits_for_token)
                     generated_tokens.append(int(draft[idx]))
                 accepted = accepted_emit
-                past_key_values = verify_kv
-                if accepted == len(draft):
-                    current_pad_mask = verify_pad_mask
+                if replay_accepted_cache and accepted > 0:
+                    for idx in range(accepted):
+                        token = torch.tensor([[int(draft[idx])]], dtype=torch.long, device=device)
+                        prev_logits = replay_one(token)
+                elif resync_accepted_cache and accepted > 0:
+                    prev_logits = resync_from_generated()
                 else:
-                    keep_len = old_mask_len + accepted
-                    past_key_values = trim_kv(verify_kv, keep_len)
-                    current_pad_mask = verify_pad_mask[:, :keep_len].contiguous()
+                    past_key_values = verify_kv
+                    if accepted == len(draft):
+                        current_pad_mask = verify_pad_mask
+                    else:
+                        keep_len = old_mask_len + accepted
+                        past_key_values = trim_kv(verify_kv, keep_len)
+                        current_pad_mask = verify_pad_mask[:, :keep_len].contiguous()
+                    prev_logits = verify_logits_all[:, accepted : accepted + 1, :]
                 if (
                     emit_bonus_token
                     and accepted == len(draft)
@@ -3357,25 +3541,42 @@ class PI0FastTokenLogitAdapter:
                         or generated_tokens[-1] != action_end_token_id
                     )
                 ):
-                    bonus_logits = verify_logits_all[:, accepted : accepted + 1, :]
+                    bonus_logits = prev_logits
                     bonus_token = torch.argmax(bonus_logits[:, -1], dim=-1, keepdim=True)
                     logits_by_step.append(bonus_logits)
                     generated_tokens.append(int(bonus_token.item()))
                     bonus_tokens += 1
                     pending_unprocessed_token = bonus_token
                     prev_logits = bonus_logits
-                else:
-                    prev_logits = verify_logits_all[:, accepted : accepted + 1, :]
             else:
-                accepted = accepted_emit
-                for idx in range(accepted):
-                    logits_for_token = verify_logits_all[:, idx : idx + 1, :]
-                    logits_by_step.append(logits_for_token)
-                    generated_tokens.append(int(draft[idx]))
-
-                keep_len = old_mask_len + accepted
-                past_key_values = trim_kv(verify_kv, keep_len)
-                current_pad_mask = verify_pad_mask[:, :keep_len].contiguous()
+                if replay_accepted_cache:
+                    accepted = 0
+                    for idx in range(accepted_emit):
+                        live_token = int(torch.argmax(prev_logits[:, -1], dim=-1).item())
+                        if live_token != int(draft[idx]):
+                            break
+                        logits_by_step.append(prev_logits)
+                        generated_tokens.append(int(draft[idx]))
+                        token = torch.tensor([[int(draft[idx])]], dtype=torch.long, device=device)
+                        prev_logits = replay_one(token)
+                        accepted += 1
+                    block_accepted = accepted
+                    accepted_emit = accepted
+                else:
+                    accepted = accepted_emit
+                    for idx in range(accepted):
+                        logits_for_token = verify_logits_all[:, idx : idx + 1, :]
+                        logits_by_step.append(logits_for_token)
+                        generated_tokens.append(int(draft[idx]))
+                    if resync_accepted_cache and accepted > 0:
+                        prev_logits = resync_from_generated()
+                    elif accepted > 0:
+                        keep_len = old_mask_len + accepted
+                        past_key_values = trim_kv(verify_kv, keep_len)
+                        current_pad_mask = verify_pad_mask[:, :keep_len].contiguous()
+                        prev_logits = verify_logits_all[:, accepted : accepted + 1, :]
+                    else:
+                        prev_logits = verify_logits_all[:, :1, :]
 
                 if (
                     len(generated_tokens) < max_decoding_steps
@@ -3385,7 +3586,7 @@ class PI0FastTokenLogitAdapter:
                         or generated_tokens[-1] != action_end_token_id
                     )
                 ):
-                    correction_logits = verify_logits_all[:, accepted : accepted + 1, :]
+                    correction_logits = prev_logits
                     correction_token = torch.argmax(correction_logits[:, -1], dim=-1, keepdim=True)
                     if (
                         not margin_rejected_block
@@ -3558,6 +3759,7 @@ class PI0FastTokenLogitAdapter:
             "verify_forwards": verify_forwards,
             "fallback_forwards": fallback_forwards,
             "replay_forwards": replay_forwards,
+            "resync_forwards": resync_forwards,
             "full_block_reuses": full_block_reuses,
             "bonus_tokens": bonus_tokens,
             "pending_verifies": pending_verifies,
@@ -3565,6 +3767,8 @@ class PI0FastTokenLogitAdapter:
             "pending_processes": pending_processes,
             "pending_token_at_return": pending_unprocessed_token is not None,
             "reuse_full_blocks": reuse_full_blocks,
+            "replay_accepted_cache": replay_accepted_cache,
+            "resync_accepted_cache": resync_accepted_cache,
             "min_verify_margin": float(min_verify_margin),
             "margin_block_rejects": margin_block_rejects,
             "verify_margin_checks": verify_margin_checks,
@@ -3598,6 +3802,31 @@ class PI0FastTokenLogitAdapter:
             "tree_first_token_misses": tree_first_token_misses,
             "tree_first_token_miss_rate": tree_first_token_misses / max(tree_first_token_checks, 1),
             "mean_tree_candidates": tree_candidates / max(tree_verifies, 1),
+            "verify_alignment_diagnostics": diagnose_verify_alignment,
+            "verify_alignment_blocks": verify_alignment_blocks,
+            "verify_alignment_checks": verify_alignment_checks,
+            "verify_alignment_argmax_mismatches": verify_alignment_argmax_mismatches,
+            "verify_alignment_blocks_with_mismatch": verify_alignment_blocks_with_mismatch,
+            "verify_alignment_false_accepts": verify_alignment_false_accepts,
+            "verify_alignment_accept_disagreements": verify_alignment_accept_disagreements,
+            "verify_alignment_first_mismatch_min": (
+                0
+                if verify_alignment_first_mismatch_min == float("inf")
+                else int(verify_alignment_first_mismatch_min)
+            ),
+            "verify_alignment_first_mismatch_mean": (
+                verify_alignment_first_mismatch_sum / max(verify_alignment_blocks_with_mismatch, 1)
+            ),
+            "verify_alignment_forwards": verify_alignment_forwards,
+            "verify_alignment_batched_accept_mean": (
+                verify_alignment_batched_accept_sum / max(verify_alignment_blocks, 1)
+            ),
+            "verify_alignment_step_accept_mean": verify_alignment_step_accept_sum / max(verify_alignment_blocks, 1),
+            "verify_alignment_correction_checks": verify_alignment_correction_checks,
+            "verify_alignment_correction_mismatches": verify_alignment_correction_mismatches,
+            "verify_alignment_correction_mismatch_rate": (
+                verify_alignment_correction_mismatches / max(verify_alignment_correction_checks, 1)
+            ),
             "second_order_action_extrapolation_drafted_tokens": second_order_action_extrapolation_drafted_tokens,
             "second_order_action_extrapolation_accepted_tokens": second_order_action_extrapolation_accepted_tokens,
             "second_order_action_extrapolation_acceptance_rate": (

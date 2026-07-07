@@ -488,6 +488,9 @@ def _predict_ngram_spec_chunk(
     min_verify_margin: float = 0.0,
     emit_bonus_token: bool = False,
     verify_from_scratch: bool = False,
+    replay_accepted_cache: bool = False,
+    resync_accepted_cache: bool = False,
+    diagnose_verify_alignment: bool = False,
     dynamic_lookahead: bool = False,
     min_lookahead: int = 1,
     lookahead_growth: int = 1,
@@ -513,6 +516,9 @@ def _predict_ngram_spec_chunk(
         min_verify_margin=min_verify_margin,
         verify_from_scratch=verify_from_scratch,
         emit_bonus_token=emit_bonus_token,
+        replay_accepted_cache=replay_accepted_cache,
+        resync_accepted_cache=resync_accepted_cache,
+        diagnose_verify_alignment=diagnose_verify_alignment,
         dynamic_lookahead=dynamic_lookahead,
         min_lookahead=min_lookahead,
         lookahead_growth=lookahead_growth,
@@ -1031,6 +1037,9 @@ def run_episode(
     pattern_min_verify_margin: float,
     pattern_emit_bonus_token: bool,
     pattern_verify_from_scratch: bool,
+    pattern_replay_accepted_cache: bool,
+    pattern_resync_accepted_cache: bool,
+    pattern_diagnose_verify_alignment: bool,
     pattern_dynamic_lookahead: bool,
     pattern_min_lookahead: int,
     pattern_lookahead_growth: int,
@@ -1245,6 +1254,9 @@ def run_episode(
                             pattern_min_verify_margin,
                             pattern_emit_bonus_token,
                             pattern_verify_from_scratch,
+                            pattern_replay_accepted_cache,
+                            pattern_resync_accepted_cache,
+                            pattern_diagnose_verify_alignment,
                             pattern_dynamic_lookahead,
                             pattern_min_lookahead,
                             pattern_lookahead_growth,
@@ -1298,6 +1310,25 @@ def run_episode(
                                 device,
                                 token_adapter,
                                 early_stop_action_end=True,
+                            )
+                        if token_trace_sink is not None:
+                            token_trace_sink.record(
+                                prediction,
+                                mode=f"{mode}_pattern_raw",
+                                task=task,
+                                task_id=task_id,
+                                episode=episode,
+                                seed=seed,
+                                step=steps,
+                            )
+                            token_trace_sink.record(
+                                target_prediction,
+                                mode=f"{mode}_target",
+                                task=task,
+                                task_id=task_id,
+                                episode=episode,
+                                seed=seed,
+                                step=steps,
                             )
                         max_diff, mean_diff = _prediction_action_diff(prediction.actions, target_prediction.actions)
                         controller.stats.record_trace_stats(
@@ -2711,6 +2742,21 @@ def parse_args() -> argparse.Namespace:
         help="Verify pattern_sd candidates by replaying the full FAST prefix instead of using the speculative KV cache.",
     )
     parser.add_argument(
+        "--pattern-replay-accepted-cache",
+        action="store_true",
+        help="After accepting pattern_sd draft tokens, replay them through the one-token target cache path.",
+    )
+    parser.add_argument(
+        "--pattern-resync-accepted-cache",
+        action="store_true",
+        help="After accepting pattern_sd draft tokens, rebuild the target KV cache from the emitted FAST prefix.",
+    )
+    parser.add_argument(
+        "--pattern-diagnose-verify-alignment",
+        action="store_true",
+        help="Compare pattern_sd batched verifier argmaxes with stepwise teacher-forced target argmaxes.",
+    )
+    parser.add_argument(
         "--pattern-dynamic-lookahead",
         action="store_true",
         help="Grow or shrink pattern_sd lookahead from recent exact acceptance in the same decode.",
@@ -3359,6 +3405,9 @@ def main() -> None:
                     pattern_min_verify_margin=args.pattern_min_verify_margin,
                     pattern_emit_bonus_token=args.pattern_emit_bonus_token,
                     pattern_verify_from_scratch=args.pattern_verify_from_scratch,
+                    pattern_replay_accepted_cache=args.pattern_replay_accepted_cache,
+                    pattern_resync_accepted_cache=args.pattern_resync_accepted_cache,
+                    pattern_diagnose_verify_alignment=args.pattern_diagnose_verify_alignment,
                     pattern_dynamic_lookahead=args.pattern_dynamic_lookahead,
                     pattern_min_lookahead=args.pattern_min_lookahead,
                     pattern_lookahead_growth=args.pattern_lookahead_growth,
@@ -3606,6 +3655,9 @@ def main() -> None:
         "pattern_min_verify_margin": args.pattern_min_verify_margin,
         "pattern_emit_bonus_token": args.pattern_emit_bonus_token,
         "pattern_verify_from_scratch": args.pattern_verify_from_scratch,
+        "pattern_replay_accepted_cache": args.pattern_replay_accepted_cache,
+        "pattern_resync_accepted_cache": args.pattern_resync_accepted_cache,
+        "pattern_diagnose_verify_alignment": args.pattern_diagnose_verify_alignment,
         "pattern_dynamic_lookahead": args.pattern_dynamic_lookahead,
         "pattern_min_lookahead": args.pattern_min_lookahead,
         "pattern_lookahead_growth": args.pattern_lookahead_growth,
