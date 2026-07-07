@@ -188,6 +188,8 @@ class PI0FastTokenLogitAdapter:
         constrained_full_head_prefix_tokens: int = 0,
         force_action_prefix: bool = False,
         stop_on_action_chars: bool = False,
+        action_char_min_chars: int | None = None,
+        action_char_plateau_tokens: int = 0,
     ) -> PI0FastGenerationTrace:
         """Serving-oriented greedy decode that stops on the FAST action-end token.
 
@@ -231,6 +233,8 @@ class PI0FastTokenLogitAdapter:
                 temperature=decode_temperature,
                 force_action_prefix=force_action_prefix,
                 stop_on_action_chars=stop_on_action_chars,
+                action_char_min_chars=action_char_min_chars,
+                action_char_plateau_tokens=action_char_plateau_tokens,
             )
             mode = "action_end_prefix_no_logits" if force_action_prefix else "action_end_no_logits"
         else:
@@ -283,7 +287,10 @@ class PI0FastTokenLogitAdapter:
                 "forced_action_prefix_tokens": int(getattr(self, "_last_forced_action_prefix_token_count", 0)),
                 "stop_on_action_chars": int(bool(stop_on_action_chars)),
                 "action_char_target": int(getattr(self, "_last_action_char_target", 0)),
+                "action_char_min_chars": int(getattr(self, "_last_action_char_min_chars", 0)),
+                "action_char_plateau_tokens": int(getattr(self, "_last_action_char_plateau_tokens", 0)),
                 "action_char_stop_count": int(getattr(self, "_last_action_char_stop_count", 0)),
+                "action_char_plateau_stop_count": int(getattr(self, "_last_action_char_plateau_stop_count", 0)),
                 "action_char_count_mean": float(getattr(self, "_last_action_char_count_mean", 0.0)),
                 "action_char_lookup_raw_limit": int(getattr(self, "_action_char_length_raw_limit", 0)),
             },
@@ -1225,6 +1232,8 @@ class PI0FastTokenLogitAdapter:
         temperature: float = 0.0,
         force_action_prefix: bool = False,
         stop_on_action_chars: bool = False,
+        action_char_min_chars: int | None = None,
+        action_char_plateau_tokens: int = 0,
     ) -> torch.Tensor:
         """KV-cache FAST decode with per-row action-end compaction.
 
@@ -1245,8 +1254,14 @@ class PI0FastTokenLogitAdapter:
                 raise ValueError("PI0-FAST action-char stop currently supports greedy temperature=0 only")
             action_dim = self.policy.config.output_features[self._action_key()].shape[0]
             action_char_target = int(self.policy.config.n_action_steps) * int(action_dim)
+        action_char_min_chars = int(action_char_target if action_char_min_chars is None else action_char_min_chars)
+        action_char_min_chars = max(0, int(action_char_min_chars))
+        action_char_plateau_tokens = max(0, int(action_char_plateau_tokens))
         self._last_action_char_target = int(action_char_target)
+        self._last_action_char_min_chars = int(action_char_min_chars if stop_on_action_chars else 0)
+        self._last_action_char_plateau_tokens = int(action_char_plateau_tokens if stop_on_action_chars else 0)
         self._last_action_char_stop_count = 0
+        self._last_action_char_plateau_stop_count = 0
         self._last_action_char_count_mean = 0.0
         action_char_lookup = self.prepare_action_char_length_lookup(device) if stop_on_action_chars else None
         prefix_tokens = None
@@ -1295,21 +1310,42 @@ class PI0FastTokenLogitAdapter:
         active_indices = torch.arange(bsize, dtype=torch.long, device=device)
         emitted_lengths = torch.zeros((bsize,), dtype=torch.long, device=device)
         action_char_counts = torch.zeros((bsize,), dtype=torch.long, device=device)
+        last_action_char_increment_lengths = torch.zeros((bsize,), dtype=torch.long, device=device)
         stopped_by_chars = torch.zeros((bsize,), dtype=torch.bool, device=device)
+        stopped_by_char_plateau = torch.zeros((bsize,), dtype=torch.bool, device=device)
 
         def record_action_chars(selected: torch.Tensor) -> torch.Tensor:
             if action_char_lookup is None:
                 return torch.zeros_like(selected, dtype=torch.bool)
             increments = action_char_lookup.index_select(0, selected).to(dtype=action_char_counts.dtype)
             action_char_counts[active_indices] += increments
-            reached = action_char_counts[active_indices] >= int(action_char_target)
+            incremented = increments > 0
+            if bool(torch.any(incremented)):
+                incremented_rows = active_indices[incremented]
+                last_action_char_increment_lengths[incremented_rows] = emitted_lengths[incremented_rows]
+            reached_target = action_char_counts[active_indices] >= int(action_char_target)
+            if action_char_target <= 0:
+                reached_target = torch.zeros_like(reached_target, dtype=torch.bool)
+            plateau = torch.zeros_like(reached_target, dtype=torch.bool)
+            if action_char_plateau_tokens > 0:
+                plateau = (
+                    (action_char_counts[active_indices] >= int(action_char_min_chars))
+                    & (last_action_char_increment_lengths[active_indices] > 0)
+                    & (
+                        emitted_lengths[active_indices] - last_action_char_increment_lengths[active_indices]
+                        >= int(action_char_plateau_tokens)
+                    )
+                )
+            reached = reached_target | plateau
             stopped_by_chars[active_indices] |= reached
+            stopped_by_char_plateau[active_indices] |= plateau
             return reached
 
         def finish_return(max_len: int) -> torch.Tensor:
             self._last_action_end_row_token_counts = emitted_lengths.detach().cpu().tolist()
             if stop_on_action_chars:
                 self._last_action_char_stop_count = int(stopped_by_chars.sum().item())
+                self._last_action_char_plateau_stop_count = int(stopped_by_char_plateau.sum().item())
                 self._last_action_char_count_mean = float(action_char_counts.float().mean().item())
                 return generated[:, : min(int(max_len) + 1, generated_width)]
             return generated[:, : int(max_len)]
@@ -1381,6 +1417,7 @@ class PI0FastTokenLogitAdapter:
         self._last_action_end_row_token_counts = emitted_lengths.detach().cpu().tolist()
         if stop_on_action_chars:
             self._last_action_char_stop_count = int(stopped_by_chars.sum().item())
+            self._last_action_char_plateau_stop_count = int(stopped_by_char_plateau.sum().item())
             self._last_action_char_count_mean = float(action_char_counts.float().mean().item())
         return generated
 

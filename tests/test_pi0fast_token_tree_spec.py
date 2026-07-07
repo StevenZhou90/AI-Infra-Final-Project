@@ -177,6 +177,33 @@ def test_pi0fast_action_char_lookup_avoids_hot_loop_tokenizer_decode() -> None:
     assert policy.action_tokenizer.bpe_tokenizer.decode_calls == warmed_decode_calls
 
 
+def test_pi0fast_action_char_plateau_can_stop_after_decoded_chars_stabilize() -> None:
+    policy = _CharStopPolicy()
+    policy.model._targets = [90, 80, 80, 80, 99]
+    adapter = PI0FastTokenLogitAdapter(policy)
+    adapter._match_model_precision = lambda tensor: tensor
+    adapter._action_key = lambda: "action"
+
+    token_ids = adapter.sample_actions_fast_kv_cache_action_end(
+        images=torch.empty(1),
+        img_masks=torch.empty(1),
+        tokens=torch.zeros((1, 2), dtype=torch.long),
+        masks=torch.ones((1, 2), dtype=torch.bool),
+        max_decoding_steps=8,
+        stop_on_action_chars=True,
+        action_char_min_chars=4,
+        action_char_plateau_tokens=2,
+    )
+
+    assert token_ids.tolist() == [[90, 80, 80, 99]]
+    assert adapter._last_action_char_target == 8
+    assert adapter._last_action_char_min_chars == 4
+    assert adapter._last_action_char_plateau_tokens == 2
+    assert adapter._last_action_char_stop_count == 1
+    assert adapter._last_action_char_plateau_stop_count == 1
+    assert adapter._last_action_char_count_mean == 4.0
+
+
 class _BranchingDrafter:
     def __init__(self, target: list[int]) -> None:
         self.target = target

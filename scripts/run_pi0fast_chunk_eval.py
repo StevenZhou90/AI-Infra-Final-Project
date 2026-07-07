@@ -359,6 +359,8 @@ def _predict_target_eos_chunk(
     constrained_full_head_prefix_tokens: int = 0,
     force_action_prefix: bool = False,
     stop_on_action_chars: bool = False,
+    action_char_min_chars: int | None = None,
+    action_char_plateau_tokens: int = 0,
 ) -> PredictionTrace:
     if stop_on_action_chars and hasattr(token_adapter, "prepare_action_char_length_lookup"):
         token_adapter.prepare_action_char_length_lookup(device=device)
@@ -377,12 +379,16 @@ def _predict_target_eos_chunk(
             constrained_full_head_prefix_tokens=constrained_full_head_prefix_tokens,
             force_action_prefix=force_action_prefix,
             stop_on_action_chars=stop_on_action_chars,
+            action_char_min_chars=action_char_min_chars,
+            action_char_plateau_tokens=action_char_plateau_tokens,
         )
     else:
         trace = token_adapter.predict_action_chunk_action_end(
             batch,
             force_action_prefix=force_action_prefix,
             stop_on_action_chars=stop_on_action_chars,
+            action_char_min_chars=action_char_min_chars,
+            action_char_plateau_tokens=action_char_plateau_tokens,
         )
     if device.startswith("cuda") and torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -1093,6 +1099,8 @@ def run_episode(
     target_eos_constrained_no_force_prefix: bool,
     target_eos_constrained_structural_token_radius: int,
     target_eos_constrained_full_head_prefix_tokens: int,
+    target_eos_action_char_min_chars: int | None,
+    target_eos_action_char_plateau_tokens: int,
     token_trace_sink: TokenTraceSink | None,
     device: str,
     use_amp: bool,
@@ -2109,6 +2117,8 @@ def run_episode(
                                 constrained_full_head_prefix_tokens=target_eos_constrained_full_head_prefix_tokens,
                                 force_action_prefix="_prefix" in mode,
                                 stop_on_action_chars="_charstop" in mode,
+                                action_char_min_chars=target_eos_action_char_min_chars,
+                                action_char_plateau_tokens=target_eos_action_char_plateau_tokens,
                             )
                         controller.stats.record_trace_stats(prediction.stats)
                     else:
@@ -2469,6 +2479,24 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Use the exact full lm_head for this many initial generated tokens in constrained modes, "
             "then switch to the restricted head."
+        ),
+    )
+    parser.add_argument(
+        "--target-eos-action-char-min-chars",
+        type=int,
+        default=-1,
+        help=(
+            "Minimum decoded FAST-character count before target_eos_charstop can use plateau stopping. "
+            "Negative keeps the default full action-dimension target."
+        ),
+    )
+    parser.add_argument(
+        "--target-eos-action-char-plateau-tokens",
+        type=int,
+        default=0,
+        help=(
+            "If positive, target_eos_charstop may stop once decoded FAST-character count has not increased "
+            "for this many generated tokens after the minimum character count."
         ),
     )
     parser.add_argument(
@@ -3512,6 +3540,10 @@ def main() -> None:
                     target_eos_constrained_no_force_prefix=args.target_eos_constrained_no_force_prefix,
                     target_eos_constrained_structural_token_radius=args.target_eos_constrained_structural_token_radius,
                     target_eos_constrained_full_head_prefix_tokens=args.target_eos_constrained_full_head_prefix_tokens,
+                    target_eos_action_char_min_chars=(
+                        None if args.target_eos_action_char_min_chars < 0 else args.target_eos_action_char_min_chars
+                    ),
+                    target_eos_action_char_plateau_tokens=args.target_eos_action_char_plateau_tokens,
                     token_trace_sink=token_trace_sink,
                     device=str(device),
                     use_amp=args.use_amp,
@@ -3546,6 +3578,8 @@ def main() -> None:
         "target_eos_constrained_no_force_prefix": args.target_eos_constrained_no_force_prefix,
         "target_eos_constrained_structural_token_radius": args.target_eos_constrained_structural_token_radius,
         "target_eos_constrained_full_head_prefix_tokens": args.target_eos_constrained_full_head_prefix_tokens,
+        "target_eos_action_char_min_chars": args.target_eos_action_char_min_chars,
+        "target_eos_action_char_plateau_tokens": args.target_eos_action_char_plateau_tokens,
         "num_inference_steps": args.num_inference_steps,
         "task": args.task,
         "task_id": args.task_id,
