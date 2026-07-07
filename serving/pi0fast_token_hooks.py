@@ -121,6 +121,7 @@ class PI0FastTokenLogitAdapter:
         constrained_full_head_margin: float | None = None,
         constrained_force_action_prefix: bool = True,
         constrained_structural_token_radius: int = 512,
+        constrained_full_head_prefix_tokens: int = 0,
         force_action_prefix: bool = False,
     ) -> PI0FastGenerationTrace:
         """Serving-oriented greedy decode that stops on the FAST action-end token.
@@ -152,6 +153,7 @@ class PI0FastTokenLogitAdapter:
                 full_head_margin=constrained_full_head_margin,
                 force_action_prefix=constrained_force_action_prefix,
                 structural_token_radius=constrained_structural_token_radius,
+                full_head_prefix_tokens=constrained_full_head_prefix_tokens,
             )
             mode = "action_end_constrained_no_logits"
         elif self.policy.config.use_kv_cache:
@@ -198,6 +200,12 @@ class PI0FastTokenLogitAdapter:
                 ),
                 "constrained_force_action_prefix": int(bool(getattr(self, "_last_constrained_force_action_prefix", False))),
                 "constrained_full_head_margin": float(getattr(self, "_last_constrained_full_head_margin", -1.0)),
+                "constrained_full_head_prefix_tokens": int(
+                    getattr(self, "_last_constrained_full_head_prefix_tokens", 0)
+                ),
+                "constrained_full_head_prefix_calls": int(
+                    getattr(self, "_last_constrained_full_head_prefix_calls", 0)
+                ),
                 "constrained_full_head_fallbacks": int(getattr(self, "_last_constrained_full_head_fallbacks", 0)),
                 "constrained_restricted_head_calls": int(getattr(self, "_last_constrained_restricted_head_calls", 0)),
                 "constrained_full_head_fallback_rate": float(
@@ -1284,6 +1292,7 @@ class PI0FastTokenLogitAdapter:
         full_head_margin: float | None = None,
         force_action_prefix: bool = True,
         structural_token_radius: int = 512,
+        full_head_prefix_tokens: int = 0,
     ) -> torch.Tensor:
         """KV-cache FAST decode using the known PI0-FAST action-token support.
 
@@ -1325,6 +1334,7 @@ class PI0FastTokenLogitAdapter:
         action_vocab_size = max(int(getattr(self.policy.action_tokenizer, "vocab_size", 1024)), int(action_vocab_size))
         text_vocab_size = min(paligemma_vocab_size, max(0, int(text_vocab_size)))
         structural_token_radius = max(0, int(structural_token_radius))
+        full_head_prefix_tokens = max(0, int(full_head_prefix_tokens))
         candidate_cache_key = (
             int(action_vocab_size),
             int(text_vocab_size),
@@ -1376,6 +1386,8 @@ class PI0FastTokenLogitAdapter:
         self._last_constrained_force_action_prefix = int(bool(force_action_prefix))
         self._last_forced_action_prefix_token_count = int(prefix_tokens.numel()) if force_action_prefix else 0
         self._last_constrained_full_head_margin = float(full_head_margin) if full_head_margin is not None else -1.0
+        self._last_constrained_full_head_prefix_tokens = int(full_head_prefix_tokens)
+        self._last_constrained_full_head_prefix_calls = 0
         self._last_constrained_full_head_fallbacks = 0
         self._last_constrained_restricted_head_calls = 0
         self._last_constrained_full_head_fallback_rate = 0.0
@@ -1383,8 +1395,19 @@ class PI0FastTokenLogitAdapter:
         self._last_constrained_margin_mean = 0.0
         restricted_head_calls = 0
         full_head_fallbacks = 0
+        full_head_prefix_calls = 0
         margin_min = float("inf")
         margin_sum = 0.0
+
+        def full_next(hidden: torch.Tensor) -> torch.Tensor:
+            return torch.argmax(lm_head(hidden)[:, -1, :], dim=-1, keepdim=True)
+
+        def constrained_next(hidden: torch.Tensor, token_position: int) -> torch.Tensor:
+            nonlocal full_head_prefix_calls
+            if token_position < full_head_prefix_tokens:
+                full_head_prefix_calls += int(hidden.shape[0])
+                return full_next(hidden)
+            return restricted_next(hidden)
 
         def restricted_next(hidden: torch.Tensor) -> torch.Tensor:
             nonlocal restricted_head_calls, full_head_fallbacks, margin_min, margin_sum
@@ -1399,12 +1422,13 @@ class PI0FastTokenLogitAdapter:
                 local = top_indices[:, 0]
                 if full_head_margin is not None and bool(torch.any(margins < float(full_head_margin))):
                     full_head_fallbacks += int(step_logits.shape[0])
-                    return torch.argmax(lm_head(hidden)[:, -1, :], dim=-1, keepdim=True)
+                    return full_next(hidden)
             else:
                 local = torch.argmax(step_logits, dim=-1)
             return candidate_ids.index_select(0, local).unsqueeze(-1)
 
         def finish_constrained_stats() -> None:
+            self._last_constrained_full_head_prefix_calls = int(full_head_prefix_calls)
             self._last_constrained_full_head_fallbacks = int(full_head_fallbacks)
             self._last_constrained_restricted_head_calls = int(restricted_head_calls)
             self._last_constrained_full_head_fallback_rate = (
@@ -1447,7 +1471,7 @@ class PI0FastTokenLogitAdapter:
         if force_action_prefix:
             next_token = prefix_tokens[0].view(1, 1).expand(bsize, 1)
         else:
-            next_token = restricted_next(prefix_out[:, -1:, :])
+            next_token = constrained_next(prefix_out[:, -1:, :], 0)
         generated[:, 0] = next_token.squeeze(-1)
         current_pad_mask = prefix_pad_masks
         active_indices = torch.arange(bsize, dtype=torch.long, device=device)
@@ -1489,7 +1513,7 @@ class PI0FastTokenLogitAdapter:
             if force_action_prefix and t < int(prefix_tokens.numel()):
                 next_token = prefix_tokens[t].view(1, 1).expand(active_bsize, 1)
             else:
-                next_token = restricted_next(step_out[:, -1:, :])
+                next_token = constrained_next(step_out[:, -1:, :], t)
             selected = next_token.squeeze(-1)
             generated[active_indices, t] = selected
             emitted_lengths[active_indices] = t + 1

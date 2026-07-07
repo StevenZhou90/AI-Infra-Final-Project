@@ -356,6 +356,7 @@ def _predict_target_eos_chunk(
     constrained_full_head_margin: float | None = None,
     constrained_force_action_prefix: bool = True,
     constrained_structural_token_radius: int = 512,
+    constrained_full_head_prefix_tokens: int = 0,
     force_action_prefix: bool = False,
 ) -> PredictionTrace:
     if device.startswith("cuda") and torch.cuda.is_available():
@@ -370,6 +371,7 @@ def _predict_target_eos_chunk(
             constrained_full_head_margin=constrained_full_head_margin,
             constrained_force_action_prefix=constrained_force_action_prefix,
             constrained_structural_token_radius=constrained_structural_token_radius,
+            constrained_full_head_prefix_tokens=constrained_full_head_prefix_tokens,
             force_action_prefix=force_action_prefix,
         )
     else:
@@ -1085,6 +1087,7 @@ def run_episode(
     target_eos_constrained_full_head_margin: float | None,
     target_eos_constrained_no_force_prefix: bool,
     target_eos_constrained_structural_token_radius: int,
+    target_eos_constrained_full_head_prefix_tokens: int,
     token_trace_sink: TokenTraceSink | None,
     device: str,
     use_amp: bool,
@@ -2098,6 +2101,7 @@ def run_episode(
                                     target_eos_constrained_no_force_prefix or "_noforce" in mode
                                 ),
                                 constrained_structural_token_radius=target_eos_constrained_structural_token_radius,
+                                constrained_full_head_prefix_tokens=target_eos_constrained_full_head_prefix_tokens,
                                 force_action_prefix="_prefix" in mode,
                             )
                         controller.stats.record_trace_stats(prediction.stats)
@@ -2451,6 +2455,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=512,
         help="Include token ids within this radius of the PI0-FAST action-end token in constrained modes.",
+    )
+    parser.add_argument(
+        "--target-eos-constrained-full-head-prefix-tokens",
+        type=int,
+        default=0,
+        help=(
+            "Use the exact full lm_head for this many initial generated tokens in constrained modes, "
+            "then switch to the restricted head."
+        ),
     )
     parser.add_argument(
         "--num-inference-steps",
@@ -3485,6 +3498,7 @@ def main() -> None:
                     ),
                     target_eos_constrained_no_force_prefix=args.target_eos_constrained_no_force_prefix,
                     target_eos_constrained_structural_token_radius=args.target_eos_constrained_structural_token_radius,
+                    target_eos_constrained_full_head_prefix_tokens=args.target_eos_constrained_full_head_prefix_tokens,
                     token_trace_sink=token_trace_sink,
                     device=str(device),
                     use_amp=args.use_amp,
@@ -3518,6 +3532,7 @@ def main() -> None:
         "target_eos_constrained_full_head_margin": args.target_eos_constrained_full_head_margin,
         "target_eos_constrained_no_force_prefix": args.target_eos_constrained_no_force_prefix,
         "target_eos_constrained_structural_token_radius": args.target_eos_constrained_structural_token_radius,
+        "target_eos_constrained_full_head_prefix_tokens": args.target_eos_constrained_full_head_prefix_tokens,
         "num_inference_steps": args.num_inference_steps,
         "task": args.task,
         "task_id": args.task_id,
