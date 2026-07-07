@@ -360,6 +360,8 @@ def _predict_target_eos_chunk(
     force_action_prefix: bool = False,
     stop_on_action_chars: bool = False,
 ) -> PredictionTrace:
+    if stop_on_action_chars and hasattr(token_adapter, "prepare_action_char_length_lookup"):
+        token_adapter.prepare_action_char_length_lookup(device=device)
     if device.startswith("cuda") and torch.cuda.is_available():
         torch.cuda.synchronize()
     t0 = time.perf_counter()
@@ -3381,6 +3383,13 @@ def main() -> None:
                 cfg = guard_cfg
             controller = ChunkExecutionController(ChunkGuard(cfg))
             drafter = RetrievalChunkDrafter() if "retrieval" in mode or mode.startswith("exact_fast_sd") else None
+            if (
+                token_adapter is not None
+                and mode.startswith("target_eos")
+                and "_charstop" in mode
+                and hasattr(token_adapter, "prepare_action_char_length_lookup")
+            ):
+                token_adapter.prepare_action_char_length_lookup(device=device)
             for ep in selected_episode_ids:
                 seed = args.seed + ep
                 logger.info("=== task_id=%d mode=%s episode=%d seed=%d ===", task_id, mode, ep, seed)

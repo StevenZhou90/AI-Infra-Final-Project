@@ -58,6 +58,70 @@ class PI0FastTokenLogitAdapter:
         self.policy = policy
         self.model = policy.model
 
+    def _canonical_lookup_device(self, device: torch.device | str | None) -> torch.device:
+        if device is None:
+            return torch.device("cpu")
+        lookup_device = torch.device(device)
+        if lookup_device.type == "cuda" and lookup_device.index is None and torch.cuda.is_available():
+            lookup_device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        return lookup_device
+
+    def prepare_action_char_length_lookup(self, device: torch.device | str | None = None) -> torch.Tensor:
+        """Return a cached PaliGemma-token -> FAST decoded-character length table."""
+
+        lookup_device = self._canonical_lookup_device(device)
+        cpu_lookup = getattr(self, "_action_char_length_lookup_cpu", None)
+        if cpu_lookup is None:
+            paligemma_vocab_size = int(self.model._paligemma_tokenizer.vocab_size)
+            tokenizer_vocab_size = int(getattr(self.policy.action_tokenizer, "vocab_size", 0) or 0)
+            raw_action_limit = min(paligemma_vocab_size, max(tokenizer_vocab_size, 65_536))
+
+            raw_lengths = torch.zeros((raw_action_limit,), dtype=torch.int16)
+            bpe_tokenizer = self.policy.action_tokenizer.bpe_tokenizer
+            for raw_id in range(raw_action_limit):
+                try:
+                    raw_lengths[raw_id] = len(bpe_tokenizer.decode(raw_id))
+                except Exception:
+                    raw_lengths[raw_id] = 0
+
+            paligemma_ids = torch.arange(paligemma_vocab_size, dtype=torch.long)
+            try:
+                raw_ids = self.policy._paligemma_tokens_to_act_tokens(paligemma_ids).detach().cpu().long()
+            except Exception:
+                raw_ids = (
+                    paligemma_vocab_size
+                    - 1
+                    - int(getattr(self.policy.config, "fast_skip_tokens", 0))
+                    - paligemma_ids
+                )
+            valid = (raw_ids >= 0) & (raw_ids < raw_action_limit)
+            cpu_lookup = torch.zeros((paligemma_vocab_size,), dtype=torch.int16)
+            cpu_lookup[valid] = raw_lengths.index_select(0, raw_ids[valid])
+
+            action_end_token_id = self._action_end_token_id()
+            if 0 <= action_end_token_id < paligemma_vocab_size:
+                cpu_lookup[action_end_token_id] = 0
+            for token_id in self.model._paligemma_tokenizer.encode("Action: ", add_special_tokens=False):
+                if 0 <= int(token_id) < paligemma_vocab_size:
+                    cpu_lookup[int(token_id)] = 0
+
+            self._action_char_length_lookup_cpu = cpu_lookup
+            self._action_char_length_raw_limit = int(raw_action_limit)
+
+        if lookup_device.type == "cpu":
+            return cpu_lookup
+
+        cache = getattr(self, "_action_char_length_lookup_device_cache", None)
+        if cache is None:
+            cache = {}
+            self._action_char_length_lookup_device_cache = cache
+        key = str(lookup_device)
+        device_lookup = cache.get(key)
+        if device_lookup is None or device_lookup.device != lookup_device:
+            device_lookup = cpu_lookup.to(device=lookup_device, non_blocking=True)
+            cache[key] = device_lookup
+        return device_lookup
+
     @torch.no_grad()
     def predict_action_chunk_with_trace(
         self,
@@ -221,6 +285,7 @@ class PI0FastTokenLogitAdapter:
                 "action_char_target": int(getattr(self, "_last_action_char_target", 0)),
                 "action_char_stop_count": int(getattr(self, "_last_action_char_stop_count", 0)),
                 "action_char_count_mean": float(getattr(self, "_last_action_char_count_mean", 0.0)),
+                "action_char_lookup_raw_limit": int(getattr(self, "_action_char_length_raw_limit", 0)),
             },
         )
 
@@ -1183,6 +1248,7 @@ class PI0FastTokenLogitAdapter:
         self._last_action_char_target = int(action_char_target)
         self._last_action_char_stop_count = 0
         self._last_action_char_count_mean = 0.0
+        action_char_lookup = self.prepare_action_char_length_lookup(device) if stop_on_action_chars else None
         prefix_tokens = None
         if force_action_prefix:
             if temperature != 0.0:
@@ -1231,27 +1297,11 @@ class PI0FastTokenLogitAdapter:
         action_char_counts = torch.zeros((bsize,), dtype=torch.long, device=device)
         stopped_by_chars = torch.zeros((bsize,), dtype=torch.bool, device=device)
 
-        def token_action_char_count(token_id: int) -> int:
-            if not stop_on_action_chars or int(token_id) == action_end_token_id:
-                return 0
-            try:
-                raw = self.policy._paligemma_tokens_to_act_tokens(
-                    torch.tensor([int(token_id)], dtype=torch.long, device=device)
-                )
-                decoded = self.policy.action_tokenizer.bpe_tokenizer.decode(int(raw[0].item()))
-            except Exception:
-                return 0
-            return len(decoded)
-
         def record_action_chars(selected: torch.Tensor) -> torch.Tensor:
-            if not stop_on_action_chars:
+            if action_char_lookup is None:
                 return torch.zeros_like(selected, dtype=torch.bool)
-            increments = [
-                token_action_char_count(int(token_id))
-                for token_id in selected.detach().cpu().tolist()
-            ]
-            if increments:
-                action_char_counts[active_indices] += torch.tensor(increments, dtype=torch.long, device=device)
+            increments = action_char_lookup.index_select(0, selected).to(dtype=action_char_counts.dtype)
+            action_char_counts[active_indices] += increments
             reached = action_char_counts[active_indices] >= int(action_char_target)
             stopped_by_chars[active_indices] |= reached
             return reached

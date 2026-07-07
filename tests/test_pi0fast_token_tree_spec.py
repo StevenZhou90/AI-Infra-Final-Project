@@ -75,12 +75,17 @@ class _CharStopTokenizer:
 
 
 class _CharStopBpe:
+    def __init__(self) -> None:
+        self.decode_calls = 0
+
     def decode(self, token_id: int) -> str:
+        self.decode_calls += 1
         return {0: "abcd", 1: "efgh", 2: "ijkl"}.get(int(token_id), "")
 
 
 class _CharStopActionTokenizer:
-    bpe_tokenizer = _CharStopBpe()
+    def __init__(self) -> None:
+        self.bpe_tokenizer = _CharStopBpe()
 
 
 class _CharStopModel:
@@ -128,7 +133,7 @@ class _CharStopPolicy:
 
     def _paligemma_tokens_to_act_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
         mapping = {90: 0, 91: 1, 92: 2}
-        return tokens.new_tensor([mapping.get(int(token.item()), 0) for token in tokens])
+        return tokens.new_tensor([mapping.get(int(token.item()), 10_000) for token in tokens])
 
 
 def test_pi0fast_action_end_decode_can_stop_after_action_chars() -> None:
@@ -149,6 +154,27 @@ def test_pi0fast_action_end_decode_can_stop_after_action_chars() -> None:
     assert adapter._last_action_char_target == 8
     assert adapter._last_action_char_stop_count == 1
     assert adapter._last_action_char_count_mean == 8.0
+
+
+def test_pi0fast_action_char_lookup_avoids_hot_loop_tokenizer_decode() -> None:
+    policy = _CharStopPolicy()
+    adapter = PI0FastTokenLogitAdapter(policy)
+    adapter._match_model_precision = lambda tensor: tensor
+    adapter._action_key = lambda: "action"
+
+    adapter.prepare_action_char_length_lookup(device="cpu")
+    warmed_decode_calls = policy.action_tokenizer.bpe_tokenizer.decode_calls
+    token_ids = adapter.sample_actions_fast_kv_cache_action_end(
+        images=torch.empty(1),
+        img_masks=torch.empty(1),
+        tokens=torch.zeros((1, 2), dtype=torch.long),
+        masks=torch.ones((1, 2), dtype=torch.bool),
+        max_decoding_steps=8,
+        stop_on_action_chars=True,
+    )
+
+    assert token_ids.tolist() == [[90, 91, 99]]
+    assert policy.action_tokenizer.bpe_tokenizer.decode_calls == warmed_decode_calls
 
 
 class _BranchingDrafter:
