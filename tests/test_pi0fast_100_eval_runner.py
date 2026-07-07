@@ -135,6 +135,29 @@ def test_manifest_auto_validates_target_cutoff_candidate() -> None:
     assert "target_cutoff96_validate" in manifest["gate_command"]
 
 
+def test_manifest_auto_validates_target_eos_constrained_candidate_without_reference_speedup() -> None:
+    manifest = build_manifest(
+        _args(
+            speed_modes="baseline,target_eos,target_eos_constrained_noforce",
+            candidate_mode="target_eos_constrained_noforce",
+        ),
+        [
+            "--target-eos-constrained-full-head-margin",
+            "1.0",
+            "--target-eos-constrained-no-force-prefix",
+        ],
+    )
+
+    assert manifest["reference_mode"] == "target_eos"
+    assert manifest["validation_modes"] == ["target_eos_constrained_noforce_validate", "target_eos_validate"]
+    assert manifest["gate_validation_mode"] == "target_eos_constrained_noforce_validate"
+    assert manifest["extra_gate_validation_modes"] == ["target_eos_validate"]
+    assert manifest["min_reference_speedup"] is None
+    assert "--min-reference-speedup" not in manifest["gate_command"]
+    assert "--target-eos-constrained-full-head-margin" in manifest["eval_extra_args"]
+    assert "--target-eos-constrained-no-force-prefix" in manifest["eval_extra_args"]
+
+
 def test_eval_metadata_extracts_pi05_policy_args() -> None:
     metadata = eval_metadata(["--policy-kind", "pi05", "--num-inference-steps=8", "--policy", "local/pi05"])
 

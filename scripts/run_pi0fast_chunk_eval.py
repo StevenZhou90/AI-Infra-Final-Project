@@ -353,6 +353,9 @@ def _predict_target_eos_chunk(
     constrained_action_vocab: bool = False,
     constrained_action_vocab_size: int | None = None,
     constrained_text_vocab_size: int | None = None,
+    constrained_full_head_margin: float | None = None,
+    constrained_force_action_prefix: bool = True,
+    constrained_structural_token_radius: int = 512,
     force_action_prefix: bool = False,
 ) -> PredictionTrace:
     if device.startswith("cuda") and torch.cuda.is_available():
@@ -364,6 +367,9 @@ def _predict_target_eos_chunk(
             constrained_action_vocab=True,
             constrained_action_vocab_size=constrained_action_vocab_size,
             constrained_text_vocab_size=constrained_text_vocab_size,
+            constrained_full_head_margin=constrained_full_head_margin,
+            constrained_force_action_prefix=constrained_force_action_prefix,
+            constrained_structural_token_radius=constrained_structural_token_radius,
             force_action_prefix=force_action_prefix,
         )
     else:
@@ -1076,6 +1082,9 @@ def run_episode(
     adaptive_prefix_gate_threshold: float,
     target_eos_constrained_action_vocab_size: int,
     target_eos_constrained_text_vocab_size: int,
+    target_eos_constrained_full_head_margin: float | None,
+    target_eos_constrained_no_force_prefix: bool,
+    target_eos_constrained_structural_token_radius: int,
     token_trace_sink: TokenTraceSink | None,
     device: str,
     use_amp: bool,
@@ -2084,6 +2093,11 @@ def run_episode(
                                 constrained_action_vocab="constrained" in mode,
                                 constrained_action_vocab_size=target_eos_constrained_action_vocab_size,
                                 constrained_text_vocab_size=target_eos_constrained_text_vocab_size,
+                                constrained_full_head_margin=target_eos_constrained_full_head_margin,
+                                constrained_force_action_prefix=not (
+                                    target_eos_constrained_no_force_prefix or "_noforce" in mode
+                                ),
+                                constrained_structural_token_radius=target_eos_constrained_structural_token_radius,
                                 force_action_prefix="_prefix" in mode,
                             )
                         controller.stats.record_trace_stats(prediction.stats)
@@ -2417,6 +2431,26 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=8192,
         help="Low-token text/special span for target_eos_constrained modes.",
+    )
+    parser.add_argument(
+        "--target-eos-constrained-full-head-margin",
+        type=float,
+        default=-1.0,
+        help=(
+            "If non-negative, target_eos_constrained modes fall back to the full lm_head when the "
+            "restricted top-1/top-2 logit margin is below this value."
+        ),
+    )
+    parser.add_argument(
+        "--target-eos-constrained-no-force-prefix",
+        action="store_true",
+        help="Let constrained target_eos choose the Action prefix through the restricted/full-head path.",
+    )
+    parser.add_argument(
+        "--target-eos-constrained-structural-token-radius",
+        type=int,
+        default=512,
+        help="Include token ids within this radius of the PI0-FAST action-end token in constrained modes.",
     )
     parser.add_argument(
         "--num-inference-steps",
@@ -3444,6 +3478,13 @@ def main() -> None:
                     adaptive_prefix_gate_threshold=args.adaptive_prefix_gate_threshold,
                     target_eos_constrained_action_vocab_size=args.target_eos_constrained_action_vocab_size,
                     target_eos_constrained_text_vocab_size=args.target_eos_constrained_text_vocab_size,
+                    target_eos_constrained_full_head_margin=(
+                        None
+                        if args.target_eos_constrained_full_head_margin < 0
+                        else args.target_eos_constrained_full_head_margin
+                    ),
+                    target_eos_constrained_no_force_prefix=args.target_eos_constrained_no_force_prefix,
+                    target_eos_constrained_structural_token_radius=args.target_eos_constrained_structural_token_radius,
                     token_trace_sink=token_trace_sink,
                     device=str(device),
                     use_amp=args.use_amp,
@@ -3474,6 +3515,9 @@ def main() -> None:
         "disable_gradient_checkpointing": args.disable_gradient_checkpointing,
         "target_eos_constrained_action_vocab_size": args.target_eos_constrained_action_vocab_size,
         "target_eos_constrained_text_vocab_size": args.target_eos_constrained_text_vocab_size,
+        "target_eos_constrained_full_head_margin": args.target_eos_constrained_full_head_margin,
+        "target_eos_constrained_no_force_prefix": args.target_eos_constrained_no_force_prefix,
+        "target_eos_constrained_structural_token_radius": args.target_eos_constrained_structural_token_radius,
         "num_inference_steps": args.num_inference_steps,
         "task": args.task,
         "task_id": args.task_id,

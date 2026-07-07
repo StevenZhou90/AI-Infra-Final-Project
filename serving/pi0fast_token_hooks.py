@@ -118,6 +118,9 @@ class PI0FastTokenLogitAdapter:
         constrained_action_vocab: bool = False,
         constrained_action_vocab_size: int | None = None,
         constrained_text_vocab_size: int | None = None,
+        constrained_full_head_margin: float | None = None,
+        constrained_force_action_prefix: bool = True,
+        constrained_structural_token_radius: int = 512,
         force_action_prefix: bool = False,
     ) -> PI0FastGenerationTrace:
         """Serving-oriented greedy decode that stops on the FAST action-end token.
@@ -146,6 +149,9 @@ class PI0FastTokenLogitAdapter:
                 temperature=decode_temperature,
                 action_vocab_size=constrained_action_vocab_size,
                 text_vocab_size=constrained_text_vocab_size,
+                full_head_margin=constrained_full_head_margin,
+                force_action_prefix=constrained_force_action_prefix,
+                structural_token_radius=constrained_structural_token_radius,
             )
             mode = "action_end_constrained_no_logits"
         elif self.policy.config.use_kv_cache:
@@ -187,6 +193,18 @@ class PI0FastTokenLogitAdapter:
                 "constrained_candidate_size": int(getattr(self, "_last_constrained_candidate_size", 0)),
                 "constrained_action_vocab_size": int(getattr(self, "_last_constrained_action_vocab_size", 0)),
                 "constrained_text_vocab_size": int(getattr(self, "_last_constrained_text_vocab_size", 0)),
+                "constrained_structural_token_radius": int(
+                    getattr(self, "_last_constrained_structural_token_radius", 0)
+                ),
+                "constrained_force_action_prefix": int(bool(getattr(self, "_last_constrained_force_action_prefix", False))),
+                "constrained_full_head_margin": float(getattr(self, "_last_constrained_full_head_margin", -1.0)),
+                "constrained_full_head_fallbacks": int(getattr(self, "_last_constrained_full_head_fallbacks", 0)),
+                "constrained_restricted_head_calls": int(getattr(self, "_last_constrained_restricted_head_calls", 0)),
+                "constrained_full_head_fallback_rate": float(
+                    getattr(self, "_last_constrained_full_head_fallback_rate", 0.0)
+                ),
+                "constrained_margin_min": float(getattr(self, "_last_constrained_margin_min", 0.0)),
+                "constrained_margin_mean": float(getattr(self, "_last_constrained_margin_mean", 0.0)),
                 "forced_action_prefix": int(bool(force_action_prefix)),
                 "forced_action_prefix_tokens": int(getattr(self, "_last_forced_action_prefix_token_count", 0)),
             },
@@ -1263,6 +1281,9 @@ class PI0FastTokenLogitAdapter:
         temperature: float = 0.0,
         action_vocab_size: int | None = None,
         text_vocab_size: int | None = None,
+        full_head_margin: float | None = None,
+        force_action_prefix: bool = True,
+        structural_token_radius: int = 512,
     ) -> torch.Tensor:
         """KV-cache FAST decode using the known PI0-FAST action-token support.
 
@@ -1303,9 +1324,11 @@ class PI0FastTokenLogitAdapter:
             text_vocab_size = 8192
         action_vocab_size = max(int(getattr(self.policy.action_tokenizer, "vocab_size", 1024)), int(action_vocab_size))
         text_vocab_size = min(paligemma_vocab_size, max(0, int(text_vocab_size)))
+        structural_token_radius = max(0, int(structural_token_radius))
         candidate_cache_key = (
             int(action_vocab_size),
             int(text_vocab_size),
+            int(structural_token_radius),
             str(device),
             str(lm_head.weight.dtype),
             int(lm_head.weight.data_ptr()),
@@ -1320,9 +1343,13 @@ class PI0FastTokenLogitAdapter:
             )
             action_token_ids = action_token_ids[(action_token_ids >= 0) & (action_token_ids < paligemma_vocab_size)]
             text_token_ids = torch.arange(text_vocab_size, dtype=torch.long, device=device)
+            structural_start = max(0, action_end_token_id - structural_token_radius)
+            structural_end = min(paligemma_vocab_size, action_end_token_id + structural_token_radius + 1)
+            structural_token_ids = torch.arange(structural_start, structural_end, dtype=torch.long, device=device)
             candidate_ids = torch.cat(
                 [
                     text_token_ids,
+                    structural_token_ids,
                     action_token_ids,
                     prefix_tokens,
                     torch.tensor([action_end_token_id], dtype=torch.long, device=device),
@@ -1337,6 +1364,7 @@ class PI0FastTokenLogitAdapter:
                 "candidate_size": int(candidate_ids.numel()),
                 "action_vocab_size": int(action_vocab_size),
                 "text_vocab_size": int(text_vocab_size),
+                "structural_token_radius": int(structural_token_radius),
             }
             self._constrained_lm_head_cache = cached
         candidate_ids = cached["candidate_ids"]
@@ -1344,11 +1372,48 @@ class PI0FastTokenLogitAdapter:
         self._last_constrained_candidate_size = int(candidate_ids.numel())
         self._last_constrained_action_vocab_size = int(cached["action_vocab_size"])
         self._last_constrained_text_vocab_size = int(cached["text_vocab_size"])
+        self._last_constrained_structural_token_radius = int(cached["structural_token_radius"])
+        self._last_constrained_force_action_prefix = int(bool(force_action_prefix))
+        self._last_forced_action_prefix_token_count = int(prefix_tokens.numel()) if force_action_prefix else 0
+        self._last_constrained_full_head_margin = float(full_head_margin) if full_head_margin is not None else -1.0
+        self._last_constrained_full_head_fallbacks = 0
+        self._last_constrained_restricted_head_calls = 0
+        self._last_constrained_full_head_fallback_rate = 0.0
+        self._last_constrained_margin_min = 0.0
+        self._last_constrained_margin_mean = 0.0
+        restricted_head_calls = 0
+        full_head_fallbacks = 0
+        margin_min = float("inf")
+        margin_sum = 0.0
 
         def restricted_next(hidden: torch.Tensor) -> torch.Tensor:
+            nonlocal restricted_head_calls, full_head_fallbacks, margin_min, margin_sum
             logits = F.linear(hidden, candidate_weight)
-            local = torch.argmax(logits[:, -1, :], dim=-1)
+            step_logits = logits[:, -1, :].float()
+            restricted_head_calls += int(step_logits.shape[0])
+            if step_logits.shape[-1] >= 2:
+                top_values, top_indices = torch.topk(step_logits, k=2, dim=-1)
+                margins = top_values[:, 0] - top_values[:, 1]
+                margin_min = min(margin_min, float(torch.min(margins).item()))
+                margin_sum += float(torch.sum(margins).item())
+                local = top_indices[:, 0]
+                if full_head_margin is not None and bool(torch.any(margins < float(full_head_margin))):
+                    full_head_fallbacks += int(step_logits.shape[0])
+                    return torch.argmax(lm_head(hidden)[:, -1, :], dim=-1, keepdim=True)
+            else:
+                local = torch.argmax(step_logits, dim=-1)
             return candidate_ids.index_select(0, local).unsqueeze(-1)
+
+        def finish_constrained_stats() -> None:
+            self._last_constrained_full_head_fallbacks = int(full_head_fallbacks)
+            self._last_constrained_restricted_head_calls = int(restricted_head_calls)
+            self._last_constrained_full_head_fallback_rate = (
+                float(full_head_fallbacks) / float(restricted_head_calls) if restricted_head_calls else 0.0
+            )
+            self._last_constrained_margin_min = float(margin_min if margin_min != float("inf") else 0.0)
+            self._last_constrained_margin_mean = (
+                float(margin_sum) / float(restricted_head_calls) if restricted_head_calls else 0.0
+            )
 
         bos_token = torch.full(
             (bsize, 1),
@@ -1369,7 +1434,7 @@ class PI0FastTokenLogitAdapter:
         prefix_embs = self._match_model_precision(prefix_embs)
         position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         att_4d = self.model._prepare_attention_masks_4d(prefix_att_masks, dtype=prefix_embs.dtype)
-        (_prefix_out, _), past_key_values = self.model.paligemma_with_expert.forward(
+        (prefix_out, _), past_key_values = self.model.paligemma_with_expert.forward(
             attention_mask=att_4d,
             position_ids=position_ids,
             past_key_values=None,
@@ -1378,12 +1443,26 @@ class PI0FastTokenLogitAdapter:
             adarms_cond=[None, None],
         )
 
-        next_token = prefix_tokens[0].view(1, 1).expand(bsize, 1)
         generated = torch.full((bsize, max_decoding_steps), action_end_token_id, dtype=torch.long, device=device)
+        if force_action_prefix:
+            next_token = prefix_tokens[0].view(1, 1).expand(bsize, 1)
+        else:
+            next_token = restricted_next(prefix_out[:, -1:, :])
         generated[:, 0] = next_token.squeeze(-1)
         current_pad_mask = prefix_pad_masks
         active_indices = torch.arange(bsize, dtype=torch.long, device=device)
         emitted_lengths = torch.ones((bsize,), dtype=torch.long, device=device)
+        finished = next_token.squeeze(-1) == action_end_token_id
+        if bool(torch.all(finished)):
+            finish_constrained_stats()
+            self._last_action_end_row_token_counts = emitted_lengths.detach().cpu().tolist()
+            return generated[:, :1]
+        if bool(torch.any(finished)):
+            keep = torch.nonzero(~finished, as_tuple=False).flatten()
+            past_key_values = past_key_values.batch_select_indices(keep)
+            current_pad_mask = current_pad_mask[keep]
+            next_token = next_token[keep]
+            active_indices = active_indices[keep]
 
         for t in range(1, max_decoding_steps):
             next_token_emb = self.model.paligemma_with_expert.embed_language_tokens(next_token)
@@ -1407,7 +1486,7 @@ class PI0FastTokenLogitAdapter:
                 use_cache=True,
                 adarms_cond=[None, None],
             )
-            if t < int(prefix_tokens.numel()):
+            if force_action_prefix and t < int(prefix_tokens.numel()):
                 next_token = prefix_tokens[t].view(1, 1).expand(active_bsize, 1)
             else:
                 next_token = restricted_next(step_out[:, -1:, :])
@@ -1417,6 +1496,7 @@ class PI0FastTokenLogitAdapter:
             finished = selected == action_end_token_id
             if bool(torch.all(finished)):
                 max_len = int(emitted_lengths.max().item())
+                finish_constrained_stats()
                 self._last_action_end_row_token_counts = emitted_lengths.detach().cpu().tolist()
                 return generated[:, :max_len]
             if bool(torch.any(finished)):
@@ -1426,6 +1506,7 @@ class PI0FastTokenLogitAdapter:
                 next_token = next_token[keep]
                 active_indices = active_indices[keep]
 
+        finish_constrained_stats()
         self._last_action_end_row_token_counts = emitted_lengths.detach().cpu().tolist()
         return generated
 

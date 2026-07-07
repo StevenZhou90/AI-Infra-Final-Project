@@ -53,6 +53,8 @@ def eval_metadata(extra_args: list[str]) -> dict[str, str]:
 def default_validation_mode(candidate_mode: str) -> str:
     if candidate_mode.startswith("target_eos_prefix"):
         return "target_eos_prefix_validate"
+    if candidate_mode.startswith("target_eos_constrained") and "validate" not in candidate_mode:
+        return f"{candidate_mode}_validate"
     if candidate_mode.startswith("target_cutoff") and "validate" not in candidate_mode:
         return f"{candidate_mode}_validate"
     if candidate_mode == "target_eos":
@@ -995,7 +997,8 @@ def build_manifest(args: argparse.Namespace, extra_args: list[str]) -> dict[str,
     min_reference_speedup = args.min_reference_speedup
     max_reference_success_drop = args.max_reference_success_drop
     max_reference_success_regressions = args.max_reference_success_regressions
-    if args.candidate_mode != "target_eos" and reference_mode == "target_eos":
+    candidate_is_target_eos_variant = args.candidate_mode.startswith("target_eos_")
+    if args.candidate_mode != "target_eos" and reference_mode == "target_eos" and not candidate_is_target_eos_variant:
         if min_reference_speedup is None:
             min_reference_speedup = args.min_speedup
         if max_reference_success_drop is None:
