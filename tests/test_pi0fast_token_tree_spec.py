@@ -52,6 +52,105 @@ class _FakePolicy:
         return None
 
 
+class _FakePast:
+    def batch_select_indices(self, _indices: torch.Tensor) -> "_FakePast":
+        return self
+
+
+class _CharStopTokenizer:
+    bos_token_id = 1
+    vocab_size = 200
+
+    def convert_tokens_to_ids(self, token: str):
+        if token == "|":
+            return 99
+        return 0
+
+    def encode(self, text: str, add_special_tokens: bool = False):
+        if text == "Action: ":
+            return [2, 3, 4]
+        if text == "|":
+            return [99]
+        return []
+
+
+class _CharStopBpe:
+    def decode(self, token_id: int) -> str:
+        return {0: "abcd", 1: "efgh", 2: "ijkl"}.get(int(token_id), "")
+
+
+class _CharStopActionTokenizer:
+    bpe_tokenizer = _CharStopBpe()
+
+
+class _CharStopModel:
+    def __init__(self) -> None:
+        self.config = SimpleNamespace(max_action_tokens=8)
+        self._paligemma_tokenizer = _CharStopTokenizer()
+        self._targets = [90, 91, 92, 99]
+        self._forward_calls = 0
+        self.paligemma_with_expert = SimpleNamespace(
+            paligemma=SimpleNamespace(lm_head=_IdentityHead()),
+            embed_language_tokens=_FakeTokenEmbedding(200),
+            forward=self.forward,
+        )
+
+    def embed_prefix_fast(self, images, img_masks, tokens, masks, fast_action_tokens=None, fast_action_masks=None):
+        batch = int(tokens.shape[0])
+        embs = torch.zeros((batch, 3, 200), dtype=torch.float32)
+        pad = torch.ones((batch, 3), dtype=torch.bool)
+        return embs, pad, pad.unsqueeze(1), None, 0
+
+    def _prepare_attention_masks_4d(self, mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        return mask
+
+    def forward(self, *, attention_mask, position_ids, past_key_values, inputs_embeds, use_cache, adarms_cond):
+        batch = int(inputs_embeds[0].shape[0])
+        seq_len = int(inputs_embeds[0].shape[1])
+        hidden = torch.zeros((batch, seq_len, 200), dtype=torch.float32)
+        token = self._targets[min(self._forward_calls, len(self._targets) - 1)]
+        hidden[:, -1, token] = 100.0
+        self._forward_calls += 1
+        return (hidden, None), _FakePast()
+
+
+class _CharStopPolicy:
+    def __init__(self) -> None:
+        self.model = _CharStopModel()
+        self.action_tokenizer = _CharStopActionTokenizer()
+        self.config = SimpleNamespace(
+            n_action_steps=2,
+            output_features={"action": SimpleNamespace(shape=(4,))},
+        )
+
+    def eval(self) -> None:
+        return None
+
+    def _paligemma_tokens_to_act_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
+        mapping = {90: 0, 91: 1, 92: 2}
+        return tokens.new_tensor([mapping.get(int(token.item()), 0) for token in tokens])
+
+
+def test_pi0fast_action_end_decode_can_stop_after_action_chars() -> None:
+    adapter = PI0FastTokenLogitAdapter(_CharStopPolicy())
+    adapter._match_model_precision = lambda tensor: tensor
+    adapter._action_key = lambda: "action"
+
+    token_ids = adapter.sample_actions_fast_kv_cache_action_end(
+        images=torch.empty(1),
+        img_masks=torch.empty(1),
+        tokens=torch.zeros((1, 2), dtype=torch.long),
+        masks=torch.ones((1, 2), dtype=torch.bool),
+        max_decoding_steps=8,
+        stop_on_action_chars=True,
+    )
+
+    assert token_ids.tolist() == [[90, 91, 99]]
+    assert adapter._last_action_char_target == 8
+    assert adapter._last_action_char_stop_count == 1
+    assert adapter._last_action_char_count_mean == 8.0
+
+
 class _BranchingDrafter:
     def __init__(self, target: list[int]) -> None:
         self.target = target

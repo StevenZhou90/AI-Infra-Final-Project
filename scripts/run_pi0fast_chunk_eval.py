@@ -358,6 +358,7 @@ def _predict_target_eos_chunk(
     constrained_structural_token_radius: int = 512,
     constrained_full_head_prefix_tokens: int = 0,
     force_action_prefix: bool = False,
+    stop_on_action_chars: bool = False,
 ) -> PredictionTrace:
     if device.startswith("cuda") and torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -373,11 +374,13 @@ def _predict_target_eos_chunk(
             constrained_structural_token_radius=constrained_structural_token_radius,
             constrained_full_head_prefix_tokens=constrained_full_head_prefix_tokens,
             force_action_prefix=force_action_prefix,
+            stop_on_action_chars=stop_on_action_chars,
         )
     else:
         trace = token_adapter.predict_action_chunk_action_end(
             batch,
             force_action_prefix=force_action_prefix,
+            stop_on_action_chars=stop_on_action_chars,
         )
     if device.startswith("cuda") and torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -2103,6 +2106,7 @@ def run_episode(
                                 constrained_structural_token_radius=target_eos_constrained_structural_token_radius,
                                 constrained_full_head_prefix_tokens=target_eos_constrained_full_head_prefix_tokens,
                                 force_action_prefix="_prefix" in mode,
+                                stop_on_action_chars="_charstop" in mode,
                             )
                         controller.stats.record_trace_stats(prediction.stats)
                     else:

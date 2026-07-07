@@ -15,9 +15,11 @@ class _FakeTokenAdapter:
         self.action_end_calls = 0
         self.cutoff_calls = 0
         self.trace_calls = 0
+        self.action_end_kwargs = {}
 
-    def predict_action_chunk_action_end(self, batch, **_kwargs):
+    def predict_action_chunk_action_end(self, batch, **kwargs):
         self.action_end_calls += 1
+        self.action_end_kwargs = dict(kwargs)
         return PI0FastGenerationTrace(
             actions=torch.tensor([[[1.0, 2.0], [3.0, 4.0]]]),
             token_ids=torch.tensor([[10, 20, 30]]),
@@ -57,6 +59,21 @@ def test_target_eos_chunk_uses_no_logits_action_end_path() -> None:
     assert prediction.token_count == 3
     assert prediction.token_ids.tolist() == [[10, 20, 30]]
     assert prediction.stats["mode"] == "action_end_no_logits"
+
+
+def test_target_eos_chunk_can_request_action_char_stop() -> None:
+    adapter = _FakeTokenAdapter()
+
+    _predict_target_eos_chunk(
+        adapter,
+        batch={},
+        postprocessor=lambda action: action,
+        device="cpu",
+        stop_on_action_chars=True,
+    )
+
+    assert adapter.action_end_calls == 1
+    assert adapter.action_end_kwargs["stop_on_action_chars"] is True
 
 
 def test_prefix_cutoff_chunk_uses_no_logits_path_by_default() -> None:

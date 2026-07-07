@@ -135,6 +135,21 @@ def test_manifest_auto_validates_target_cutoff_candidate() -> None:
     assert "target_cutoff96_validate" in manifest["gate_command"]
 
 
+def test_manifest_auto_validates_target_eos_charstop_candidate() -> None:
+    manifest = build_manifest(
+        _args(
+            speed_modes="baseline,target_eos,target_eos_charstop",
+            candidate_mode="target_eos_charstop",
+        ),
+        [],
+    )
+
+    assert manifest["reference_mode"] == "target_eos"
+    assert manifest["validation_modes"] == ["target_eos_charstop_validate", "target_eos_validate"]
+    assert manifest["gate_validation_mode"] == "target_eos_charstop_validate"
+    assert manifest["extra_gate_validation_modes"] == ["target_eos_validate"]
+
+
 def test_manifest_auto_validates_target_eos_constrained_candidate_without_reference_speedup() -> None:
     manifest = build_manifest(
         _args(

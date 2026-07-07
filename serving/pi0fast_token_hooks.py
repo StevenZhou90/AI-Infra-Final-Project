@@ -123,6 +123,7 @@ class PI0FastTokenLogitAdapter:
         constrained_structural_token_radius: int = 512,
         constrained_full_head_prefix_tokens: int = 0,
         force_action_prefix: bool = False,
+        stop_on_action_chars: bool = False,
     ) -> PI0FastGenerationTrace:
         """Serving-oriented greedy decode that stops on the FAST action-end token.
 
@@ -165,6 +166,7 @@ class PI0FastTokenLogitAdapter:
                 max_decoding_steps=max_steps,
                 temperature=decode_temperature,
                 force_action_prefix=force_action_prefix,
+                stop_on_action_chars=stop_on_action_chars,
             )
             mode = "action_end_prefix_no_logits" if force_action_prefix else "action_end_no_logits"
         else:
@@ -215,6 +217,10 @@ class PI0FastTokenLogitAdapter:
                 "constrained_margin_mean": float(getattr(self, "_last_constrained_margin_mean", 0.0)),
                 "forced_action_prefix": int(bool(force_action_prefix)),
                 "forced_action_prefix_tokens": int(getattr(self, "_last_forced_action_prefix_token_count", 0)),
+                "stop_on_action_chars": int(bool(stop_on_action_chars)),
+                "action_char_target": int(getattr(self, "_last_action_char_target", 0)),
+                "action_char_stop_count": int(getattr(self, "_last_action_char_stop_count", 0)),
+                "action_char_count_mean": float(getattr(self, "_last_action_char_count_mean", 0.0)),
             },
         )
 
@@ -1153,6 +1159,7 @@ class PI0FastTokenLogitAdapter:
         max_decoding_steps: int | None = None,
         temperature: float = 0.0,
         force_action_prefix: bool = False,
+        stop_on_action_chars: bool = False,
     ) -> torch.Tensor:
         """KV-cache FAST decode with per-row action-end compaction.
 
@@ -1167,6 +1174,15 @@ class PI0FastTokenLogitAdapter:
         device = tokens.device
         lm_head = self.model.paligemma_with_expert.paligemma.lm_head
         action_end_token_id = self._action_end_token_id()
+        action_char_target = 0
+        if stop_on_action_chars:
+            if temperature != 0.0:
+                raise ValueError("PI0-FAST action-char stop currently supports greedy temperature=0 only")
+            action_dim = self.policy.config.output_features[self._action_key()].shape[0]
+            action_char_target = int(self.policy.config.n_action_steps) * int(action_dim)
+        self._last_action_char_target = int(action_char_target)
+        self._last_action_char_stop_count = 0
+        self._last_action_char_count_mean = 0.0
         prefix_tokens = None
         if force_action_prefix:
             if temperature != 0.0:
@@ -1207,10 +1223,46 @@ class PI0FastTokenLogitAdapter:
             use_cache=True,
             adarms_cond=[None, None],
         )
-        generated = torch.full((bsize, max_decoding_steps), action_end_token_id, dtype=torch.long, device=device)
+        generated_width = int(max_decoding_steps) + (1 if stop_on_action_chars else 0)
+        generated = torch.full((bsize, generated_width), action_end_token_id, dtype=torch.long, device=device)
         current_pad_mask = prefix_pad_masks
         active_indices = torch.arange(bsize, dtype=torch.long, device=device)
         emitted_lengths = torch.zeros((bsize,), dtype=torch.long, device=device)
+        action_char_counts = torch.zeros((bsize,), dtype=torch.long, device=device)
+        stopped_by_chars = torch.zeros((bsize,), dtype=torch.bool, device=device)
+
+        def token_action_char_count(token_id: int) -> int:
+            if not stop_on_action_chars or int(token_id) == action_end_token_id:
+                return 0
+            try:
+                raw = self.policy._paligemma_tokens_to_act_tokens(
+                    torch.tensor([int(token_id)], dtype=torch.long, device=device)
+                )
+                decoded = self.policy.action_tokenizer.bpe_tokenizer.decode(int(raw[0].item()))
+            except Exception:
+                return 0
+            return len(decoded)
+
+        def record_action_chars(selected: torch.Tensor) -> torch.Tensor:
+            if not stop_on_action_chars:
+                return torch.zeros_like(selected, dtype=torch.bool)
+            increments = [
+                token_action_char_count(int(token_id))
+                for token_id in selected.detach().cpu().tolist()
+            ]
+            if increments:
+                action_char_counts[active_indices] += torch.tensor(increments, dtype=torch.long, device=device)
+            reached = action_char_counts[active_indices] >= int(action_char_target)
+            stopped_by_chars[active_indices] |= reached
+            return reached
+
+        def finish_return(max_len: int) -> torch.Tensor:
+            self._last_action_end_row_token_counts = emitted_lengths.detach().cpu().tolist()
+            if stop_on_action_chars:
+                self._last_action_char_stop_count = int(stopped_by_chars.sum().item())
+                self._last_action_char_count_mean = float(action_char_counts.float().mean().item())
+                return generated[:, : min(int(max_len) + 1, generated_width)]
+            return generated[:, : int(max_len)]
 
         if prefix_tokens is not None:
             next_token = prefix_tokens[0].view(1, 1).expand(bsize, 1)
@@ -1223,10 +1275,11 @@ class PI0FastTokenLogitAdapter:
             emitted_lengths[:] = 1
             loop_start = 1
 
-        finished = next_token.squeeze(-1) == action_end_token_id
+        selected = next_token.squeeze(-1)
+        finished_by_chars = record_action_chars(selected)
+        finished = (selected == action_end_token_id) | finished_by_chars
         if bool(torch.all(finished)):
-            self._last_action_end_row_token_counts = emitted_lengths.detach().cpu().tolist()
-            return generated[:, :1]
+            return finish_return(1)
         keep = torch.nonzero(~finished, as_tuple=False).flatten()
         if keep.numel() != bsize:
             past_key_values = past_key_values.batch_select_indices(keep)
@@ -1263,11 +1316,11 @@ class PI0FastTokenLogitAdapter:
             selected = next_token.squeeze(-1)
             generated[active_indices, t] = selected
             emitted_lengths[active_indices] = t + 1
-            finished = selected == action_end_token_id
+            finished_by_chars = record_action_chars(selected)
+            finished = (selected == action_end_token_id) | finished_by_chars
             if bool(torch.all(finished)):
                 max_len = int(emitted_lengths.max().item())
-                self._last_action_end_row_token_counts = emitted_lengths.detach().cpu().tolist()
-                return generated[:, :max_len]
+                return finish_return(max_len)
             if bool(torch.any(finished)):
                 keep = torch.nonzero(~finished, as_tuple=False).flatten()
                 past_key_values = past_key_values.batch_select_indices(keep)
@@ -1276,6 +1329,9 @@ class PI0FastTokenLogitAdapter:
                 active_indices = active_indices[keep]
 
         self._last_action_end_row_token_counts = emitted_lengths.detach().cpu().tolist()
+        if stop_on_action_chars:
+            self._last_action_char_stop_count = int(stopped_by_chars.sum().item())
+            self._last_action_char_count_mean = float(action_char_counts.float().mean().item())
         return generated
 
     @torch.no_grad()
