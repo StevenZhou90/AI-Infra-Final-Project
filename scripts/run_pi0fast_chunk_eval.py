@@ -363,6 +363,7 @@ def _predict_target_eos_chunk(
     action_char_plateau_tokens: int = 0,
     action_char_stable_checks: int = 0,
     action_char_stable_tolerance: float = 0.0,
+    action_char_plateau_reject_eos_restart: bool = False,
 ) -> PredictionTrace:
     if stop_on_action_chars and hasattr(token_adapter, "prepare_action_char_length_lookup"):
         token_adapter.prepare_action_char_length_lookup(device=device)
@@ -385,6 +386,7 @@ def _predict_target_eos_chunk(
             action_char_plateau_tokens=action_char_plateau_tokens,
             action_char_stable_checks=action_char_stable_checks,
             action_char_stable_tolerance=action_char_stable_tolerance,
+            action_char_plateau_reject_eos_restart=action_char_plateau_reject_eos_restart,
         )
     else:
         trace = token_adapter.predict_action_chunk_action_end(
@@ -395,6 +397,7 @@ def _predict_target_eos_chunk(
             action_char_plateau_tokens=action_char_plateau_tokens,
             action_char_stable_checks=action_char_stable_checks,
             action_char_stable_tolerance=action_char_stable_tolerance,
+            action_char_plateau_reject_eos_restart=action_char_plateau_reject_eos_restart,
         )
     if device.startswith("cuda") and torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -1109,6 +1112,7 @@ def run_episode(
     target_eos_action_char_plateau_tokens: int,
     target_eos_action_char_stable_checks: int,
     target_eos_action_char_stable_tolerance: float,
+    target_eos_action_char_plateau_reject_eos_restart: bool,
     token_trace_sink: TokenTraceSink | None,
     device: str,
     use_amp: bool,
@@ -2129,6 +2133,48 @@ def run_episode(
                                 action_char_plateau_tokens=target_eos_action_char_plateau_tokens,
                                 action_char_stable_checks=target_eos_action_char_stable_checks,
                                 action_char_stable_tolerance=target_eos_action_char_stable_tolerance,
+                                action_char_plateau_reject_eos_restart=(
+                                    target_eos_action_char_plateau_reject_eos_restart
+                                ),
+                            )
+                        restart_fallback_count = int(
+                            (prediction.stats or {}).get("action_char_restart_fallback_count", 0)
+                        )
+                        if restart_fallback_count > 0:
+                            with autocast_ctx:
+                                fallback_prediction = _predict_target_eos_chunk(
+                                    token_adapter,
+                                    batch,
+                                    policy_postprocessor,
+                                    device,
+                                    constrained_action_vocab="constrained" in mode,
+                                    constrained_action_vocab_size=target_eos_constrained_action_vocab_size,
+                                    constrained_text_vocab_size=target_eos_constrained_text_vocab_size,
+                                    constrained_full_head_margin=target_eos_constrained_full_head_margin,
+                                    constrained_force_action_prefix=not (
+                                        target_eos_constrained_no_force_prefix or "_noforce" in mode
+                                    ),
+                                    constrained_structural_token_radius=target_eos_constrained_structural_token_radius,
+                                    constrained_full_head_prefix_tokens=(
+                                        target_eos_constrained_full_head_prefix_tokens
+                                    ),
+                                    force_action_prefix="_prefix" in mode,
+                                    stop_on_action_chars=False,
+                                )
+                            controller.stats.guard_reasons.update(["target_eos_restart_fallback"])
+                            prediction = PredictionTrace(
+                                actions=fallback_prediction.actions,
+                                elapsed_ms=prediction.elapsed_ms + fallback_prediction.elapsed_ms,
+                                token_count=fallback_prediction.token_count,
+                                token_ids=fallback_prediction.token_ids,
+                                stats={
+                                    **(prediction.stats or {}),
+                                    "action_char_restart_fallback": 1.0,
+                                    "action_char_restart_fallback_ms": fallback_prediction.elapsed_ms,
+                                    "action_char_restart_fallback_token_count": float(
+                                        fallback_prediction.token_count or 0
+                                    ),
+                                },
                             )
                         controller.stats.record_trace_stats(prediction.stats)
                     else:
@@ -2186,16 +2232,66 @@ def run_episode(
                                     device,
                                     token_adapter=None,
                                 )
+                        token_reference_prediction = full_prediction
+                        candidate_trace_mode = f"{mode}_candidate"
+                        target_trace_mode = f"{mode}_target"
+                        wants_target_trace = (
+                            token_trace_sink is not None
+                            and (token_trace_sink.modes is None or target_trace_mode in token_trace_sink.modes)
+                        )
+                        if wants_target_trace and token_reference_prediction.token_ids is None:
+                            with autocast_ctx:
+                                token_reference_prediction = _predict_target_eos_chunk(
+                                    token_adapter,
+                                    batch,
+                                    policy_postprocessor,
+                                    device,
+                                )
                         horizon = min(len(prediction.actions), len(full_prediction.actions))
                         diff = np.abs(prediction.actions[:horizon] - full_prediction.actions[:horizon])
                         max_diff = float(np.max(diff)) if diff.size else 0.0
                         mean_diff = float(np.mean(diff)) if diff.size else 0.0
-                        controller.stats.record_trace_stats(
-                            _prediction_token_diff_stats(prediction, full_prediction, "target_eos")
-                        )
+                        target_eos_diff_stats = {
+                            **_prediction_token_diff_stats(prediction, token_reference_prediction, "target_eos"),
+                            "target_eos_action_max_diff": float(max_diff),
+                            "target_eos_action_mean_diff": float(mean_diff),
+                            "target_eos_candidate_elapsed_ms": float(prediction.elapsed_ms),
+                            "target_eos_reference_elapsed_ms": float(token_reference_prediction.elapsed_ms),
+                            "target_eos_candidate_token_count": float(prediction.token_count or 0),
+                            "target_eos_reference_token_count": float(token_reference_prediction.token_count or 0),
+                        }
+                        prediction.stats = {
+                            **(prediction.stats or {}),
+                            **target_eos_diff_stats,
+                        }
+                        token_reference_prediction.stats = {
+                            **(token_reference_prediction.stats or {}),
+                            "paired_candidate_mode": mode,
+                            **target_eos_diff_stats,
+                        }
+                        controller.stats.record_trace_stats(target_eos_diff_stats)
                         controller.stats.exact_verifies += 1
                         controller.stats.action_max_diffs.append(max_diff)
                         controller.stats.action_mean_diffs.append(mean_diff)
+                        if token_trace_sink is not None:
+                            token_trace_sink.record(
+                                prediction,
+                                mode=candidate_trace_mode,
+                                task=task,
+                                task_id=task_id,
+                                episode=episode,
+                                seed=seed,
+                                step=steps,
+                            )
+                            token_trace_sink.record(
+                                token_reference_prediction,
+                                mode=target_trace_mode,
+                                task=task,
+                                task_id=task_id,
+                                episode=episode,
+                                seed=seed,
+                                step=steps,
+                            )
                         if max_diff != 0.0:
                             controller.stats.guard_reasons.update(["target_eos_action_diff"])
                     chunk = prediction.actions
@@ -2523,6 +2619,14 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help="Maximum action delta considered stable for --target-eos-action-char-stable-checks.",
+    )
+    parser.add_argument(
+        "--target-eos-action-char-plateau-reject-eos-restart",
+        action="store_true",
+        help=(
+            "Block target_eos_charstop plateau stops when the no-character plateau tail emits EOS "
+            "and then resumes with a non-EOS token."
+        ),
     )
     parser.add_argument(
         "--num-inference-steps",
@@ -3571,6 +3675,9 @@ def main() -> None:
                     target_eos_action_char_plateau_tokens=args.target_eos_action_char_plateau_tokens,
                     target_eos_action_char_stable_checks=args.target_eos_action_char_stable_checks,
                     target_eos_action_char_stable_tolerance=args.target_eos_action_char_stable_tolerance,
+                    target_eos_action_char_plateau_reject_eos_restart=(
+                        args.target_eos_action_char_plateau_reject_eos_restart
+                    ),
                     token_trace_sink=token_trace_sink,
                     device=str(device),
                     use_amp=args.use_amp,
@@ -3609,6 +3716,9 @@ def main() -> None:
         "target_eos_action_char_plateau_tokens": args.target_eos_action_char_plateau_tokens,
         "target_eos_action_char_stable_checks": args.target_eos_action_char_stable_checks,
         "target_eos_action_char_stable_tolerance": args.target_eos_action_char_stable_tolerance,
+        "target_eos_action_char_plateau_reject_eos_restart": (
+            args.target_eos_action_char_plateau_reject_eos_restart
+        ),
         "num_inference_steps": args.num_inference_steps,
         "task": args.task,
         "task_id": args.task_id,

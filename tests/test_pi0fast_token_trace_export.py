@@ -18,7 +18,14 @@ def test_parse_token_trace_modes() -> None:
 
 def test_token_trace_sink_writes_lightweight_shards(tmp_path: Path) -> None:
     sink = TokenTraceSink(output_dir=tmp_path, modes={"target_eos"}, max_rows_per_shard=1)
-    prediction = SimpleNamespace(token_ids=torch.tensor([[11, 12, 13]]), stats={"action_end_token_id": 99})
+    prediction = SimpleNamespace(
+        token_ids=torch.tensor([[11, 12, 13]]),
+        stats={
+            "action_end_token_id": 99,
+            "target_eos_action_max_diff": 0.25,
+            "trace_stats": {"action_char_plateau_stop_count": 1},
+        },
+    )
 
     sink.record(
         prediction,
@@ -49,3 +56,6 @@ def test_token_trace_sink_writes_lightweight_shards(tmp_path: Path) -> None:
     assert records[0].seed == 44
     assert records[0].stop_token_ids == (99,)
     assert "modetarget_eos" in records[0].trace_id
+    raw_rows = torch.load(shard_files[0], weights_only=False)
+    assert raw_rows[0]["stats"]["target_eos_action_max_diff"] == 0.25
+    assert raw_rows[0]["stats"]["trace_stats.action_char_plateau_stop_count"] == 1

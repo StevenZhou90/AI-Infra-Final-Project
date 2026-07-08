@@ -9,6 +9,24 @@ from typing import Any
 import torch
 
 
+def _flatten_scalar_stats(stats: dict[str, Any], prefix: str = "") -> dict[str, int | float | str | bool]:
+    flattened: dict[str, int | float | str | bool] = {}
+    for key, value in stats.items():
+        name = f"{prefix}.{key}" if prefix else str(key)
+        if isinstance(value, dict):
+            flattened.update(_flatten_scalar_stats(value, name))
+        elif isinstance(value, (bool, int, float, str)):
+            flattened[name] = value
+        elif hasattr(value, "item"):
+            try:
+                item = value.item()
+            except Exception:
+                continue
+            if isinstance(item, (bool, int, float, str)):
+                flattened[name] = item
+    return flattened
+
+
 def parse_token_trace_modes(value: str) -> set[str] | None:
     modes = {part.strip() for part in value.split(",") if part.strip()}
     if not modes or modes & {"all", "*"}:
@@ -81,6 +99,10 @@ class TokenTraceSink:
             }
             if stop_token_ids:
                 row["stop_token_ids"] = list(stop_token_ids)
+            if isinstance(stats, dict):
+                flattened_stats = _flatten_scalar_stats(stats)
+                if flattened_stats:
+                    row["stats"] = flattened_stats
             self.rows.append(row)
             self.total_rows += 1
             if len(self.rows) >= self.max_rows_per_shard:

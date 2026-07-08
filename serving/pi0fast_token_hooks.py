@@ -101,6 +101,12 @@ class PI0FastTokenLogitAdapter:
             action_end_token_id = self._action_end_token_id()
             if 0 <= action_end_token_id < paligemma_vocab_size:
                 cpu_lookup[action_end_token_id] = 0
+            for special_id in (
+                getattr(self.model._paligemma_tokenizer, "eos_token_id", None),
+                getattr(self.model._paligemma_tokenizer, "bos_token_id", None),
+            ):
+                if special_id is not None and 0 <= int(special_id) < paligemma_vocab_size:
+                    cpu_lookup[int(special_id)] = 0
             for token_id in self.model._paligemma_tokenizer.encode("Action: ", add_special_tokens=False):
                 if 0 <= int(token_id) < paligemma_vocab_size:
                     cpu_lookup[int(token_id)] = 0
@@ -192,6 +198,7 @@ class PI0FastTokenLogitAdapter:
         action_char_plateau_tokens: int = 0,
         action_char_stable_checks: int = 0,
         action_char_stable_tolerance: float = 0.0,
+        action_char_plateau_reject_eos_restart: bool = False,
     ) -> PI0FastGenerationTrace:
         """Serving-oriented greedy decode that stops on the FAST action-end token.
 
@@ -239,6 +246,7 @@ class PI0FastTokenLogitAdapter:
                 action_char_plateau_tokens=action_char_plateau_tokens,
                 action_char_stable_checks=action_char_stable_checks,
                 action_char_stable_tolerance=action_char_stable_tolerance,
+                action_char_plateau_reject_eos_restart=action_char_plateau_reject_eos_restart,
             )
             mode = "action_end_prefix_no_logits" if force_action_prefix else "action_end_no_logits"
         else:
@@ -295,10 +303,19 @@ class PI0FastTokenLogitAdapter:
                 "action_char_plateau_tokens": int(getattr(self, "_last_action_char_plateau_tokens", 0)),
                 "action_char_stable_checks": int(getattr(self, "_last_action_char_stable_checks", 0)),
                 "action_char_stable_tolerance": float(getattr(self, "_last_action_char_stable_tolerance", 0.0)),
+                "action_char_plateau_reject_eos_restart": int(
+                    bool(getattr(self, "_last_action_char_plateau_reject_eos_restart", False))
+                ),
                 "action_char_stop_count": int(getattr(self, "_last_action_char_stop_count", 0)),
                 "action_char_plateau_stop_count": int(getattr(self, "_last_action_char_plateau_stop_count", 0)),
                 "action_char_plateau_stability_block_count": int(
                     getattr(self, "_last_action_char_plateau_stability_block_count", 0)
+                ),
+                "action_char_plateau_eos_restart_block_count": int(
+                    getattr(self, "_last_action_char_plateau_eos_restart_block_count", 0)
+                ),
+                "action_char_restart_fallback_count": int(
+                    getattr(self, "_last_action_char_restart_fallback_count", 0)
                 ),
                 "action_char_count_mean": float(getattr(self, "_last_action_char_count_mean", 0.0)),
                 "action_char_stable_snapshot_count_mean": float(
@@ -1249,6 +1266,7 @@ class PI0FastTokenLogitAdapter:
         action_char_plateau_tokens: int = 0,
         action_char_stable_checks: int = 0,
         action_char_stable_tolerance: float = 0.0,
+        action_char_plateau_reject_eos_restart: bool = False,
     ) -> torch.Tensor:
         """KV-cache FAST decode with per-row action-end compaction.
 
@@ -1274,14 +1292,20 @@ class PI0FastTokenLogitAdapter:
         action_char_plateau_tokens = max(0, int(action_char_plateau_tokens))
         action_char_stable_checks = max(0, int(action_char_stable_checks))
         action_char_stable_tolerance = max(0.0, float(action_char_stable_tolerance))
+        action_char_plateau_reject_eos_restart = bool(action_char_plateau_reject_eos_restart)
         self._last_action_char_target = int(action_char_target)
         self._last_action_char_min_chars = int(action_char_min_chars if stop_on_action_chars else 0)
         self._last_action_char_plateau_tokens = int(action_char_plateau_tokens if stop_on_action_chars else 0)
         self._last_action_char_stable_checks = int(action_char_stable_checks if stop_on_action_chars else 0)
         self._last_action_char_stable_tolerance = float(action_char_stable_tolerance if stop_on_action_chars else 0.0)
+        self._last_action_char_plateau_reject_eos_restart = bool(
+            action_char_plateau_reject_eos_restart if stop_on_action_chars else False
+        )
         self._last_action_char_stop_count = 0
         self._last_action_char_plateau_stop_count = 0
         self._last_action_char_plateau_stability_block_count = 0
+        self._last_action_char_plateau_eos_restart_block_count = 0
+        self._last_action_char_restart_fallback_count = 0
         self._last_action_char_count_mean = 0.0
         self._last_action_char_stable_snapshot_count_mean = 0.0
         self._last_action_char_stable_count_mean = 0.0
@@ -1338,7 +1362,14 @@ class PI0FastTokenLogitAdapter:
         previous_action_snapshots: list[torch.Tensor | None] = [None] * bsize
         stopped_by_chars = torch.zeros((bsize,), dtype=torch.bool, device=device)
         stopped_by_char_plateau = torch.zeros((bsize,), dtype=torch.bool, device=device)
+        stopped_by_restart_fallback = torch.zeros((bsize,), dtype=torch.bool, device=device)
         blocked_by_char_plateau_stability = torch.zeros((bsize,), dtype=torch.bool, device=device)
+        blocked_by_char_plateau_eos_restart = torch.zeros((bsize,), dtype=torch.bool, device=device)
+        plateau_tail_seen_eos = torch.zeros((bsize,), dtype=torch.bool, device=device)
+        plateau_tail_eos_restart = torch.zeros((bsize,), dtype=torch.bool, device=device)
+        eos_token_id = int(getattr(self.model._paligemma_tokenizer, "eos_token_id", -1) or -1)
+        bos_token_id = int(getattr(self.model._paligemma_tokenizer, "bos_token_id", -1) or -1)
+        has_restart_guard_tokens = eos_token_id >= 0 or bos_token_id >= 0
 
         def token_ids_with_action_end(row_idx: int) -> torch.Tensor:
             length = max(int(emitted_lengths[row_idx].item()), 1)
@@ -1370,15 +1401,36 @@ class PI0FastTokenLogitAdapter:
             if action_char_lookup is None:
                 return torch.zeros_like(selected, dtype=torch.bool)
             increments = action_char_lookup.index_select(0, selected).to(dtype=action_char_counts.dtype)
+            if action_char_plateau_reject_eos_restart and has_restart_guard_tokens:
+                selected_is_eos = selected == int(eos_token_id) if eos_token_id >= 0 else torch.zeros_like(selected, dtype=torch.bool)
+                selected_is_bos = selected == int(bos_token_id) if bos_token_id >= 0 else torch.zeros_like(selected, dtype=torch.bool)
+                restarted = selected_is_bos | (plateau_tail_seen_eos[active_indices] & ~selected_is_eos)
+                plateau_tail_eos_restart[active_indices] |= restarted
             action_char_counts[active_indices] += increments
             incremented = increments > 0
             if bool(torch.any(incremented)):
                 incremented_rows = active_indices[incremented]
                 last_action_char_increment_lengths[incremented_rows] = emitted_lengths[incremented_rows]
+                if action_char_plateau_reject_eos_restart and has_restart_guard_tokens:
+                    safe_rows = incremented_rows[~plateau_tail_eos_restart[incremented_rows]]
+                    plateau_tail_seen_eos[safe_rows] = False
+                else:
+                    plateau_tail_seen_eos[incremented_rows] = False
+                    plateau_tail_eos_restart[incremented_rows] = False
                 record_action_stability(incremented_rows)
+            if action_char_plateau_reject_eos_restart and has_restart_guard_tokens:
+                selected_is_eos = selected == int(eos_token_id) if eos_token_id >= 0 else torch.zeros_like(selected, dtype=torch.bool)
+                not_incremented = ~incremented
+                if bool(torch.any(not_incremented)):
+                    tail_rows = active_indices[not_incremented]
+                    plateau_tail_seen_eos[tail_rows] |= selected_is_eos[not_incremented]
             reached_target = action_char_counts[active_indices] >= int(action_char_target)
             if action_char_target <= 0:
                 reached_target = torch.zeros_like(reached_target, dtype=torch.bool)
+            restart_fallback = torch.zeros_like(reached_target, dtype=torch.bool)
+            if action_char_plateau_reject_eos_restart and has_restart_guard_tokens:
+                restart_fallback = plateau_tail_eos_restart[active_indices]
+                reached_target = reached_target & ~restart_fallback
             plateau_candidate = torch.zeros_like(reached_target, dtype=torch.bool)
             if action_char_plateau_tokens > 0:
                 plateau_candidate = (
@@ -1390,15 +1442,20 @@ class PI0FastTokenLogitAdapter:
                     )
                 )
             plateau = plateau_candidate
+            if action_char_plateau_reject_eos_restart and has_restart_guard_tokens:
+                blocked = plateau_candidate & plateau_tail_eos_restart[active_indices]
+                blocked_by_char_plateau_eos_restart[active_indices] |= blocked
+                plateau = plateau & ~plateau_tail_eos_restart[active_indices]
             if action_char_stable_checks > 0:
                 stable_enough = action_stable_counts[active_indices] >= int(action_char_stable_checks)
-                blocked = plateau_candidate & ~stable_enough
+                blocked = plateau & ~stable_enough
                 blocked_by_char_plateau_stability[active_indices] |= blocked
-                plateau = plateau_candidate & stable_enough
+                plateau = plateau & stable_enough
             reached = reached_target | plateau
             stopped_by_chars[active_indices] |= reached
             stopped_by_char_plateau[active_indices] |= plateau
-            return reached
+            stopped_by_restart_fallback[active_indices] |= restart_fallback
+            return reached | restart_fallback
 
         def finish_return(max_len: int) -> torch.Tensor:
             self._last_action_end_row_token_counts = emitted_lengths.detach().cpu().tolist()
@@ -1408,6 +1465,10 @@ class PI0FastTokenLogitAdapter:
                 self._last_action_char_plateau_stability_block_count = int(
                     blocked_by_char_plateau_stability.sum().item()
                 )
+                self._last_action_char_plateau_eos_restart_block_count = int(
+                    blocked_by_char_plateau_eos_restart.sum().item()
+                )
+                self._last_action_char_restart_fallback_count = int(stopped_by_restart_fallback.sum().item())
                 self._last_action_char_count_mean = float(action_char_counts.float().mean().item())
                 self._last_action_char_stable_snapshot_count_mean = float(
                     action_stable_snapshot_counts.float().mean().item()
@@ -1429,7 +1490,10 @@ class PI0FastTokenLogitAdapter:
 
         selected = next_token.squeeze(-1)
         finished_by_chars = record_action_chars(selected)
-        finished = (selected == action_end_token_id) | finished_by_chars
+        finished_by_action_end = selected == action_end_token_id
+        if action_char_plateau_reject_eos_restart and has_restart_guard_tokens:
+            finished_by_action_end = finished_by_action_end & ~plateau_tail_eos_restart[active_indices]
+        finished = finished_by_action_end | finished_by_chars
         if bool(torch.all(finished)):
             return finish_return(1)
         keep = torch.nonzero(~finished, as_tuple=False).flatten()
@@ -1469,7 +1533,10 @@ class PI0FastTokenLogitAdapter:
             generated[active_indices, t] = selected
             emitted_lengths[active_indices] = t + 1
             finished_by_chars = record_action_chars(selected)
-            finished = (selected == action_end_token_id) | finished_by_chars
+            finished_by_action_end = selected == action_end_token_id
+            if action_char_plateau_reject_eos_restart and has_restart_guard_tokens:
+                finished_by_action_end = finished_by_action_end & ~plateau_tail_eos_restart[active_indices]
+            finished = finished_by_action_end | finished_by_chars
             if bool(torch.all(finished)):
                 max_len = int(emitted_lengths.max().item())
                 return finish_return(max_len)
@@ -1487,6 +1554,10 @@ class PI0FastTokenLogitAdapter:
             self._last_action_char_plateau_stability_block_count = int(
                 blocked_by_char_plateau_stability.sum().item()
             )
+            self._last_action_char_plateau_eos_restart_block_count = int(
+                blocked_by_char_plateau_eos_restart.sum().item()
+            )
+            self._last_action_char_restart_fallback_count = int(stopped_by_restart_fallback.sum().item())
             self._last_action_char_count_mean = float(action_char_counts.float().mean().item())
             self._last_action_char_stable_snapshot_count_mean = float(
                 action_stable_snapshot_counts.float().mean().item()
