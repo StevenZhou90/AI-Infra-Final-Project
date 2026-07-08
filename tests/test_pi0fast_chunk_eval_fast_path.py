@@ -74,8 +74,10 @@ def test_target_eos_chunk_can_request_action_char_stop() -> None:
         action_char_plateau_tokens=2,
         action_char_stable_checks=1,
         action_char_stable_tolerance=0.001,
+        action_char_stable_max_chars=16,
         action_char_plateau_reject_eos_restart=True,
         action_char_restart_continue=True,
+        action_char_restart_reset=True,
     )
 
     assert adapter.action_end_calls == 1
@@ -84,8 +86,10 @@ def test_target_eos_chunk_can_request_action_char_stop() -> None:
     assert adapter.action_end_kwargs["action_char_plateau_tokens"] == 2
     assert adapter.action_end_kwargs["action_char_stable_checks"] == 1
     assert adapter.action_end_kwargs["action_char_stable_tolerance"] == 0.001
+    assert adapter.action_end_kwargs["action_char_stable_max_chars"] == 16
     assert adapter.action_end_kwargs["action_char_plateau_reject_eos_restart"] is True
     assert adapter.action_end_kwargs["action_char_restart_continue"] is True
+    assert adapter.action_end_kwargs["action_char_restart_reset"] is True
 
 
 def test_prefix_cutoff_chunk_uses_no_logits_path_by_default() -> None:

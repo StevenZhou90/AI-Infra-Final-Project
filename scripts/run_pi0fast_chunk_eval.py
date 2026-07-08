@@ -363,8 +363,10 @@ def _predict_target_eos_chunk(
     action_char_plateau_tokens: int = 0,
     action_char_stable_checks: int = 0,
     action_char_stable_tolerance: float = 0.0,
+    action_char_stable_max_chars: int = 0,
     action_char_plateau_reject_eos_restart: bool = False,
     action_char_restart_continue: bool = False,
+    action_char_restart_reset: bool = False,
 ) -> PredictionTrace:
     if stop_on_action_chars and hasattr(token_adapter, "prepare_action_char_length_lookup"):
         token_adapter.prepare_action_char_length_lookup(device=device)
@@ -387,8 +389,10 @@ def _predict_target_eos_chunk(
             action_char_plateau_tokens=action_char_plateau_tokens,
             action_char_stable_checks=action_char_stable_checks,
             action_char_stable_tolerance=action_char_stable_tolerance,
+            action_char_stable_max_chars=action_char_stable_max_chars,
             action_char_plateau_reject_eos_restart=action_char_plateau_reject_eos_restart,
             action_char_restart_continue=action_char_restart_continue,
+            action_char_restart_reset=action_char_restart_reset,
         )
     else:
         trace = token_adapter.predict_action_chunk_action_end(
@@ -399,8 +403,10 @@ def _predict_target_eos_chunk(
             action_char_plateau_tokens=action_char_plateau_tokens,
             action_char_stable_checks=action_char_stable_checks,
             action_char_stable_tolerance=action_char_stable_tolerance,
+            action_char_stable_max_chars=action_char_stable_max_chars,
             action_char_plateau_reject_eos_restart=action_char_plateau_reject_eos_restart,
             action_char_restart_continue=action_char_restart_continue,
+            action_char_restart_reset=action_char_restart_reset,
         )
     if device.startswith("cuda") and torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -1115,8 +1121,10 @@ def run_episode(
     target_eos_action_char_plateau_tokens: int,
     target_eos_action_char_stable_checks: int,
     target_eos_action_char_stable_tolerance: float,
+    target_eos_action_char_stable_max_chars: int,
     target_eos_action_char_plateau_reject_eos_restart: bool,
     target_eos_action_char_restart_continue: bool,
+    target_eos_action_char_restart_reset: bool,
     token_trace_sink: TokenTraceSink | None,
     device: str,
     use_amp: bool,
@@ -2137,10 +2145,12 @@ def run_episode(
                                 action_char_plateau_tokens=target_eos_action_char_plateau_tokens,
                                 action_char_stable_checks=target_eos_action_char_stable_checks,
                                 action_char_stable_tolerance=target_eos_action_char_stable_tolerance,
+                                action_char_stable_max_chars=target_eos_action_char_stable_max_chars,
                                 action_char_plateau_reject_eos_restart=(
                                     target_eos_action_char_plateau_reject_eos_restart
                                 ),
                                 action_char_restart_continue=target_eos_action_char_restart_continue,
+                                action_char_restart_reset=target_eos_action_char_restart_reset,
                             )
                         restart_fallback_count = int(
                             (prediction.stats or {}).get("action_char_restart_fallback_count", 0)
@@ -2626,6 +2636,15 @@ def parse_args() -> argparse.Namespace:
         help="Maximum action delta considered stable for --target-eos-action-char-stable-checks.",
     )
     parser.add_argument(
+        "--target-eos-action-char-stable-max-chars",
+        type=int,
+        default=0,
+        help=(
+            "If positive, apply --target-eos-action-char-stable-checks only to plateau stops below "
+            "this decoded FAST-character count. Zero applies stability checks to every plateau stop."
+        ),
+    )
+    parser.add_argument(
         "--target-eos-action-char-plateau-reject-eos-restart",
         action="store_true",
         help=(
@@ -2639,6 +2658,14 @@ def parse_args() -> argparse.Namespace:
         help=(
             "When restart rejection taints a target_eos_charstop row, keep decoding in the same "
             "KV-cache pass until the normal action-end token instead of requesting a full rerun."
+        ),
+    )
+    parser.add_argument(
+        "--target-eos-action-char-restart-reset",
+        action="store_true",
+        help=(
+            "When an EOS/BOS restart is detected in a target_eos_charstop row, reset decoded "
+            "FAST-character counts and allow char stops to mature again on the restarted action."
         ),
     )
     parser.add_argument(
@@ -3688,10 +3715,12 @@ def main() -> None:
                     target_eos_action_char_plateau_tokens=args.target_eos_action_char_plateau_tokens,
                     target_eos_action_char_stable_checks=args.target_eos_action_char_stable_checks,
                     target_eos_action_char_stable_tolerance=args.target_eos_action_char_stable_tolerance,
+                    target_eos_action_char_stable_max_chars=args.target_eos_action_char_stable_max_chars,
                     target_eos_action_char_plateau_reject_eos_restart=(
                         args.target_eos_action_char_plateau_reject_eos_restart
                     ),
                     target_eos_action_char_restart_continue=args.target_eos_action_char_restart_continue,
+                    target_eos_action_char_restart_reset=args.target_eos_action_char_restart_reset,
                     token_trace_sink=token_trace_sink,
                     device=str(device),
                     use_amp=args.use_amp,
@@ -3730,10 +3759,12 @@ def main() -> None:
         "target_eos_action_char_plateau_tokens": args.target_eos_action_char_plateau_tokens,
         "target_eos_action_char_stable_checks": args.target_eos_action_char_stable_checks,
         "target_eos_action_char_stable_tolerance": args.target_eos_action_char_stable_tolerance,
+        "target_eos_action_char_stable_max_chars": args.target_eos_action_char_stable_max_chars,
         "target_eos_action_char_plateau_reject_eos_restart": (
             args.target_eos_action_char_plateau_reject_eos_restart
         ),
         "target_eos_action_char_restart_continue": args.target_eos_action_char_restart_continue,
+        "target_eos_action_char_restart_reset": args.target_eos_action_char_restart_reset,
         "num_inference_steps": args.num_inference_steps,
         "task": args.task,
         "task_id": args.task_id,
