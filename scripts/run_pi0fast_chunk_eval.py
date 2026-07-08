@@ -367,6 +367,8 @@ def _predict_target_eos_chunk(
     action_char_plateau_reject_eos_restart: bool = False,
     action_char_restart_continue: bool = False,
     action_char_restart_reset: bool = False,
+    action_char_restart_reset_low_text_tokens: int = 0,
+    action_char_plateau_low_text_tail_tokens: int = 0,
 ) -> PredictionTrace:
     if stop_on_action_chars and hasattr(token_adapter, "prepare_action_char_length_lookup"):
         token_adapter.prepare_action_char_length_lookup(device=device)
@@ -393,6 +395,8 @@ def _predict_target_eos_chunk(
             action_char_plateau_reject_eos_restart=action_char_plateau_reject_eos_restart,
             action_char_restart_continue=action_char_restart_continue,
             action_char_restart_reset=action_char_restart_reset,
+            action_char_restart_reset_low_text_tokens=action_char_restart_reset_low_text_tokens,
+            action_char_plateau_low_text_tail_tokens=action_char_plateau_low_text_tail_tokens,
         )
     else:
         trace = token_adapter.predict_action_chunk_action_end(
@@ -407,6 +411,8 @@ def _predict_target_eos_chunk(
             action_char_plateau_reject_eos_restart=action_char_plateau_reject_eos_restart,
             action_char_restart_continue=action_char_restart_continue,
             action_char_restart_reset=action_char_restart_reset,
+            action_char_restart_reset_low_text_tokens=action_char_restart_reset_low_text_tokens,
+            action_char_plateau_low_text_tail_tokens=action_char_plateau_low_text_tail_tokens,
         )
     if device.startswith("cuda") and torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -1125,6 +1131,8 @@ def run_episode(
     target_eos_action_char_plateau_reject_eos_restart: bool,
     target_eos_action_char_restart_continue: bool,
     target_eos_action_char_restart_reset: bool,
+    target_eos_action_char_restart_reset_low_text_tokens: int,
+    target_eos_action_char_plateau_low_text_tail_tokens: int,
     token_trace_sink: TokenTraceSink | None,
     device: str,
     use_amp: bool,
@@ -2151,6 +2159,12 @@ def run_episode(
                                 ),
                                 action_char_restart_continue=target_eos_action_char_restart_continue,
                                 action_char_restart_reset=target_eos_action_char_restart_reset,
+                                action_char_restart_reset_low_text_tokens=(
+                                    target_eos_action_char_restart_reset_low_text_tokens
+                                ),
+                                action_char_plateau_low_text_tail_tokens=(
+                                    target_eos_action_char_plateau_low_text_tail_tokens
+                                ),
                             )
                         restart_fallback_count = int(
                             (prediction.stats or {}).get("action_char_restart_fallback_count", 0)
@@ -2666,6 +2680,24 @@ def parse_args() -> argparse.Namespace:
         help=(
             "When an EOS/BOS restart is detected in a target_eos_charstop row, reset decoded "
             "FAST-character counts and allow char stops to mature again on the restarted action."
+        ),
+    )
+    parser.add_argument(
+        "--target-eos-action-char-restart-reset-low-text-tokens",
+        type=int,
+        default=0,
+        help=(
+            "If positive with --target-eos-action-char-restart-reset, delay the reset until the "
+            "restarted tail emits this many non-prefix low/text tokens."
+        ),
+    )
+    parser.add_argument(
+        "--target-eos-action-char-plateau-low-text-tail-tokens",
+        type=int,
+        default=0,
+        help=(
+            "If positive, block target_eos_charstop plateau stops when the no-action tail contains "
+            "at least this many non-prefix low/text tokens."
         ),
     )
     parser.add_argument(
@@ -3721,6 +3753,12 @@ def main() -> None:
                     ),
                     target_eos_action_char_restart_continue=args.target_eos_action_char_restart_continue,
                     target_eos_action_char_restart_reset=args.target_eos_action_char_restart_reset,
+                    target_eos_action_char_restart_reset_low_text_tokens=(
+                        args.target_eos_action_char_restart_reset_low_text_tokens
+                    ),
+                    target_eos_action_char_plateau_low_text_tail_tokens=(
+                        args.target_eos_action_char_plateau_low_text_tail_tokens
+                    ),
                     token_trace_sink=token_trace_sink,
                     device=str(device),
                     use_amp=args.use_amp,
@@ -3765,6 +3803,12 @@ def main() -> None:
         ),
         "target_eos_action_char_restart_continue": args.target_eos_action_char_restart_continue,
         "target_eos_action_char_restart_reset": args.target_eos_action_char_restart_reset,
+        "target_eos_action_char_restart_reset_low_text_tokens": (
+            args.target_eos_action_char_restart_reset_low_text_tokens
+        ),
+        "target_eos_action_char_plateau_low_text_tail_tokens": (
+            args.target_eos_action_char_plateau_low_text_tail_tokens
+        ),
         "num_inference_steps": args.num_inference_steps,
         "task": args.task,
         "task_id": args.task_id,

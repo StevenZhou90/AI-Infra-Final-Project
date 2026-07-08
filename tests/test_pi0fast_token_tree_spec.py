@@ -431,6 +431,32 @@ def test_pi0fast_action_char_restart_reset_allows_new_target_stop() -> None:
     assert adapter._last_action_char_count_mean == 8.0
 
 
+def test_pi0fast_action_char_restart_reset_can_wait_for_low_text() -> None:
+    policy = _CharStopPolicy()
+    policy.model._targets = [90, 1, 2, 80, 91, 92, 99]
+    adapter = PI0FastTokenLogitAdapter(policy)
+    adapter._match_model_precision = lambda tensor: tensor
+    adapter._action_key = lambda: "action"
+
+    token_ids = adapter.sample_actions_fast_kv_cache_action_end(
+        images=torch.empty(1),
+        img_masks=torch.empty(1),
+        tokens=torch.zeros((1, 2), dtype=torch.long),
+        masks=torch.ones((1, 2), dtype=torch.bool),
+        max_decoding_steps=8,
+        stop_on_action_chars=True,
+        action_char_plateau_reject_eos_restart=True,
+        action_char_restart_reset=True,
+        action_char_restart_reset_low_text_tokens=1,
+    )
+
+    assert token_ids.tolist() == [[90, 1, 2, 80, 91, 92, 99]]
+    assert adapter._last_action_char_stop_count == 1
+    assert adapter._last_action_char_restart_fallback_count == 0
+    assert adapter._last_action_char_restart_reset_count == 1
+    assert adapter._last_action_char_count_mean == 8.0
+
+
 def test_pi0fast_action_char_plateau_allows_repeated_eos_tail() -> None:
     policy = _CharStopPolicy()
     policy.model._targets = [90, 5, 5, 5, 99]
@@ -543,6 +569,32 @@ def test_pi0fast_action_char_stability_guard_can_target_early_plateaus() -> None
     assert adapter._last_action_char_count_mean == 8.0
 
 
+def test_pi0fast_action_char_plateau_low_text_tail_guard_blocks_stop() -> None:
+    policy = _CharStopPolicy()
+    policy.model._targets = [90, 80, 80, 91, 99]
+    adapter = PI0FastTokenLogitAdapter(policy)
+    adapter._match_model_precision = lambda tensor: tensor
+    adapter._action_key = lambda: "action"
+
+    token_ids = adapter.sample_actions_fast_kv_cache_action_end(
+        images=torch.empty(1),
+        img_masks=torch.empty(1),
+        tokens=torch.zeros((1, 2), dtype=torch.long),
+        masks=torch.ones((1, 2), dtype=torch.bool),
+        max_decoding_steps=8,
+        stop_on_action_chars=True,
+        action_char_min_chars=4,
+        action_char_plateau_tokens=2,
+        action_char_plateau_low_text_tail_tokens=2,
+    )
+
+    assert token_ids.tolist() == [[90, 80, 80, 91, 99]]
+    assert adapter._last_action_char_stop_count == 1
+    assert adapter._last_action_char_plateau_stop_count == 0
+    assert adapter._last_action_char_plateau_low_text_tail_block_count == 1
+    assert adapter._last_action_char_count_mean == 8.0
+
+
 def test_pi0fast_constrained_action_char_plateau_can_stop_after_decoded_chars_stabilize() -> None:
     policy = _CharStopPolicy()
     policy.model._targets = [90, 80, 80, 80, 99]
@@ -601,6 +653,38 @@ def test_pi0fast_constrained_action_char_restart_continue_blocks_target_stop() -
     assert adapter._last_action_char_restart_fallback_count == 0
     assert adapter._last_action_char_restart_continue_count == 1
     assert adapter._last_action_char_count_mean == 12.0
+
+
+def test_pi0fast_constrained_action_char_restart_reset_can_wait_for_low_text() -> None:
+    policy = _CharStopPolicy()
+    policy.model._targets = [90, 1, 2, 80, 91, 92, 99]
+    _install_identity_linear_head(policy)
+    adapter = PI0FastTokenLogitAdapter(policy)
+    adapter._match_model_precision = lambda tensor: tensor
+    adapter._action_key = lambda: "action"
+
+    token_ids = adapter.sample_actions_fast_kv_cache_action_end_constrained(
+        images=torch.empty(1),
+        img_masks=torch.empty(1),
+        tokens=torch.zeros((1, 2), dtype=torch.long),
+        masks=torch.ones((1, 2), dtype=torch.bool),
+        max_decoding_steps=8,
+        force_action_prefix=False,
+        action_vocab_size=128,
+        text_vocab_size=128,
+        stop_on_action_chars=True,
+        action_char_plateau_reject_eos_restart=True,
+        action_char_restart_reset=True,
+        action_char_restart_reset_low_text_tokens=1,
+        action_char_plateau_low_text_tail_tokens=2,
+    )
+
+    assert token_ids.tolist() == [[90, 1, 2, 80, 91, 92, 99]]
+    assert adapter._last_action_char_stop_count == 1
+    assert adapter._last_action_char_restart_reset_low_text_tokens == 1
+    assert adapter._last_action_char_plateau_low_text_tail_tokens == 2
+    assert adapter._last_action_char_restart_reset_count == 1
+    assert adapter._last_action_char_count_mean == 8.0
 
 
 class _BranchingDrafter:
