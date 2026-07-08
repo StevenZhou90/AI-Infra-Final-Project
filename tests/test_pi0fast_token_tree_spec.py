@@ -319,6 +319,34 @@ def test_pi0fast_action_char_plateau_ignores_action_end_after_restart() -> None:
     assert adapter._last_action_char_count_mean == 4.0
 
 
+def test_pi0fast_action_char_restart_continue_allows_action_end() -> None:
+    policy = _CharStopPolicy()
+    policy.model._targets = [90, 5, 1, 99, 91, 99]
+    adapter = PI0FastTokenLogitAdapter(policy)
+    adapter._match_model_precision = lambda tensor: tensor
+    adapter._action_key = lambda: "action"
+
+    token_ids = adapter.sample_actions_fast_kv_cache_action_end(
+        images=torch.empty(1),
+        img_masks=torch.empty(1),
+        tokens=torch.zeros((1, 2), dtype=torch.long),
+        masks=torch.ones((1, 2), dtype=torch.bool),
+        max_decoding_steps=8,
+        stop_on_action_chars=True,
+        action_char_min_chars=4,
+        action_char_plateau_tokens=2,
+        action_char_plateau_reject_eos_restart=True,
+        action_char_restart_continue=True,
+    )
+
+    assert token_ids.tolist() == [[90, 5, 1, 99]]
+    assert adapter._last_action_char_stop_count == 0
+    assert adapter._last_action_char_plateau_stop_count == 0
+    assert adapter._last_action_char_restart_fallback_count == 0
+    assert adapter._last_action_char_restart_continue_count == 1
+    assert adapter._last_action_char_count_mean == 4.0
+
+
 def test_pi0fast_action_char_stop_ignores_target_after_restart() -> None:
     policy = _CharStopPolicy()
     policy.model._targets = [90, 1, 91, 92, 99]
@@ -341,6 +369,32 @@ def test_pi0fast_action_char_stop_ignores_target_after_restart() -> None:
     assert adapter._last_action_char_plateau_stop_count == 0
     assert adapter._last_action_char_restart_fallback_count == 1
     assert adapter._last_action_char_count_mean == 4.0
+
+
+def test_pi0fast_action_char_restart_continue_blocks_target_stop() -> None:
+    policy = _CharStopPolicy()
+    policy.model._targets = [90, 1, 91, 92, 99]
+    adapter = PI0FastTokenLogitAdapter(policy)
+    adapter._match_model_precision = lambda tensor: tensor
+    adapter._action_key = lambda: "action"
+
+    token_ids = adapter.sample_actions_fast_kv_cache_action_end(
+        images=torch.empty(1),
+        img_masks=torch.empty(1),
+        tokens=torch.zeros((1, 2), dtype=torch.long),
+        masks=torch.ones((1, 2), dtype=torch.bool),
+        max_decoding_steps=6,
+        stop_on_action_chars=True,
+        action_char_plateau_reject_eos_restart=True,
+        action_char_restart_continue=True,
+    )
+
+    assert token_ids.tolist() == [[90, 1, 91, 92, 99]]
+    assert adapter._last_action_char_stop_count == 0
+    assert adapter._last_action_char_plateau_stop_count == 0
+    assert adapter._last_action_char_restart_fallback_count == 0
+    assert adapter._last_action_char_restart_continue_count == 1
+    assert adapter._last_action_char_count_mean == 12.0
 
 
 def test_pi0fast_action_char_plateau_allows_repeated_eos_tail() -> None:
