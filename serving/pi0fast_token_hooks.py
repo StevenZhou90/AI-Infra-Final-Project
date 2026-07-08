@@ -204,6 +204,9 @@ class PI0FastTokenLogitAdapter:
         action_char_restart_reset: bool = False,
         action_char_restart_reset_low_text_tokens: int = 0,
         action_char_plateau_low_text_tail_tokens: int = 0,
+        action_char_strict_target_stop: bool = False,
+        action_char_reset_requires_action_end: bool = False,
+        action_char_target_confirm_tokens: int = 0,
     ) -> PI0FastGenerationTrace:
         """Serving-oriented greedy decode that stops on the FAST action-end token.
 
@@ -246,6 +249,9 @@ class PI0FastTokenLogitAdapter:
                 action_char_restart_reset=action_char_restart_reset,
                 action_char_restart_reset_low_text_tokens=action_char_restart_reset_low_text_tokens,
                 action_char_plateau_low_text_tail_tokens=action_char_plateau_low_text_tail_tokens,
+                action_char_strict_target_stop=action_char_strict_target_stop,
+                action_char_reset_requires_action_end=action_char_reset_requires_action_end,
+                action_char_target_confirm_tokens=action_char_target_confirm_tokens,
             )
             mode = "action_end_constrained_charstop_no_logits" if stop_on_action_chars else "action_end_constrained_no_logits"
         elif self.policy.config.use_kv_cache:
@@ -268,6 +274,9 @@ class PI0FastTokenLogitAdapter:
                 action_char_restart_reset=action_char_restart_reset,
                 action_char_restart_reset_low_text_tokens=action_char_restart_reset_low_text_tokens,
                 action_char_plateau_low_text_tail_tokens=action_char_plateau_low_text_tail_tokens,
+                action_char_strict_target_stop=action_char_strict_target_stop,
+                action_char_reset_requires_action_end=action_char_reset_requires_action_end,
+                action_char_target_confirm_tokens=action_char_target_confirm_tokens,
             )
             mode = "action_end_prefix_no_logits" if force_action_prefix else "action_end_no_logits"
         else:
@@ -338,6 +347,15 @@ class PI0FastTokenLogitAdapter:
                 "action_char_plateau_low_text_tail_tokens": int(
                     getattr(self, "_last_action_char_plateau_low_text_tail_tokens", 0)
                 ),
+                "action_char_strict_target_stop": int(
+                    bool(getattr(self, "_last_action_char_strict_target_stop", False))
+                ),
+                "action_char_reset_requires_action_end": int(
+                    bool(getattr(self, "_last_action_char_reset_requires_action_end", False))
+                ),
+                "action_char_target_confirm_tokens": int(
+                    getattr(self, "_last_action_char_target_confirm_tokens", 0)
+                ),
                 "action_char_stop_count": int(getattr(self, "_last_action_char_stop_count", 0)),
                 "action_char_plateau_stop_count": int(getattr(self, "_last_action_char_plateau_stop_count", 0)),
                 "action_char_plateau_stability_block_count": int(
@@ -353,6 +371,12 @@ class PI0FastTokenLogitAdapter:
                     getattr(self, "_last_action_char_restart_continue_count", 0)
                 ),
                 "action_char_restart_reset_count": int(getattr(self, "_last_action_char_restart_reset_count", 0)),
+                "action_char_reset_requires_action_end_block_count": int(
+                    getattr(self, "_last_action_char_reset_requires_action_end_block_count", 0)
+                ),
+                "action_char_target_confirm_block_count": int(
+                    getattr(self, "_last_action_char_target_confirm_block_count", 0)
+                ),
                 "action_char_plateau_low_text_tail_block_count": int(
                     getattr(self, "_last_action_char_plateau_low_text_tail_block_count", 0)
                 ),
@@ -1311,6 +1335,9 @@ class PI0FastTokenLogitAdapter:
         action_char_restart_reset: bool = False,
         action_char_restart_reset_low_text_tokens: int = 0,
         action_char_plateau_low_text_tail_tokens: int = 0,
+        action_char_strict_target_stop: bool = False,
+        action_char_reset_requires_action_end: bool = False,
+        action_char_target_confirm_tokens: int = 0,
     ) -> torch.Tensor:
         """KV-cache FAST decode with per-row action-end compaction.
 
@@ -1342,6 +1369,9 @@ class PI0FastTokenLogitAdapter:
         action_char_restart_reset = bool(action_char_restart_reset)
         action_char_restart_reset_low_text_tokens = max(0, int(action_char_restart_reset_low_text_tokens))
         action_char_plateau_low_text_tail_tokens = max(0, int(action_char_plateau_low_text_tail_tokens))
+        action_char_strict_target_stop = bool(action_char_strict_target_stop)
+        action_char_reset_requires_action_end = bool(action_char_reset_requires_action_end)
+        action_char_target_confirm_tokens = max(0, int(action_char_target_confirm_tokens))
         self._last_action_char_target = int(action_char_target)
         self._last_action_char_min_chars = int(action_char_min_chars if stop_on_action_chars else 0)
         self._last_action_char_plateau_tokens = int(action_char_plateau_tokens if stop_on_action_chars else 0)
@@ -1359,6 +1389,15 @@ class PI0FastTokenLogitAdapter:
         self._last_action_char_plateau_low_text_tail_tokens = int(
             action_char_plateau_low_text_tail_tokens if stop_on_action_chars else 0
         )
+        self._last_action_char_strict_target_stop = bool(
+            action_char_strict_target_stop if stop_on_action_chars else False
+        )
+        self._last_action_char_reset_requires_action_end = bool(
+            action_char_reset_requires_action_end if stop_on_action_chars else False
+        )
+        self._last_action_char_target_confirm_tokens = int(
+            action_char_target_confirm_tokens if stop_on_action_chars else 0
+        )
         self._last_action_char_stop_count = 0
         self._last_action_char_plateau_stop_count = 0
         self._last_action_char_plateau_stability_block_count = 0
@@ -1366,6 +1405,8 @@ class PI0FastTokenLogitAdapter:
         self._last_action_char_restart_fallback_count = 0
         self._last_action_char_restart_continue_count = 0
         self._last_action_char_restart_reset_count = 0
+        self._last_action_char_reset_requires_action_end_block_count = 0
+        self._last_action_char_target_confirm_block_count = 0
         self._last_action_char_plateau_low_text_tail_block_count = 0
         self._last_action_char_count_mean = 0.0
         self._last_action_char_stable_snapshot_count_mean = 0.0
@@ -1430,11 +1471,13 @@ class PI0FastTokenLogitAdapter:
         last_action_char_increment_lengths = torch.zeros((bsize,), dtype=torch.long, device=device)
         action_stable_counts = torch.zeros((bsize,), dtype=torch.long, device=device)
         action_stable_snapshot_counts = torch.zeros((bsize,), dtype=torch.long, device=device)
+        target_reached_lengths = torch.zeros((bsize,), dtype=torch.long, device=device)
         previous_action_snapshots: list[torch.Tensor | None] = [None] * bsize
         stopped_by_chars = torch.zeros((bsize,), dtype=torch.bool, device=device)
         stopped_by_char_plateau = torch.zeros((bsize,), dtype=torch.bool, device=device)
         stopped_by_restart_fallback = torch.zeros((bsize,), dtype=torch.bool, device=device)
         restarted_with_count_reset = torch.zeros((bsize,), dtype=torch.bool, device=device)
+        reset_requires_action_end = torch.zeros((bsize,), dtype=torch.bool, device=device)
         pending_restart_reset = torch.zeros((bsize,), dtype=torch.bool, device=device)
         post_restart_action_char_counts = torch.zeros((bsize,), dtype=torch.long, device=device)
         post_restart_last_action_char_increment_lengths = torch.zeros((bsize,), dtype=torch.long, device=device)
@@ -1443,6 +1486,8 @@ class PI0FastTokenLogitAdapter:
         blocked_by_char_plateau_stability = torch.zeros((bsize,), dtype=torch.bool, device=device)
         blocked_by_char_plateau_eos_restart = torch.zeros((bsize,), dtype=torch.bool, device=device)
         blocked_by_char_plateau_low_text_tail = torch.zeros((bsize,), dtype=torch.bool, device=device)
+        blocked_by_reset_requires_action_end = torch.zeros((bsize,), dtype=torch.bool, device=device)
+        blocked_by_target_confirmation = torch.zeros((bsize,), dtype=torch.bool, device=device)
         plateau_tail_seen_eos = torch.zeros((bsize,), dtype=torch.bool, device=device)
         plateau_tail_eos_restart = torch.zeros((bsize,), dtype=torch.bool, device=device)
         eos_token_id = int(getattr(self.model._paligemma_tokenizer, "eos_token_id", -1) or -1)
@@ -1503,11 +1548,14 @@ class PI0FastTokenLogitAdapter:
                     else:
                         action_char_counts[restart_rows] = 0
                         last_action_char_increment_lengths[restart_rows] = 0
+                        target_reached_lengths[restart_rows] = 0
                         action_stable_counts[restart_rows] = 0
                         action_stable_snapshot_counts[restart_rows] = 0
                         plateau_tail_seen_eos[restart_rows] = False
                         plateau_tail_eos_restart[restart_rows] = False
                         restarted_with_count_reset[restart_rows] = True
+                        if action_char_reset_requires_action_end:
+                            reset_requires_action_end[restart_rows] = True
                         for row_idx in restart_rows.detach().cpu().tolist():
                             previous_action_snapshots[int(row_idx)] = None
                 else:
@@ -1554,12 +1602,15 @@ class PI0FastTokenLogitAdapter:
                     last_action_char_increment_lengths[reset_rows] = post_restart_last_action_char_increment_lengths[
                         reset_rows
                     ]
+                    target_reached_lengths[reset_rows] = 0
                     action_stable_counts[reset_rows] = 0
                     action_stable_snapshot_counts[reset_rows] = 0
                     plateau_tail_seen_eos[reset_rows] = False
                     plateau_tail_eos_restart[reset_rows] = False
                     pending_restart_reset[reset_rows] = False
                     restarted_with_count_reset[reset_rows] = True
+                    if action_char_reset_requires_action_end:
+                        reset_requires_action_end[reset_rows] = True
                     for row_idx in reset_rows.detach().cpu().tolist():
                         previous_action_snapshots[int(row_idx)] = None
             if action_char_plateau_reject_eos_restart and has_restart_guard_tokens:
@@ -1568,9 +1619,24 @@ class PI0FastTokenLogitAdapter:
                 if bool(torch.any(not_incremented)):
                     tail_rows = active_indices[not_incremented]
                     plateau_tail_seen_eos[tail_rows] |= selected_is_eos[not_incremented]
-            reached_target = action_char_counts[active_indices] >= int(action_char_target)
+            if action_char_strict_target_stop:
+                reached_target = action_char_counts[active_indices] > int(action_char_target)
+            else:
+                reached_target = action_char_counts[active_indices] >= int(action_char_target)
             if action_char_target <= 0:
                 reached_target = torch.zeros_like(reached_target, dtype=torch.bool)
+            if action_char_target_confirm_tokens > 0 and bool(torch.any(reached_target)):
+                first_reached = reached_target & (target_reached_lengths[active_indices] <= 0)
+                if bool(torch.any(first_reached)):
+                    first_rows = active_indices[first_reached]
+                    target_reached_lengths[first_rows] = emitted_lengths[first_rows]
+                confirmed = (
+                    emitted_lengths[active_indices] - target_reached_lengths[active_indices]
+                    >= int(action_char_target_confirm_tokens)
+                )
+                blocked = reached_target & ~confirmed
+                blocked_by_target_confirmation[active_indices] |= blocked
+                reached_target = reached_target & confirmed
             restart_fallback = torch.zeros_like(reached_target, dtype=torch.bool)
             if action_char_plateau_reject_eos_restart and has_restart_guard_tokens:
                 restart_tainted = plateau_tail_eos_restart[active_indices]
@@ -1611,6 +1677,12 @@ class PI0FastTokenLogitAdapter:
                 blocked = stable_guard & ~stable_enough
                 blocked_by_char_plateau_stability[active_indices] |= blocked
                 plateau = plateau & (~stable_guard | stable_enough)
+            if action_char_reset_requires_action_end:
+                require_action_end = reset_requires_action_end[active_indices]
+                blocked = (reached_target | plateau) & require_action_end
+                blocked_by_reset_requires_action_end[active_indices] |= blocked
+                reached_target = reached_target & ~require_action_end
+                plateau = plateau & ~require_action_end
             reached = reached_target | plateau
             stopped_by_chars[active_indices] |= reached
             stopped_by_char_plateau[active_indices] |= plateau
@@ -1636,6 +1708,12 @@ class PI0FastTokenLogitAdapter:
                     int(plateau_tail_eos_restart.sum().item()) if action_char_restart_continue else 0
                 )
                 self._last_action_char_restart_reset_count = int(restarted_with_count_reset.sum().item())
+                self._last_action_char_reset_requires_action_end_block_count = int(
+                    blocked_by_reset_requires_action_end.sum().item()
+                )
+                self._last_action_char_target_confirm_block_count = int(
+                    blocked_by_target_confirmation.sum().item()
+                )
                 self._last_action_char_count_mean = float(action_char_counts.float().mean().item())
                 self._last_action_char_stable_snapshot_count_mean = float(
                     action_stable_snapshot_counts.float().mean().item()
@@ -1737,6 +1815,12 @@ class PI0FastTokenLogitAdapter:
                 int(plateau_tail_eos_restart.sum().item()) if action_char_restart_continue else 0
             )
             self._last_action_char_restart_reset_count = int(restarted_with_count_reset.sum().item())
+            self._last_action_char_reset_requires_action_end_block_count = int(
+                blocked_by_reset_requires_action_end.sum().item()
+            )
+            self._last_action_char_target_confirm_block_count = int(
+                blocked_by_target_confirmation.sum().item()
+            )
             self._last_action_char_count_mean = float(action_char_counts.float().mean().item())
             self._last_action_char_stable_snapshot_count_mean = float(
                 action_stable_snapshot_counts.float().mean().item()
@@ -1770,6 +1854,9 @@ class PI0FastTokenLogitAdapter:
         action_char_restart_reset: bool = False,
         action_char_restart_reset_low_text_tokens: int = 0,
         action_char_plateau_low_text_tail_tokens: int = 0,
+        action_char_strict_target_stop: bool = False,
+        action_char_reset_requires_action_end: bool = False,
+        action_char_target_confirm_tokens: int = 0,
     ) -> torch.Tensor:
         """KV-cache FAST decode using the known PI0-FAST action-token support.
 
@@ -1804,6 +1891,9 @@ class PI0FastTokenLogitAdapter:
         action_char_restart_reset = bool(action_char_restart_reset)
         action_char_restart_reset_low_text_tokens = max(0, int(action_char_restart_reset_low_text_tokens))
         action_char_plateau_low_text_tail_tokens = max(0, int(action_char_plateau_low_text_tail_tokens))
+        action_char_strict_target_stop = bool(action_char_strict_target_stop)
+        action_char_reset_requires_action_end = bool(action_char_reset_requires_action_end)
+        action_char_target_confirm_tokens = max(0, int(action_char_target_confirm_tokens))
         self._last_action_char_target = int(action_char_target)
         self._last_action_char_min_chars = int(action_char_min_chars if stop_on_action_chars else 0)
         self._last_action_char_plateau_tokens = int(action_char_plateau_tokens if stop_on_action_chars else 0)
@@ -1821,6 +1911,15 @@ class PI0FastTokenLogitAdapter:
         self._last_action_char_plateau_low_text_tail_tokens = int(
             action_char_plateau_low_text_tail_tokens if stop_on_action_chars else 0
         )
+        self._last_action_char_strict_target_stop = bool(
+            action_char_strict_target_stop if stop_on_action_chars else False
+        )
+        self._last_action_char_reset_requires_action_end = bool(
+            action_char_reset_requires_action_end if stop_on_action_chars else False
+        )
+        self._last_action_char_target_confirm_tokens = int(
+            action_char_target_confirm_tokens if stop_on_action_chars else 0
+        )
         self._last_action_char_stop_count = 0
         self._last_action_char_plateau_stop_count = 0
         self._last_action_char_plateau_stability_block_count = 0
@@ -1828,6 +1927,8 @@ class PI0FastTokenLogitAdapter:
         self._last_action_char_restart_fallback_count = 0
         self._last_action_char_restart_continue_count = 0
         self._last_action_char_restart_reset_count = 0
+        self._last_action_char_reset_requires_action_end_block_count = 0
+        self._last_action_char_target_confirm_block_count = 0
         self._last_action_char_plateau_low_text_tail_block_count = 0
         self._last_action_char_count_mean = 0.0
         self._last_action_char_stable_snapshot_count_mean = 0.0
@@ -1973,11 +2074,13 @@ class PI0FastTokenLogitAdapter:
         last_action_char_increment_lengths = torch.zeros((bsize,), dtype=torch.long, device=device)
         action_stable_counts = torch.zeros((bsize,), dtype=torch.long, device=device)
         action_stable_snapshot_counts = torch.zeros((bsize,), dtype=torch.long, device=device)
+        target_reached_lengths = torch.zeros((bsize,), dtype=torch.long, device=device)
         previous_action_snapshots: list[torch.Tensor | None] = [None] * bsize
         stopped_by_chars = torch.zeros((bsize,), dtype=torch.bool, device=device)
         stopped_by_char_plateau = torch.zeros((bsize,), dtype=torch.bool, device=device)
         stopped_by_restart_fallback = torch.zeros((bsize,), dtype=torch.bool, device=device)
         restarted_with_count_reset = torch.zeros((bsize,), dtype=torch.bool, device=device)
+        reset_requires_action_end = torch.zeros((bsize,), dtype=torch.bool, device=device)
         pending_restart_reset = torch.zeros((bsize,), dtype=torch.bool, device=device)
         post_restart_action_char_counts = torch.zeros((bsize,), dtype=torch.long, device=device)
         post_restart_last_action_char_increment_lengths = torch.zeros((bsize,), dtype=torch.long, device=device)
@@ -1986,6 +2089,8 @@ class PI0FastTokenLogitAdapter:
         blocked_by_char_plateau_stability = torch.zeros((bsize,), dtype=torch.bool, device=device)
         blocked_by_char_plateau_eos_restart = torch.zeros((bsize,), dtype=torch.bool, device=device)
         blocked_by_char_plateau_low_text_tail = torch.zeros((bsize,), dtype=torch.bool, device=device)
+        blocked_by_reset_requires_action_end = torch.zeros((bsize,), dtype=torch.bool, device=device)
+        blocked_by_target_confirmation = torch.zeros((bsize,), dtype=torch.bool, device=device)
         plateau_tail_seen_eos = torch.zeros((bsize,), dtype=torch.bool, device=device)
         plateau_tail_eos_restart = torch.zeros((bsize,), dtype=torch.bool, device=device)
         eos_token_id = int(getattr(self.model._paligemma_tokenizer, "eos_token_id", -1) or -1)
@@ -2046,11 +2151,14 @@ class PI0FastTokenLogitAdapter:
                     else:
                         action_char_counts[restart_rows] = 0
                         last_action_char_increment_lengths[restart_rows] = 0
+                        target_reached_lengths[restart_rows] = 0
                         action_stable_counts[restart_rows] = 0
                         action_stable_snapshot_counts[restart_rows] = 0
                         plateau_tail_seen_eos[restart_rows] = False
                         plateau_tail_eos_restart[restart_rows] = False
                         restarted_with_count_reset[restart_rows] = True
+                        if action_char_reset_requires_action_end:
+                            reset_requires_action_end[restart_rows] = True
                         for row_idx in restart_rows.detach().cpu().tolist():
                             previous_action_snapshots[int(row_idx)] = None
                 else:
@@ -2097,12 +2205,15 @@ class PI0FastTokenLogitAdapter:
                     last_action_char_increment_lengths[reset_rows] = post_restart_last_action_char_increment_lengths[
                         reset_rows
                     ]
+                    target_reached_lengths[reset_rows] = 0
                     action_stable_counts[reset_rows] = 0
                     action_stable_snapshot_counts[reset_rows] = 0
                     plateau_tail_seen_eos[reset_rows] = False
                     plateau_tail_eos_restart[reset_rows] = False
                     pending_restart_reset[reset_rows] = False
                     restarted_with_count_reset[reset_rows] = True
+                    if action_char_reset_requires_action_end:
+                        reset_requires_action_end[reset_rows] = True
                     for row_idx in reset_rows.detach().cpu().tolist():
                         previous_action_snapshots[int(row_idx)] = None
             if action_char_plateau_reject_eos_restart and has_restart_guard_tokens:
@@ -2111,9 +2222,24 @@ class PI0FastTokenLogitAdapter:
                 if bool(torch.any(not_incremented)):
                     tail_rows = active_indices[not_incremented]
                     plateau_tail_seen_eos[tail_rows] |= selected_is_eos[not_incremented]
-            reached_target = action_char_counts[active_indices] >= int(action_char_target)
+            if action_char_strict_target_stop:
+                reached_target = action_char_counts[active_indices] > int(action_char_target)
+            else:
+                reached_target = action_char_counts[active_indices] >= int(action_char_target)
             if action_char_target <= 0:
                 reached_target = torch.zeros_like(reached_target, dtype=torch.bool)
+            if action_char_target_confirm_tokens > 0 and bool(torch.any(reached_target)):
+                first_reached = reached_target & (target_reached_lengths[active_indices] <= 0)
+                if bool(torch.any(first_reached)):
+                    first_rows = active_indices[first_reached]
+                    target_reached_lengths[first_rows] = emitted_lengths[first_rows]
+                confirmed = (
+                    emitted_lengths[active_indices] - target_reached_lengths[active_indices]
+                    >= int(action_char_target_confirm_tokens)
+                )
+                blocked = reached_target & ~confirmed
+                blocked_by_target_confirmation[active_indices] |= blocked
+                reached_target = reached_target & confirmed
             restart_fallback = torch.zeros_like(reached_target, dtype=torch.bool)
             if action_char_plateau_reject_eos_restart and has_restart_guard_tokens:
                 restart_tainted = plateau_tail_eos_restart[active_indices]
@@ -2155,6 +2281,12 @@ class PI0FastTokenLogitAdapter:
                 blocked = stable_guard & ~stable_enough
                 blocked_by_char_plateau_stability[active_indices] |= blocked
                 plateau = plateau & (~stable_guard | stable_enough)
+            if action_char_reset_requires_action_end:
+                require_action_end = reset_requires_action_end[active_indices]
+                blocked = (reached_target | plateau) & require_action_end
+                blocked_by_reset_requires_action_end[active_indices] |= blocked
+                reached_target = reached_target & ~require_action_end
+                plateau = plateau & ~require_action_end
             reached = reached_target | plateau
             stopped_by_chars[active_indices] |= reached
             stopped_by_char_plateau[active_indices] |= plateau
@@ -2181,6 +2313,12 @@ class PI0FastTokenLogitAdapter:
                     int(plateau_tail_eos_restart.sum().item()) if action_char_restart_continue else 0
                 )
                 self._last_action_char_restart_reset_count = int(restarted_with_count_reset.sum().item())
+                self._last_action_char_reset_requires_action_end_block_count = int(
+                    blocked_by_reset_requires_action_end.sum().item()
+                )
+                self._last_action_char_target_confirm_block_count = int(
+                    blocked_by_target_confirmation.sum().item()
+                )
                 self._last_action_char_count_mean = float(action_char_counts.float().mean().item())
                 self._last_action_char_stable_snapshot_count_mean = float(
                     action_stable_snapshot_counts.float().mean().item()

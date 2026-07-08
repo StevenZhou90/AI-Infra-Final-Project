@@ -169,6 +169,51 @@ def test_pi0fast_action_end_decode_can_stop_after_action_chars() -> None:
     assert adapter._last_action_char_count_mean == 8.0
 
 
+def test_pi0fast_strict_action_char_target_waits_for_extra_action_token() -> None:
+    adapter = PI0FastTokenLogitAdapter(_CharStopPolicy())
+    adapter._match_model_precision = lambda tensor: tensor
+    adapter._action_key = lambda: "action"
+
+    token_ids = adapter.sample_actions_fast_kv_cache_action_end(
+        images=torch.empty(1),
+        img_masks=torch.empty(1),
+        tokens=torch.zeros((1, 2), dtype=torch.long),
+        masks=torch.ones((1, 2), dtype=torch.bool),
+        max_decoding_steps=8,
+        stop_on_action_chars=True,
+        action_char_strict_target_stop=True,
+    )
+
+    assert token_ids.tolist() == [[90, 91, 92, 99]]
+    assert adapter._last_action_char_stop_count == 1
+    assert adapter._last_action_char_count_mean == 12.0
+    assert adapter._last_action_char_strict_target_stop is True
+
+
+def test_pi0fast_action_char_target_confirmation_waits_after_target_hit() -> None:
+    policy = _CharStopPolicy()
+    policy.model._targets = [90, 91, 80, 99]
+    adapter = PI0FastTokenLogitAdapter(policy)
+    adapter._match_model_precision = lambda tensor: tensor
+    adapter._action_key = lambda: "action"
+
+    token_ids = adapter.sample_actions_fast_kv_cache_action_end(
+        images=torch.empty(1),
+        img_masks=torch.empty(1),
+        tokens=torch.zeros((1, 2), dtype=torch.long),
+        masks=torch.ones((1, 2), dtype=torch.bool),
+        max_decoding_steps=8,
+        stop_on_action_chars=True,
+        action_char_target_confirm_tokens=1,
+    )
+
+    assert token_ids.tolist() == [[90, 91, 80, 99]]
+    assert adapter._last_action_char_stop_count == 1
+    assert adapter._last_action_char_target_confirm_tokens == 1
+    assert adapter._last_action_char_target_confirm_block_count == 1
+    assert adapter._last_action_char_count_mean == 8.0
+
+
 def test_pi0fast_action_char_lookup_avoids_hot_loop_tokenizer_decode() -> None:
     policy = _CharStopPolicy()
     adapter = PI0FastTokenLogitAdapter(policy)
@@ -457,6 +502,34 @@ def test_pi0fast_action_char_restart_reset_can_wait_for_low_text() -> None:
     assert adapter._last_action_char_count_mean == 8.0
 
 
+def test_pi0fast_action_char_reset_requires_action_end_waits_after_reset() -> None:
+    policy = _CharStopPolicy()
+    policy.model._targets = [90, 5, 91, 92, 80, 99]
+    adapter = PI0FastTokenLogitAdapter(policy)
+    adapter._match_model_precision = lambda tensor: tensor
+    adapter._action_key = lambda: "action"
+
+    token_ids = adapter.sample_actions_fast_kv_cache_action_end(
+        images=torch.empty(1),
+        img_masks=torch.empty(1),
+        tokens=torch.zeros((1, 2), dtype=torch.long),
+        masks=torch.ones((1, 2), dtype=torch.bool),
+        max_decoding_steps=8,
+        stop_on_action_chars=True,
+        action_char_plateau_reject_eos_restart=True,
+        action_char_restart_reset=True,
+        action_char_reset_requires_action_end=True,
+    )
+
+    assert token_ids.tolist() == [[90, 5, 91, 92, 80, 99]]
+    assert adapter._last_action_char_stop_count == 0
+    assert adapter._last_action_char_restart_fallback_count == 0
+    assert adapter._last_action_char_restart_reset_count == 1
+    assert adapter._last_action_char_reset_requires_action_end is True
+    assert adapter._last_action_char_reset_requires_action_end_block_count == 1
+    assert adapter._last_action_char_count_mean == 8.0
+
+
 def test_pi0fast_action_char_plateau_allows_repeated_eos_tail() -> None:
     policy = _CharStopPolicy()
     policy.model._targets = [90, 5, 5, 5, 99]
@@ -684,6 +757,38 @@ def test_pi0fast_constrained_action_char_restart_reset_can_wait_for_low_text() -
     assert adapter._last_action_char_restart_reset_low_text_tokens == 1
     assert adapter._last_action_char_plateau_low_text_tail_tokens == 2
     assert adapter._last_action_char_restart_reset_count == 1
+    assert adapter._last_action_char_count_mean == 8.0
+
+
+def test_pi0fast_constrained_action_char_reset_requires_action_end_waits_after_reset() -> None:
+    policy = _CharStopPolicy()
+    policy.model._targets = [90, 5, 91, 92, 80, 99]
+    _install_identity_linear_head(policy)
+    adapter = PI0FastTokenLogitAdapter(policy)
+    adapter._match_model_precision = lambda tensor: tensor
+    adapter._action_key = lambda: "action"
+
+    token_ids = adapter.sample_actions_fast_kv_cache_action_end_constrained(
+        images=torch.empty(1),
+        img_masks=torch.empty(1),
+        tokens=torch.zeros((1, 2), dtype=torch.long),
+        masks=torch.ones((1, 2), dtype=torch.bool),
+        max_decoding_steps=8,
+        force_action_prefix=False,
+        action_vocab_size=128,
+        text_vocab_size=128,
+        stop_on_action_chars=True,
+        action_char_plateau_reject_eos_restart=True,
+        action_char_restart_reset=True,
+        action_char_reset_requires_action_end=True,
+    )
+
+    assert token_ids.tolist() == [[90, 5, 91, 92, 80, 99]]
+    assert adapter._last_action_char_stop_count == 0
+    assert adapter._last_action_char_restart_fallback_count == 0
+    assert adapter._last_action_char_restart_reset_count == 1
+    assert adapter._last_action_char_reset_requires_action_end is True
+    assert adapter._last_action_char_reset_requires_action_end_block_count == 1
     assert adapter._last_action_char_count_mean == 8.0
 
 

@@ -369,6 +369,9 @@ def _predict_target_eos_chunk(
     action_char_restart_reset: bool = False,
     action_char_restart_reset_low_text_tokens: int = 0,
     action_char_plateau_low_text_tail_tokens: int = 0,
+    action_char_strict_target_stop: bool = False,
+    action_char_reset_requires_action_end: bool = False,
+    action_char_target_confirm_tokens: int = 0,
 ) -> PredictionTrace:
     if stop_on_action_chars and hasattr(token_adapter, "prepare_action_char_length_lookup"):
         token_adapter.prepare_action_char_length_lookup(device=device)
@@ -397,6 +400,9 @@ def _predict_target_eos_chunk(
             action_char_restart_reset=action_char_restart_reset,
             action_char_restart_reset_low_text_tokens=action_char_restart_reset_low_text_tokens,
             action_char_plateau_low_text_tail_tokens=action_char_plateau_low_text_tail_tokens,
+            action_char_strict_target_stop=action_char_strict_target_stop,
+            action_char_reset_requires_action_end=action_char_reset_requires_action_end,
+            action_char_target_confirm_tokens=action_char_target_confirm_tokens,
         )
     else:
         trace = token_adapter.predict_action_chunk_action_end(
@@ -413,6 +419,9 @@ def _predict_target_eos_chunk(
             action_char_restart_reset=action_char_restart_reset,
             action_char_restart_reset_low_text_tokens=action_char_restart_reset_low_text_tokens,
             action_char_plateau_low_text_tail_tokens=action_char_plateau_low_text_tail_tokens,
+            action_char_strict_target_stop=action_char_strict_target_stop,
+            action_char_reset_requires_action_end=action_char_reset_requires_action_end,
+            action_char_target_confirm_tokens=action_char_target_confirm_tokens,
         )
     if device.startswith("cuda") and torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -1133,6 +1142,9 @@ def run_episode(
     target_eos_action_char_restart_reset: bool,
     target_eos_action_char_restart_reset_low_text_tokens: int,
     target_eos_action_char_plateau_low_text_tail_tokens: int,
+    target_eos_action_char_strict_target_stop: bool,
+    target_eos_action_char_reset_requires_action_end: bool,
+    target_eos_action_char_target_confirm_tokens: int,
     token_trace_sink: TokenTraceSink | None,
     device: str,
     use_amp: bool,
@@ -2165,6 +2177,11 @@ def run_episode(
                                 action_char_plateau_low_text_tail_tokens=(
                                     target_eos_action_char_plateau_low_text_tail_tokens
                                 ),
+                                action_char_strict_target_stop=target_eos_action_char_strict_target_stop,
+                                action_char_reset_requires_action_end=(
+                                    target_eos_action_char_reset_requires_action_end
+                                ),
+                                action_char_target_confirm_tokens=target_eos_action_char_target_confirm_tokens,
                             )
                         restart_fallback_count = int(
                             (prediction.stats or {}).get("action_char_restart_fallback_count", 0)
@@ -2698,6 +2715,31 @@ def parse_args() -> argparse.Namespace:
         help=(
             "If positive, block target_eos_charstop plateau stops when the no-action tail contains "
             "at least this many non-prefix low/text tokens."
+        ),
+    )
+    parser.add_argument(
+        "--target-eos-action-char-strict-target-stop",
+        action="store_true",
+        help=(
+            "Require decoded FAST-character count to exceed, not merely equal, the action target "
+            "before target_eos_charstop can use the target-count stop."
+        ),
+    )
+    parser.add_argument(
+        "--target-eos-action-char-reset-requires-action-end",
+        action="store_true",
+        help=(
+            "After an EOS/BOS restart reset, suppress target_eos_charstop char/plateau stops "
+            "until the normal PI0-FAST action-end token is emitted."
+        ),
+    )
+    parser.add_argument(
+        "--target-eos-action-char-target-confirm-tokens",
+        type=int,
+        default=0,
+        help=(
+            "If positive, wait this many generated tokens after first crossing the decoded "
+            "FAST-character target before target_eos_charstop may use the target-count stop."
         ),
     )
     parser.add_argument(
@@ -3759,6 +3801,15 @@ def main() -> None:
                     target_eos_action_char_plateau_low_text_tail_tokens=(
                         args.target_eos_action_char_plateau_low_text_tail_tokens
                     ),
+                    target_eos_action_char_strict_target_stop=(
+                        args.target_eos_action_char_strict_target_stop
+                    ),
+                    target_eos_action_char_reset_requires_action_end=(
+                        args.target_eos_action_char_reset_requires_action_end
+                    ),
+                    target_eos_action_char_target_confirm_tokens=(
+                        args.target_eos_action_char_target_confirm_tokens
+                    ),
                     token_trace_sink=token_trace_sink,
                     device=str(device),
                     use_amp=args.use_amp,
@@ -3809,6 +3860,11 @@ def main() -> None:
         "target_eos_action_char_plateau_low_text_tail_tokens": (
             args.target_eos_action_char_plateau_low_text_tail_tokens
         ),
+        "target_eos_action_char_strict_target_stop": args.target_eos_action_char_strict_target_stop,
+        "target_eos_action_char_reset_requires_action_end": (
+            args.target_eos_action_char_reset_requires_action_end
+        ),
+        "target_eos_action_char_target_confirm_tokens": args.target_eos_action_char_target_confirm_tokens,
         "num_inference_steps": args.num_inference_steps,
         "task": args.task,
         "task_id": args.task_id,
