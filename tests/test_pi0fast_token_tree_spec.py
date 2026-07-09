@@ -723,6 +723,64 @@ def test_pi0fast_constrained_extra_tokens_extend_candidate_set() -> None:
     assert adapter._last_constrained_candidate_size == 145
 
 
+def test_pi0fast_constrained_head_respects_lm_head_bias() -> None:
+    policy = _CharStopPolicy()
+    policy.action_tokenizer.vocab_size = 16
+    policy.model._targets = [90]
+    head = torch.nn.Linear(200, 200, bias=True)
+    with torch.no_grad():
+        head.weight.zero_()
+        head.bias.zero_()
+        head.bias[150] = 1.0
+    policy.model.paligemma_with_expert.paligemma.lm_head = head
+    adapter = PI0FastTokenLogitAdapter(policy)
+    adapter._match_model_precision = lambda tensor: tensor
+
+    token_ids = adapter.sample_actions_fast_kv_cache_action_end_constrained(
+        images=torch.empty(1),
+        img_masks=torch.empty(1),
+        tokens=torch.zeros((1, 2), dtype=torch.long),
+        masks=torch.ones((1, 2), dtype=torch.bool),
+        max_decoding_steps=1,
+        force_action_prefix=False,
+        action_vocab_size=16,
+        text_vocab_size=0,
+        structural_token_radius=0,
+        extra_token_ids=[150],
+    )
+
+    assert token_ids.tolist() == [[150]]
+    assert adapter._last_constrained_extra_token_count == 1
+
+
+def test_pi0fast_constrained_head_uses_argmax_tie_break() -> None:
+    policy = _CharStopPolicy()
+    policy.action_tokenizer.vocab_size = 0
+    policy.model._targets = [90]
+    head = torch.nn.Linear(200, 200, bias=True)
+    with torch.no_grad():
+        head.weight.zero_()
+        head.bias.zero_()
+    policy.model.paligemma_with_expert.paligemma.lm_head = head
+    adapter = PI0FastTokenLogitAdapter(policy)
+    adapter._match_model_precision = lambda tensor: tensor
+
+    token_ids = adapter.sample_actions_fast_kv_cache_action_end_constrained(
+        images=torch.empty(1),
+        img_masks=torch.empty(1),
+        tokens=torch.zeros((1, 2), dtype=torch.long),
+        masks=torch.ones((1, 2), dtype=torch.bool),
+        max_decoding_steps=1,
+        force_action_prefix=False,
+        action_vocab_size=0,
+        text_vocab_size=0,
+        structural_token_radius=0,
+        extra_token_ids=[151, 150],
+    )
+
+    assert token_ids.tolist() == [[2]]
+
+
 def test_pi0fast_constrained_action_char_restart_continue_blocks_target_stop() -> None:
     policy = _CharStopPolicy()
     policy.config.n_action_steps = 3

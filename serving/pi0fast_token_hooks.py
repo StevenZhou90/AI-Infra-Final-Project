@@ -2018,10 +2018,17 @@ class PI0FastTokenLogitAdapter:
             )
             candidate_ids = torch.unique(candidate_ids)
             candidate_weight = lm_head.weight.index_select(0, candidate_ids).contiguous()
+            lm_head_bias = getattr(lm_head, "bias", None)
+            candidate_bias = (
+                None
+                if lm_head_bias is None
+                else lm_head_bias.index_select(0, candidate_ids).contiguous()
+            )
             cached = {
                 "key": candidate_cache_key,
                 "candidate_ids": candidate_ids,
                 "candidate_weight": candidate_weight,
+                "candidate_bias": candidate_bias,
                 "candidate_size": int(candidate_ids.numel()),
                 "action_vocab_size": int(action_vocab_size),
                 "text_vocab_size": int(text_vocab_size),
@@ -2031,6 +2038,7 @@ class PI0FastTokenLogitAdapter:
             self._constrained_lm_head_cache = cached
         candidate_ids = cached["candidate_ids"]
         candidate_weight = cached["candidate_weight"]
+        candidate_bias = cached["candidate_bias"]
         self._last_constrained_candidate_size = int(candidate_ids.numel())
         self._last_constrained_action_vocab_size = int(cached["action_vocab_size"])
         self._last_constrained_text_vocab_size = int(cached["text_vocab_size"])
@@ -2064,15 +2072,15 @@ class PI0FastTokenLogitAdapter:
 
         def restricted_next(hidden: torch.Tensor) -> torch.Tensor:
             nonlocal restricted_head_calls, full_head_fallbacks, margin_min, margin_sum
-            logits = F.linear(hidden, candidate_weight)
+            logits = F.linear(hidden, candidate_weight, candidate_bias)
             step_logits = logits[:, -1, :].float()
             restricted_head_calls += int(step_logits.shape[0])
             if step_logits.shape[-1] >= 2:
+                local = torch.argmax(step_logits, dim=-1)
                 top_values, top_indices = torch.topk(step_logits, k=2, dim=-1)
                 margins = top_values[:, 0] - top_values[:, 1]
                 margin_min = min(margin_min, float(torch.min(margins).item()))
                 margin_sum += float(torch.sum(margins).item())
-                local = top_indices[:, 0]
                 if full_head_margin is not None and bool(torch.any(margins < float(full_head_margin))):
                     full_head_fallbacks += int(step_logits.shape[0])
                     return full_next(hidden)

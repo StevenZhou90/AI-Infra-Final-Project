@@ -44,6 +44,17 @@ Recent 2026-07-09 probes on the matched task-id/seed subset:
 | `outputs/pi0fast_target_eos_fastpath_probe_rq` | current no-logits target-EOS | `6` | `1 -> 1` | `331.5` | `1.83x` | object reaches `2.04x`, spatial/goal stay near `1.74x` |
 | `outputs/pi0fast_target_eos_no_gc_probe_rq` | target-EOS with `--disable-gradient-checkpointing` | `6` | `1 -> 1` | `333.3` | `1.82x` | neutral-to-worse; do not promote |
 | `outputs/pi0fast_constrained_struct_margin1_validate_6x50_rq` | constrained head, margin `1.0`, object rows only | `2` | exact actions/tokens | `416.5`, `469.5` | slower than target-EOS | exact but too many full-head fallbacks |
+| `outputs/pi0fast_empirical_vocab_smoke/shrunk_candidate_argmax` | 2-row empirical vocab, 1k restricted head | `1` | not exact | `186.8` | `2.12x` vs target-EOS smoke | fast but action diff; do not promote |
+| `outputs/pi0fast_empirical_vocab_smoke/shrunk_candidate_prefix32_margin001` | same-slice empirical vocab, full-head prefix 32 | `1` | exact tokens/actions | `187.5` | `2.06x` vs target-EOS smoke | overfit smoke only; useful mechanism check |
+| `outputs/pi0fast_empirical_vocab_probe_3task/heldout_task3_prefix32` | tasks 0-2 calibration, task 3 heldout | `1` | not exact | `209.1` | `1.85x` vs target-EOS smoke | heldout mismatch after prefix; needs broader calibration/adaptive fallback |
+| `outputs/pi0fast_empirical_vocab_probe_3task/heldout_task3_prefix64` | tasks 0-2 calibration, task 3 heldout, prefix 64 | `1` | exact tokens/actions | `210.0` | `1.85x` vs target-EOS smoke | exact because restricted tail unused on this slice; not proof of generalization |
+
+The empirical-vocab path now has two important correctness fixes in
+`serving/pi0fast_token_hooks.py`: the sliced restricted LM head includes
+`lm_head.bias`, and selected tokens use `argmax` over sorted candidate IDs
+instead of `topk` tie ordering. These are required for parity with the full
+head, but the heldout probe shows whitelist coverage is still the limiting
+factor.
 
 The next required evidence step is still the strict 120 matched-eval gate:
 
