@@ -868,6 +868,7 @@ class PI0FastTokenLogitAdapter:
         skip_unproductive_checks: bool = False,
         skip_unproductive_after_checkpoint: int = 0,
         continue_to_action_end_on_unstable: bool = False,
+        stability_continue_to_action_end: bool = False,
         prefix_gate: Any | None = None,
         prefix_gate_threshold: float = 0.98,
         early_stop_action_end: bool = True,
@@ -924,6 +925,7 @@ class PI0FastTokenLogitAdapter:
         stable_count = 0
         action_snapshots = 0
         checked: list[dict[str, Any]] = []
+        continuing_after_stability_stop: dict[str, float] | None = None
 
         def candidate_trace() -> tuple[torch.Tensor, torch.Tensor]:
             token_ids = torch.tensor([generated_tokens], dtype=torch.long, device=device)
@@ -980,6 +982,13 @@ class PI0FastTokenLogitAdapter:
                     "stopped_on_stability": False,
                     "stopped_on_action_end": True,
                 }
+                if continuing_after_stability_stop is not None:
+                    stats.update(
+                        {
+                            "continued_after_stability_stop": True,
+                            **continuing_after_stability_stop,
+                        }
+                    )
                 return PI0FastGenerationTrace(actions=actions, token_ids=token_ids, logits=torch.cat(logits_by_step, dim=1), stats=stats)
 
             while checkpoint_idx < len(checkpoints) and len(generated_tokens) >= checkpoints[checkpoint_idx]:
@@ -1033,7 +1042,19 @@ class PI0FastTokenLogitAdapter:
                 if checkpoint_stable_checks and checkpoint in checkpoint_stable_checks:
                     required_stable_checks = checkpoint_stable_checks[checkpoint]
                 can_stop_at_checkpoint = max_stable_checkpoint is None or checkpoint <= max_stable_checkpoint
-                if stable_count >= required_stable_checks and can_stop_at_checkpoint:
+                if (
+                    stable_count >= required_stable_checks
+                    and can_stop_at_checkpoint
+                    and continuing_after_stability_stop is None
+                ):
+                    if stability_continue_to_action_end:
+                        checked[-1]["continued_to_action_end"] = True
+                        continuing_after_stability_stop = {
+                            "stability_continue_checkpoint": float(checkpoint),
+                            "stability_continue_required_checks": float(required_stable_checks),
+                            "stability_continue_stable_count": float(stable_count),
+                        }
+                        continue
                     gate_prob = gate_probability(checkpoint, token_ids, actions)
                     if gate_prob is not None and gate_prob < prefix_gate_threshold:
                         checked[-1]["gate_probability"] = gate_prob
@@ -1077,7 +1098,7 @@ class PI0FastTokenLogitAdapter:
             )
             prev_logits = lm_head(step_out[:, -1:, :])
 
-        if continue_to_action_end_on_unstable:
+        if continue_to_action_end_on_unstable or continuing_after_stability_stop is not None:
             max_action_tokens = int(self.model.config.max_action_tokens)
             while len(generated_tokens) < max_action_tokens:
                 next_token = torch.argmax(prev_logits[:, -1], dim=-1, keepdim=True)
@@ -1094,6 +1115,13 @@ class PI0FastTokenLogitAdapter:
                         "stopped_on_action_end": True,
                         "continued_on_unstable": True,
                     }
+                    if continuing_after_stability_stop is not None:
+                        stats.update(
+                            {
+                                "continued_after_stability_stop": True,
+                                **continuing_after_stability_stop,
+                            }
+                        )
                     return PI0FastGenerationTrace(
                         actions=actions,
                         token_ids=token_ids,
@@ -1133,6 +1161,13 @@ class PI0FastTokenLogitAdapter:
                 "stopped_on_action_end": False,
                 "continued_on_unstable": True,
             }
+            if continuing_after_stability_stop is not None:
+                stats.update(
+                    {
+                        "continued_after_stability_stop": True,
+                        **continuing_after_stability_stop,
+                    }
+                )
             return PI0FastGenerationTrace(
                 actions=actions,
                 token_ids=token_ids,

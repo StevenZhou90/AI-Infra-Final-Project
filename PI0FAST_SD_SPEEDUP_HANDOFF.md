@@ -17,13 +17,13 @@ prefix hybrid at
 `outputs/robotics_spec_120_proof/pi0fast_adaptive_object_ck152_stable4_hybrid/gate.json`
 passes the strict 120-row speed gate at `302.5 ms/control` (`2.01x`) with
 matched steps and zero success drop. It is not a final candidate as-is because
-focused exact validation found another object failure. The current next
-candidate adds a selective late-stability target-EOS fallback: object uses
-checkpoint `152`, stable checks `4`, and at most one target-EOS fallback after
-control step `200` when a chunk stopped by stability; spatial and goal retain
-stable checks `3`. The strict best fully validated artifact remains exact
-target-EOS early stop, documented in `docs/pi0fast_target_eos.md`, but it is
-short of the required `2.0x` speedup.
+focused exact validation found another object failure. A selective late
+target-EOS fallback fixed the known bad rows but was too slow in a partial
+object speed shard. The current next step is a narrower safety gate for late
+stability stops, ideally using scalar features from the stop candidate rather
+than falling back on every late stability stop. The strict best fully validated
+artifact remains exact target-EOS early stop, documented in
+`docs/pi0fast_target_eos.md`, but it is short of the required `2.0x` speedup.
 PI0-FAST's fixed-budget decoder keeps generating after the FAST action-end
 marker (`|`), while LeRobot detokenization ignores the tail. Stopping when the
 target model emits action-end preserves the continuous action chunk while
@@ -83,6 +83,9 @@ Recent 2026-07-09 probes on the matched task-id/seed subset:
 | `outputs/pi0fast_adaptive_mismatch_object0_ep1_ck152_stable4_trace_rq` | traced failing row, object checkpoint `152`, stable checks `4` | `1` | one bad refresh out of `30` | `879.0` validate | diagnostic only | bad refresh was step `210`, stability stop at checkpoint `152`, emitted `153` tokens while target fallback had `197` tokens |
 | `outputs/pi0fast_adaptive_mismatch_object0_ep1_ck152_stable4_late200_once_rq` | object checkpoint `152`, stable checks `4`, one late stability target-EOS fallback after step `200` | `1` | `0 -> 0`, `max_action_diff=0.0` | `270.6` speed / `798.9` validate | diagnostic only | fixes object task `0`, episode `1`; one fallback per episode kept speed much lower than uncapped fallback |
 | `outputs/pi0fast_adaptive_mismatch_object1_ep1_ck152_stable4_late200_once_rq` | same once-capped late fallback | `1` | `0 -> 0`, `max_action_diff=0.0` | `263.1` speed / `852.1` validate | diagnostic only | preserves exactness on the task `1`, episode `1` row that killed the first hybrid |
+| `outputs/robotics_spec_120_proof/pi0fast_adaptive_object_ck152_stable4_late200_once_hybrid/speed/target_eos_adaptive/libero_object/metrics.jsonl` | partial object speed shard, one late target-EOS fallback after step `200` | `6` | running shard stopped early | `268.6` | too slow | exceeded the object budget `255.8 ms/control`; do not finish this candidate as a global object policy |
+| `outputs/pi0fast_adaptive_mismatch_object0_ep1_ck152_stable4_continue200_once_rq` | one late stability continuation to action-end using existing KV cache | `1` | `0 -> 0`, `max_action_diff=0.0` | `264.7` speed / `807.7` validate | diagnostic only | exact and cheaper than target-EOS fallback, but still too slow unless a narrower trigger is found |
+| `outputs/pi0fast_adaptive_mismatch_object0_ep1_ck152_stable4_confirm192_rq` | disallow stops at checkpoints `152` and `160`, first stability stop at `192` | `1` | `0 -> 0`, `max_action_diff=0.0` | `279.3` speed / `801.2` validate | diagnostic only | exact but slower than action-end continuation; not speed-viable globally |
 
 The empirical-vocab path now has two important correctness fixes in
 `serving/pi0fast_token_hooks.py`: the sliced restricted LM head includes
@@ -187,6 +190,10 @@ target-EOS fallback had `197` tokens. This motivated the new runner knobs in
   late stability stops.
 - `--adaptive-stability-target-eos-max-fallbacks N` to cap those fallbacks per
   episode.
+- `--adaptive-stability-continue-to-action-end-after-step STEP` to continue a
+  risky stability stop to the action-end token using the existing KV cache.
+- `--adaptive-stability-continue-to-action-end-max-fallbacks N` to cap those
+  continuations per episode.
 
 The checkpoint-level threshold probe (`152=5`) did not fix task `0`; it delayed
 the false positive to checkpoint `160`. The more promising focused candidate is
@@ -195,15 +202,31 @@ the once-capped late fallback: object checkpoint `152`, stable checks `4`,
 `--adaptive-stability-target-eos-max-fallbacks 1`. It fixed object task `0`,
 episode `1` with `max_action_diff=0.0` at `270.6 ms/control`, and preserved
 object task `1`, episode `1` exactness with `max_action_diff=0.0` at
-`263.1 ms/control`. This still needs a full speed shard and full exact
-validation before it can replace the speed-only hybrid.
+`263.1 ms/control`. It is not viable as a global object policy: the partial
+object speed shard under
+`outputs/robotics_spec_120_proof/pi0fast_adaptive_object_ck152_stable4_late200_once_hybrid`
+was stopped after `6` rows because it averaged `268.6 ms/control`, above the
+`255.8 ms/control` object budget needed for a `2.0x` 120-row hybrid.
 
-The next required evidence step is a full object speed shard for the once-capped
-late-fallback candidate, then the 120-row speed gate, then full exact validation
-plus final audit if speed still clears `2.0x`. The validation shards must use
-the same suite-conditional settings as the speed artifact:
+The KV-cache continuation probe is directionally better than from-scratch
+target-EOS fallback. On object task `0`, episode `1`, it had
+`max_action_diff=0.0` at `264.7 ms/control`; forcing stability confirmation to
+checkpoint `192` was also exact but slower at `279.3 ms/control`. Both are too
+slow if applied broadly. The next required evidence step is not a full 120-row
+run; it is a narrower late-stability safety gate. Recommended next moves:
 
-Object validation for the once-capped late-fallback candidate:
+- Export richer scalar features for stability-stop candidates, including stop
+  checkpoint, generated token count, logprob/entropy summary, and action-shape
+  features already used by `serving/pi0fast_prefix_gate.py`.
+- Train or hand-check a conservative gate on stop candidates, with heldout
+  tasks, that rejects the one bad late stability stop while keeping most safe
+  checkpoint-`152` stops.
+- Only after a gate keeps the object speed estimate below `255.8 ms/control`,
+  rerun the full object speed shard and then the 120-row speed gate.
+
+If a new gate passes speed, object validation should use the same
+suite-conditional settings as the speed artifact. A template for the current
+KV-cache continuation diagnostic is:
 
 ```bash
 for mode in target_eos_adaptive_validate target_eos_validate; do
@@ -214,7 +237,7 @@ python scripts/run_pi0fast_chunk_eval.py \
   --steps 300 \
   --modes "$mode" \
   --seed 42 \
-  --output-dir outputs/robotics_spec_120_proof/pi0fast_adaptive_object_ck152_stable4_late200_once_hybrid/validate/"$mode"/libero_object \
+  --output-dir outputs/robotics_spec_120_proof/pi0fast_adaptive_object_ck152_stable4_continue200_once_hybrid/validate/"$mode"/libero_object \
   --device cuda \
   --dtype bfloat16 \
   --smooth-position-delta 0.06 \
@@ -223,8 +246,8 @@ python scripts/run_pi0fast_chunk_eval.py \
   --adaptive-prefix-checkpoints 32,64,96,128,152,160,192,224 \
   --adaptive-stable-checks 4 \
   --adaptive-stable-tolerance 0.0 \
-  --adaptive-stability-target-eos-after-step 200 \
-  --adaptive-stability-target-eos-max-fallbacks 1
+  --adaptive-stability-continue-to-action-end-after-step 200 \
+  --adaptive-stability-continue-to-action-end-max-fallbacks 1
 done
 ```
 
@@ -240,7 +263,7 @@ python scripts/run_pi0fast_chunk_eval.py \
   --steps 300 \
   --modes "$mode" \
   --seed 42 \
-  --output-dir outputs/robotics_spec_120_proof/pi0fast_adaptive_object_ck152_stable4_late200_once_hybrid/validate/"$mode"/"$suite" \
+  --output-dir outputs/robotics_spec_120_proof/pi0fast_adaptive_object_ck152_stable4_continue200_once_hybrid/validate/"$mode"/"$suite" \
   --device cuda \
   --dtype bfloat16 \
   --smooth-position-delta 0.06 \
@@ -254,7 +277,7 @@ done
 ```
 
 After all validation shards exist, run the gate/final audit against
-`outputs/robotics_spec_120_proof/pi0fast_adaptive_object_ck152_stable4_late200_once_hybrid`.
+`outputs/robotics_spec_120_proof/pi0fast_adaptive_object_ck152_stable4_continue200_once_hybrid`.
 
 For a fresh canonical `pi0fast-adaptive` run, use a new root or remove stale
 stable-checks `1` adaptive speed shards before combining `--skip-existing` with
