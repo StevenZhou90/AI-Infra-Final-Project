@@ -19,8 +19,9 @@ from typing import Any
 
 
 PI0_PATTERN_PATHS = {"pi0fast-pattern", "pi05-pattern"}
+PI0_ADAPTIVE_PATHS = {"pi0fast-adaptive"}
 PI0_CONSTRAINED_PATHS = {"pi0fast-constrained"}
-PI0_PATHS = {"pi0fast-target-eos", *PI0_CONSTRAINED_PATHS, *PI0_PATTERN_PATHS}
+PI0_PATHS = {"pi0fast-target-eos", *PI0_ADAPTIVE_PATHS, *PI0_CONSTRAINED_PATHS, *PI0_PATTERN_PATHS}
 OPENVLA_PATHS = {"openvla"}
 
 
@@ -295,6 +296,17 @@ def build_pi0_command(args: argparse.Namespace) -> tuple[list[str], dict[str, An
     ]
     if args.path == "pi0fast-target-eos":
         cmd.extend(["--speed-modes", "baseline,target_eos", "--candidate-mode", "target_eos"])
+    elif args.path in PI0_ADAPTIVE_PATHS:
+        cmd.extend(
+            [
+                "--speed-modes",
+                "baseline,target_eos,target_eos_adaptive",
+                "--candidate-mode",
+                "target_eos_adaptive",
+                "--reference-mode",
+                "target_eos",
+            ]
+        )
     elif args.path in PI0_CONSTRAINED_PATHS:
         cmd.extend(
             [
@@ -353,6 +365,17 @@ def build_pi0_command(args: argparse.Namespace) -> tuple[list[str], dict[str, An
                 "--target-eos-constrained-no-force-prefix",
             ]
         )
+    if args.path in PI0_ADAPTIVE_PATHS:
+        extra_args.extend(
+            [
+                "--adaptive-prefix-checkpoints",
+                "32,64,96,128,160,192,224",
+                "--adaptive-stable-checks",
+                "1",
+                "--adaptive-stable-tolerance",
+                "0.0",
+            ]
+        )
     if args.path == "pi05-pattern":
         extra_args.extend(["--policy-kind", "pi05"])
         if args.pi05_policy is not None:
@@ -367,7 +390,9 @@ def build_pi0_command(args: argparse.Namespace) -> tuple[list[str], dict[str, An
         "proof_root": str(root),
         "runner": "pi0fast",
         "min_unique_tasks": min_unique_tasks,
-        "early_stop_reference": "target_eos" if args.path in PI0_PATTERN_PATHS | PI0_CONSTRAINED_PATHS else None,
+        "early_stop_reference": "target_eos"
+        if args.path in PI0_PATTERN_PATHS | PI0_ADAPTIVE_PATHS | PI0_CONSTRAINED_PATHS
+        else None,
         "expected_policy_kind": "pi05" if args.path == "pi05-pattern" else "pi0fast",
         "pattern_sweep_precheck": pattern_sweep_precheck,
     }

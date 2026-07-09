@@ -97,6 +97,24 @@ def test_target_eos_proof_runs_strict_pi0_gate_steps(tmp_path: Path) -> None:
     assert command[command.index("--max-success-drop") + 1] == "0.0"
 
 
+def test_adaptive_proof_runs_against_target_eos_reference(tmp_path: Path) -> None:
+    manifest = build_manifest(_args(tmp_path, path="pi0fast-adaptive"))
+    command = manifest["command"]
+
+    assert manifest["path"] == "pi0fast-adaptive"
+    assert manifest["early_stop_reference"] == "target_eos"
+    assert "--speed-modes" in command
+    assert command[command.index("--speed-modes") + 1] == "baseline,target_eos,target_eos_adaptive"
+    assert "--candidate-mode" in command
+    assert command[command.index("--candidate-mode") + 1] == "target_eos_adaptive"
+    assert "--reference-mode" in command
+    assert command[command.index("--reference-mode") + 1] == "target_eos"
+    assert "--adaptive-prefix-checkpoints" in command
+    assert command[command.index("--adaptive-prefix-checkpoints") + 1] == "32,64,96,128,160,192,224"
+    assert "--adaptive-stable-checks" in command
+    assert command[command.index("--adaptive-stable-checks") + 1] == "1"
+
+
 def test_pattern_proof_requires_sweep_json_by_default(tmp_path: Path) -> None:
     try:
         build_manifest(_args(tmp_path, path="pi0fast-pattern"))

@@ -10,13 +10,16 @@ The current experiments use `lerobot/pi0fast-libero` in LIBERO object tasks with
 
 ## Current Best Result
 
-Update: there is not yet a passing strict 120-row result. The strongest usable
-mechanism remains exact target-EOS early stop, documented in
-`docs/pi0fast_target_eos.md`, but the current strict gate artifact is short of
-the required `2.0x` speedup. PI0-FAST's fixed-budget decoder keeps generating
-after the FAST action-end marker (`|`), while LeRobot detokenization ignores the
-tail. Stopping when the target model emits action-end preserves the continuous
-action chunk while removing wasted target decode steps.
+Update: there is not yet a passing strict 120-row result. The strict best
+artifact remains exact target-EOS early stop, documented in
+`docs/pi0fast_target_eos.md`, but it is short of the required `2.0x` speedup.
+PI0-FAST's fixed-budget decoder keeps generating after the FAST action-end
+marker (`|`), while LeRobot detokenization ignores the tail. Stopping when the
+target model emits action-end preserves the continuous action chunk while
+removing wasted target decode steps. The best current candidate for closing the
+remaining gap is adaptive prefix cutoff: detokenize target prefixes at fixed
+checkpoints, append the action-end marker, and stop only when the continuous
+action snapshot is stable.
 
 Legacy 90-episode LIBERO result:
 
@@ -53,6 +56,10 @@ Recent 2026-07-09 probes on the matched task-id/seed subset:
 | `outputs/pi0fast_empirical_vocab_cross_suite/heldout_task3/libero_object_prefix24_action4096` | object/spatial/goal tasks 0-2 calibration, object task 3 heldout | `1` | `max_action_diff=0.0`, token mismatch in one chunk | `207.9` | `1.88x` vs target-EOS smoke | broader vocab preserves object heldout action equality |
 | `outputs/pi0fast_empirical_vocab_cross_suite/heldout_task3/libero_spatial_prefix24_action4096` | same cross-suite vocab, spatial task 3 heldout | `1` | `max_action_diff=0.0`, token exact in validation | `312.8` | `1.07x` vs target-EOS smoke | exact but speed collapses because long token generations remain |
 | `outputs/pi0fast_empirical_vocab_cross_suite/heldout_task3/libero_goal_prefix24_action4096` | same cross-suite vocab, goal task 3 heldout | `1` | `max_action_diff=0.0`, token exact in validation | `463.8` | `1.01x` vs target-EOS smoke | exact but no useful speedup |
+| `outputs/pi0fast_empirical_vocab_cross_suite/heldout_task3/libero_goal_prefix24_action4096_charplateau32_2` | constrained vocab + `min_chars=32`, plateau 2, goal task 3 heldout | `1` | `max_action_diff=0.0`, token exact in validation | `460.0` | `1.00x` vs target-EOS smoke | plateau never fired; one chunk ran to the 256-token ceiling with only 3 decoded action chars |
+| `outputs/pi0fast_adaptive_prefix_cross_suite_task3_ck32_224_stable1` | adaptive prefix checkpoints `32..224`, stable checks 1, object task 3 heldout | `1` | `max_action_diff=0.0` vs target-EOS | `213.5` | `1.86x` vs target-EOS smoke | action-stability cutoff recovers object speed without static vocab |
+| `outputs/pi0fast_adaptive_prefix_cross_suite_task3_ck32_224_stable1` | same adaptive setting, spatial task 3 heldout | `1` | `max_action_diff=0.0` vs target-EOS | `294.9` | `1.14x` vs target-EOS smoke | exact but only modest gain because target-EOS already emitted shorter chunks |
+| `outputs/pi0fast_adaptive_prefix_cross_suite_task3_ck32_224_stable1` | same adaptive setting, goal task 3 heldout | `1` | `max_action_diff=0.0` vs target-EOS | `298.8` | `1.54x` vs target-EOS smoke | fixes the no-stop-token 256-token goal chunk; best candidate to scale |
 
 The empirical-vocab path now has two important correctness fixes in
 `serving/pi0fast_token_hooks.py`: the sliced restricted LM head includes
@@ -79,7 +86,40 @@ exactness/generalization, but it is not enough for the final 120-task speed
 target unless paired with a safe early-execution/char-stop verifier or another
 mechanism that reduces target forward count.
 
-The next required evidence step is still the strict 120 matched-eval gate:
+The adaptive prefix path does not rely on an empirical vocabulary. On the
+task-3 heldout sweep above, it reduced average target-EOS latency from
+`398.2` to `269.1 ms/control` across object/spatial/goal with
+`max_action_diff=0.0` in validation. Relative to the existing strict fixed
+baseline average (`607.9 ms/control`), that heldout mean would be `2.26x`, but
+this is not a final claim until the strict 120 matched gate passes.
+
+The next required evidence step is the strict 120 matched-eval gate for
+`pi0fast-adaptive`:
+
+```bash
+python scripts/run_robotics_spec_120_proof.py \
+  --path pi0fast-adaptive \
+  --root outputs/robotics_spec_120_proof \
+  --run-preflight \
+  --require-hf-token \
+  --run-synthetic \
+  --run-final-audit \
+  --render-result-card \
+  --skip-existing
+```
+
+That wrapper expands to `baseline,target_eos,target_eos_adaptive`, uses
+`target_eos` as the early-stop reference, and validates both
+`target_eos_adaptive_validate` and `target_eos_validate`. The baked candidate
+settings are:
+
+```bash
+--adaptive-prefix-checkpoints 32,64,96,128,160,192,224 \
+--adaptive-stable-checks 1 \
+--adaptive-stable-tolerance 0.0
+```
+
+The target-EOS strict gate remains useful as the reference/baseline:
 
 ```bash
 python scripts/run_pi0fast_100_eval_gate.py \
@@ -118,12 +158,14 @@ python scripts/run_pi0fast_100_eval_gate.py \
   -- --pattern-lookahead 8 --pattern-action-dim 7 --pattern-reuse-full-blocks --pattern-emit-bonus-token
 ```
 
-For any other speculative candidate, include `target_eos` in `--speed-modes` and
-use `--reference-mode target_eos` so the result is compared against early stop,
-not only against the fixed-budget decode. The wrapper defaults speculative
-candidate reference thresholds to the main gate thresholds, so the candidate
-must also clear the speedup, success-drop, and regression checks versus
-`target_eos`.
+For non-`target_eos_*` speculative candidates, include `target_eos` in
+`--speed-modes` and use `--reference-mode target_eos` so the result is compared
+against early stop, not only against fixed-budget decode. The wrapper defaults
+those speculative candidate reference thresholds to the main gate thresholds, so
+pattern/block candidates must also clear speedup, success-drop, and regression
+checks versus `target_eos`. The adaptive path is a `target_eos_*` variant, so
+its hard `2.0x` speed gate is against the fixed-budget baseline while
+validation checks action equality against `target_eos`.
 
 To screen pattern settings before the expensive simulator run, sweep saved
 PI0-FAST FAST-token traces:
