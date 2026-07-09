@@ -275,6 +275,27 @@ is still slightly above the earlier estimated object budget of about
 `255.8 ms/control` for a `2.0x` 120-row hybrid, so this is promising but not a
 full-object or full-suite proof.
 
+The full object candidate speed shard now exists at
+`outputs/robotics_spec_120_proof/pi0fast_adaptive_object_ck152_stable4_riskgate_hybrid/speed/target_eos_adaptive/libero_object/metrics.jsonl`.
+Compared against the existing strict object baseline/target rows from the
+checkpoint-`152`, stable-checks-`4` hybrid, it has `40` matched rows, success
+`1 -> 1`, zero baseline-success regressions, zero step mismatches, and
+`251.4 ms/control`. That is `2.25x` versus the object fixed-budget baseline
+(`565.1 ms/control`) and `1.14x` versus object target-EOS (`286.7 ms/control`).
+It is under the earlier `255.8 ms/control` object budget. The risk gate fired on
+task `5`, episode `1`, seed `43`, and task `7`, episode `2`, seed `44`; it did
+not fire on task `0`, episode `1` in the full-order speed shard. A focused
+full-order validation for task `0`, episodes `0,1`, at
+`outputs/pi0fast_adaptive_object0_ep01_ck152_stable4_riskgate_validate_fullorder_rq/metrics.jsonl`
+had `max_action_diff=0.0` on both rows with `60` exact verifies per row. Object
+validation then checked the two rows where the full object speed shard fired the
+risk gate plus surrounding episodes:
+`outputs/pi0fast_adaptive_object_riskfired_ck152_stable4_riskgate_validate_fullorder_rq/metrics.jsonl`.
+Task `7`, episode `2`, seed `44` was exact (`max_action_diff=0.0`), but task
+`5`, episode `1`, seed `43` still had `max_action_diff=0.019725091755390167`
+with `adaptive_action_diff_fallback=1`. The current risk rule is therefore a
+good speed probe but not a final exactness gate.
+
 The checkpoint-level threshold probe (`152=5`) did not fix task `0`; it delayed
 the false positive to checkpoint `160`. The more promising focused candidate is
 the once-capped late fallback: object checkpoint `152`, stable checks `4`,
@@ -293,14 +314,16 @@ target-EOS fallback. On object task `0`, episode `1`, it had
 `max_action_diff=0.0` at `264.7 ms/control`; forcing stability confirmation to
 checkpoint `192` was also exact but slower at `279.3 ms/control`. Both are too
 slow if applied broadly. The next required evidence step is not a full 120-row
-run; it is a full object speed shard with the narrower risk gate. Recommended
+run; it is focused object validation for the narrower risk gate. Recommended
 next moves:
 
-- Rerun the full object speed shard with the risk gate. Spatial/goal can keep
-  the stable-checks `3` policy unless new validation failures appear.
-- If the full object average stays above about `255.8 ms/control`, tune the
-  late-stability risk rule or limit the fired fallback further before spending a
-  full 120-row speed run.
+- Trace/label object task `5`, episode `1`, seed `43` under the full-order
+  setting. The current risk gate fires once but still leaves a small action
+  mismatch, so the follow-up gate probably needs to catch a second later
+  stability stop or force a target/action-end fallback after the first rejection.
+- After task `5`, episode `1` is exact, run the remaining object
+  exact-validation shard in full-order settings. Spatial/goal can keep the
+  stable-checks `3` policy unless new validation failures appear.
 - Continue collecting stop-only labels on heldout rows if the risk gate fires on
   safe rows or another object validation failure appears.
 - Only after a gate keeps the object speed estimate below `255.8 ms/control`,
