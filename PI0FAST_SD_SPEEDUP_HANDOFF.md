@@ -50,6 +50,9 @@ Recent 2026-07-09 probes on the matched task-id/seed subset:
 | `outputs/pi0fast_empirical_vocab_probe_3task/heldout_task3_prefix64` | tasks 0-2 calibration, task 3 heldout, prefix 64 | `1` | exact tokens/actions | `210.0` | `1.85x` vs target-EOS smoke | exact because restricted tail unused on this slice; not proof of generalization |
 | `outputs/pi0fast_empirical_vocab_probe_3task/heldout_task3_prefix32_expand8` | tasks 0-2 vocab plus high-token radius 8, task 3 heldout | `1` | not exact | `211.4` | `1.84x` vs target-EOS smoke | neighborhood expansion alone did not fix action diff |
 | `outputs/pi0fast_empirical_vocab_probe_3task/heldout_task3_prefix32_expand8_action4096` | expanded vocab, 4096 high-action band, task 3 heldout | `1` | `max_action_diff=0.0`, token mismatch in one chunk | `210.7` | `1.85x` vs target-EOS smoke | promising action-exact candidate; scale before trusting |
+| `outputs/pi0fast_empirical_vocab_cross_suite/heldout_task3/libero_object_prefix24_action4096` | object/spatial/goal tasks 0-2 calibration, object task 3 heldout | `1` | `max_action_diff=0.0`, token mismatch in one chunk | `207.9` | `1.88x` vs target-EOS smoke | broader vocab preserves object heldout action equality |
+| `outputs/pi0fast_empirical_vocab_cross_suite/heldout_task3/libero_spatial_prefix24_action4096` | same cross-suite vocab, spatial task 3 heldout | `1` | `max_action_diff=0.0`, token exact in validation | `312.8` | `1.07x` vs target-EOS smoke | exact but speed collapses because long token generations remain |
+| `outputs/pi0fast_empirical_vocab_cross_suite/heldout_task3/libero_goal_prefix24_action4096` | same cross-suite vocab, goal task 3 heldout | `1` | `max_action_diff=0.0`, token exact in validation | `463.8` | `1.01x` vs target-EOS smoke | exact but no useful speedup |
 
 The empirical-vocab path now has two important correctness fixes in
 `serving/pi0fast_token_hooks.py`: the sliced restricted LM head includes
@@ -65,6 +68,16 @@ dynamic-vocabulary speculation: keep the active vocabulary compact, but cover
 nearby FAST quantization bins around target-observed action tokens. The
 `action4096` heldout probe suggests action equivalence may be recoverable with
 a wider high-action band even when exact token identity differs.
+
+A broader 2026-07-09 calibration used target-EOS traces from tasks 0-2 across
+`libero_object`, `libero_spatial`, and `libero_goal` (`18` chunks, `3` shards).
+The expanded whitelist had `1623` extra IDs. It validated action equality on
+heldout task 3 for all three suites, but only object got a meaningful speedup.
+Spatial and goal remained slow because the constrained decode still emitted
+long FAST token sequences. Conclusion: static active vocab can address
+exactness/generalization, but it is not enough for the final 120-task speed
+target unless paired with a safe early-execution/char-stop verifier or another
+mechanism that reduces target forward count.
 
 The next required evidence step is still the strict 120 matched-eval gate:
 
