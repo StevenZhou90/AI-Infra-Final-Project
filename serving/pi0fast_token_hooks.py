@@ -539,6 +539,7 @@ class PI0FastTokenLogitAdapter:
         min_verify_margin: float = 0.0,
         verify_from_scratch: bool = False,
         emit_bonus_token: bool = False,
+        defer_correction_token: bool = False,
         dynamic_lookahead: bool = False,
         min_lookahead: int = 1,
         lookahead_growth: int = 1,
@@ -574,6 +575,7 @@ class PI0FastTokenLogitAdapter:
             min_verify_margin=min_verify_margin,
             verify_from_scratch=verify_from_scratch,
             emit_bonus_token=emit_bonus_token,
+            defer_correction_token=defer_correction_token,
             dynamic_lookahead=dynamic_lookahead,
             min_lookahead=min_lookahead,
             lookahead_growth=lookahead_growth,
@@ -2443,6 +2445,7 @@ class PI0FastTokenLogitAdapter:
         min_verify_margin: float = 0.0,
         verify_from_scratch: bool = False,
         emit_bonus_token: bool = False,
+        defer_correction_token: bool = False,
         dynamic_lookahead: bool = False,
         min_lookahead: int = 1,
         lookahead_growth: int = 1,
@@ -2467,6 +2470,10 @@ class PI0FastTokenLogitAdapter:
         With ``emit_bonus_token`` enabled, a fully accepted block also emits the
         verifier's next greedy token. That token is processed by the next
         verify pass, matching standard greedy speculative decoding.
+        With ``defer_correction_token`` enabled, rejected-block correction
+        tokens use the same pending-token path instead of an immediate fallback
+        forward, so the next verifier pass can process the correction and draft
+        together.
         """
 
         if temperature != 0.0:
@@ -2478,6 +2485,7 @@ class PI0FastTokenLogitAdapter:
             raise ValueError("ngram speculative PI0-FAST decode currently supports batch size 1")
         if int(tree_width) > 1 and verify_from_scratch:
             raise ValueError("PI0-FAST tree speculation requires cached verification; disable verify_from_scratch")
+        defer_correction_token = bool(defer_correction_token)
 
         device = tokens.device
         lm_head = self.model.paligemma_with_expert.paligemma.lm_head
@@ -4092,7 +4100,16 @@ class PI0FastTokenLogitAdapter:
                                     "rejected_draft": int(draft[accepted]) if accepted < len(draft) else None,
                                 }
                             )
-                        prev_logits = advance_one(correction_token, correction_logits, fallback=True)
+                        if defer_correction_token:
+                            logits_by_step.append(correction_logits)
+                            generated_tokens.append(int(correction_token.item()))
+                            pending_corrections += 1
+                            pending_unprocessed_token = correction_token
+                            prev_logits = correction_logits
+                            if action_end_token_id is not None and int(correction_token.item()) == action_end_token_id:
+                                break
+                        else:
+                            prev_logits = advance_one(correction_token, correction_logits, fallback=True)
                 accepted_tokens += accepted
                 tree_accepted_tokens += accepted
                 record_source_feedback(draft_source_row, block_accepted)
@@ -4613,7 +4630,16 @@ class PI0FastTokenLogitAdapter:
                                 "rejected_draft": int(draft[accepted]) if accepted < len(draft) else None,
                             }
                         )
-                    prev_logits = advance_one(correction_token, correction_logits, fallback=True)
+                    if defer_correction_token:
+                        logits_by_step.append(correction_logits)
+                        generated_tokens.append(int(correction_token.item()))
+                        pending_corrections += 1
+                        pending_unprocessed_token = correction_token
+                        prev_logits = correction_logits
+                        if action_end_token_id is not None and int(correction_token.item()) == action_end_token_id:
+                            break
+                    else:
+                        prev_logits = advance_one(correction_token, correction_logits, fallback=True)
             accepted_tokens += accepted
             record_source_feedback(draft_sources, block_accepted)
             second_order_action_extrapolation_accepted_tokens += source_count(
@@ -4775,6 +4801,7 @@ class PI0FastTokenLogitAdapter:
             "verify_margin_mean": verify_margin_sum / max(verify_margin_checks, 1),
             "verify_from_scratch": verify_from_scratch,
             "emit_bonus_token": emit_bonus_token,
+            "defer_correction_token": defer_correction_token,
             "dynamic_lookahead": dynamic_lookahead,
             "min_lookahead": min_dynamic_lookahead,
             "max_lookahead": max_lookahead,

@@ -576,6 +576,46 @@ Key code:
 - `serving/pi0fast_prefix_gate.py`
 - `serving/pi0fast_token_hooks.py`
 
+## 2026-07 Deferred-Correction Pattern Probe
+
+Implemented an opt-in `pattern_sd` correction-token deferral path:
+
+- Online flag: `--pattern-defer-correction-token`
+- Offline flag: `--defer-correction-token`
+- Sweep/pipeline flag: `--defer-correction-token`
+
+The change emits a rejected-block correction token but leaves it pending so the
+next verifier pass can process the correction and future draft together. This
+is exact in the fake-model tests and improves offline target-forward accounting.
+
+Results:
+
+- Existing 60-row target-eos trace mini, tree width 4 + anchor continuation:
+  - `outputs/pi0fast_pattern_offline_existing_target_rows/tree_anchor_cont_defercorr.json`
+  - `target_forward_reduction = 2.7485x`
+  - `min_task_target_forward_reduction = 1.9818x`
+  - `deferred_correction_tokens = 1487`
+- Same mini, tree width 2 + anchor continuation:
+  - `outputs/pi0fast_pattern_offline_existing_target_rows/tree2_anchor_cont_defercorr.json`
+  - `target_forward_reduction = 2.7100x`
+  - `min_task_target_forward_reduction = 1.9739x`
+- Same mini, no tree:
+  - `outputs/pi0fast_pattern_offline_existing_target_rows/multiprior_defercorr.json`
+  - `target_forward_reduction = 1.5003x`
+  - `min_task_target_forward_reduction = 1.0187x`
+- Live 20-step object0 smoke, tree width 4 + anchor continuation:
+  - `outputs/pi0fast_pattern_tree_anchor_defercorr_validate_object0_20_rq_osmesa/summary.json`
+  - `pattern_sd_validate = 8111.2 ms/control`
+  - `target_eos = 188.0 ms/control`
+  - Conclusion: the tree verifier's wall-clock overhead dominates despite good offline forward counts.
+
+Takeaway:
+
+- Correction deferral is worth keeping as an exact SD primitive.
+- Current tree-pattern speculation is not a viable speed path unless verifier
+  batching becomes much cheaper or candidate count is gated aggressively.
+- Non-tree pattern speculation remains below the 2x target on the current trace mini.
+
 ## Bottom Line
 
 The most likely near-term success is not a full LLM-style draft model. It is a conservative FAST-prefix early-stop verifier:

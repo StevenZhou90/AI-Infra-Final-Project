@@ -1735,6 +1735,7 @@ class PatternSpecTraceResult:
     draft_misses: int
     full_block_reuses: int = 0
     bonus_tokens: int = 0
+    deferred_correction_tokens: int = 0
     tree_candidates: int = 0
     tree_verifies: int = 0
     tree_anchor_candidates: int = 0
@@ -1907,6 +1908,7 @@ def simulate_exact_pattern_spec_decode(
     lookahead: int,
     reuse_full_blocks: bool = False,
     emit_bonus_token: bool = False,
+    defer_correction_token: bool = False,
     dynamic_lookahead: bool = False,
     min_lookahead: int = 1,
     lookahead_growth: int = 1,
@@ -1924,6 +1926,8 @@ def simulate_exact_pattern_spec_decode(
     draft_misses = 0
     full_block_reuses = 0
     bonus_tokens = 0
+    deferred_correction_tokens = 0
+    pending_unprocessed_token = False
     second_order_action_extrapolation_drafted_tokens = 0
     second_order_action_extrapolation_accepted_tokens = 0
     previous_chunk_position_drafted_tokens = 0
@@ -1981,13 +1985,17 @@ def simulate_exact_pattern_spec_decode(
         if not draft:
             draft_misses += 1
             target_forwards += 1
-            generated.append(target[len(generated)])
+            if pending_unprocessed_token:
+                pending_unprocessed_token = False
+            else:
+                generated.append(target[len(generated)])
             _record_source_miss(drafter)
             if dynamic_lookahead:
                 current_lookahead = max(min_dynamic_lookahead, current_lookahead - max(int(lookahead_shrink), 1))
             continue
 
         target_forwards += 1
+        pending_unprocessed_token = False
         drafted_tokens += len(draft)
         sources = drafter.last_draft_sources() if hasattr(drafter, "last_draft_sources") else []
         second_order_action_extrapolation_drafted_tokens += _source_count(
@@ -2073,13 +2081,20 @@ def simulate_exact_pattern_spec_decode(
             if emit_bonus_token and len(generated) < len(target):
                 generated.append(target[len(generated)])
                 bonus_tokens += 1
+                if defer_correction_token:
+                    pending_unprocessed_token = True
             continue
 
+        if accepted < len(draft):
+            rejected_blocks += 1
+            if defer_correction_token:
+                generated.append(target[len(generated)])
+                pending_unprocessed_token = True
+                deferred_correction_tokens += 1
+                continue
         # The verifier supplies the first rejected token, or the bonus target
         # token after a fully accepted block, before the next speculative block.
         target_forwards += 1
-        if accepted < len(draft):
-            rejected_blocks += 1
         generated.append(target[len(generated)])
 
     cooldown_stats = _source_cooldown_stats(drafter)
@@ -2092,6 +2107,7 @@ def simulate_exact_pattern_spec_decode(
         draft_misses=draft_misses,
         full_block_reuses=full_block_reuses,
         bonus_tokens=bonus_tokens,
+        deferred_correction_tokens=deferred_correction_tokens,
         second_order_action_extrapolation_drafted_tokens=second_order_action_extrapolation_drafted_tokens,
         second_order_action_extrapolation_accepted_tokens=second_order_action_extrapolation_accepted_tokens,
         previous_chunk_position_drafted_tokens=previous_chunk_position_drafted_tokens,
@@ -2161,6 +2177,7 @@ def simulate_exact_pattern_tree_spec_decode(
     tree_anchor_target_continuation: bool = False,
     reuse_full_blocks: bool = False,
     emit_bonus_token: bool = False,
+    defer_correction_token: bool = False,
     dynamic_lookahead: bool = False,
     min_lookahead: int = 1,
     lookahead_growth: int = 1,
@@ -2178,6 +2195,8 @@ def simulate_exact_pattern_tree_spec_decode(
     draft_misses = 0
     full_block_reuses = 0
     bonus_tokens = 0
+    deferred_correction_tokens = 0
+    pending_unprocessed_token = False
     tree_candidates = 0
     tree_verifies = 0
     tree_anchor_candidates = 0
@@ -2518,11 +2537,18 @@ def simulate_exact_pattern_tree_spec_decode(
                                 if emit_bonus_token and len(generated) < len(target):
                                     generated.append(target[len(generated)])
                                     bonus_tokens += 1
+                                    if defer_correction_token:
+                                        pending_unprocessed_token = True
                                 continue
 
-                            target_forwards += 1
                             if accepted < len(best_candidate):
                                 rejected_blocks += 1
+                                if defer_correction_token:
+                                    generated.append(target[len(generated)])
+                                    pending_unprocessed_token = True
+                                    deferred_correction_tokens += 1
+                                    continue
+                            target_forwards += 1
                             generated.append(target[len(generated)])
                             continue
                         candidates = []
@@ -2537,7 +2563,10 @@ def simulate_exact_pattern_tree_spec_decode(
         if not candidates:
             draft_misses += 1
             target_forwards += 1
-            generated.append(target[len(generated)])
+            if pending_unprocessed_token:
+                pending_unprocessed_token = False
+            else:
+                generated.append(target[len(generated)])
             _record_source_miss(drafter)
             if dynamic_tree_width:
                 current_tree_width = max(1, min(max_tree_width, current_tree_width - max(int(tree_width_shrink), 1)))
@@ -2546,6 +2575,7 @@ def simulate_exact_pattern_tree_spec_decode(
             continue
 
         target_forwards += 1
+        pending_unprocessed_token = False
         if block_tree_width > 1:
             tree_verifies += 1
             tree_candidates += len(candidates)
@@ -2762,11 +2792,18 @@ def simulate_exact_pattern_tree_spec_decode(
             if emit_bonus_token and len(generated) < len(target):
                 generated.append(target[len(generated)])
                 bonus_tokens += 1
+                if defer_correction_token:
+                    pending_unprocessed_token = True
             continue
 
-        target_forwards += 1
         if accepted < len(best_candidate):
             rejected_blocks += 1
+            if defer_correction_token:
+                generated.append(target[len(generated)])
+                pending_unprocessed_token = True
+                deferred_correction_tokens += 1
+                continue
+        target_forwards += 1
         generated.append(target[len(generated)])
 
     cooldown_stats = _source_cooldown_stats(drafter)
@@ -2779,6 +2816,7 @@ def simulate_exact_pattern_tree_spec_decode(
         draft_misses=draft_misses,
         full_block_reuses=full_block_reuses,
         bonus_tokens=bonus_tokens,
+        deferred_correction_tokens=deferred_correction_tokens,
         tree_candidates=tree_candidates,
         tree_verifies=tree_verifies,
         tree_anchor_candidates=tree_anchor_candidates,
@@ -2864,6 +2902,7 @@ def evaluate_pattern_drafter(
     tree_anchor_target_continuation: bool = False,
     target_forward_ms: float = 1.0,
     draft_token_ms: float = 0.0,
+    defer_correction_token: bool = False,
     history_reset: str = "task_seed",
 ) -> dict:
     per_trace: list[dict] = []
@@ -2875,6 +2914,7 @@ def evaluate_pattern_drafter(
     total_misses = 0
     total_full_block_reuses = 0
     total_bonus_tokens = 0
+    total_deferred_correction_tokens = 0
     total_tree_candidates = 0
     total_tree_verifies = 0
     total_tree_anchor_candidates = 0
@@ -2961,6 +3001,7 @@ def evaluate_pattern_drafter(
                 tree_anchor_target_continuation=tree_anchor_target_continuation,
                 reuse_full_blocks=reuse_full_blocks,
                 emit_bonus_token=emit_bonus_token,
+                defer_correction_token=defer_correction_token,
                 dynamic_lookahead=dynamic_lookahead,
                 min_lookahead=min_lookahead,
                 lookahead_growth=lookahead_growth,
@@ -2973,6 +3014,7 @@ def evaluate_pattern_drafter(
                 lookahead=lookahead,
                 reuse_full_blocks=reuse_full_blocks,
                 emit_bonus_token=emit_bonus_token,
+                defer_correction_token=defer_correction_token,
                 dynamic_lookahead=dynamic_lookahead,
                 min_lookahead=min_lookahead,
                 lookahead_growth=lookahead_growth,
@@ -2986,6 +3028,7 @@ def evaluate_pattern_drafter(
         total_misses += result.draft_misses
         total_full_block_reuses += result.full_block_reuses
         total_bonus_tokens += result.bonus_tokens
+        total_deferred_correction_tokens += result.deferred_correction_tokens
         total_tree_candidates += result.tree_candidates
         total_tree_verifies += result.tree_verifies
         total_tree_anchor_candidates += result.tree_anchor_candidates
@@ -3067,6 +3110,7 @@ def evaluate_pattern_drafter(
                 "draft_misses": result.draft_misses,
                 "full_block_reuses": result.full_block_reuses,
                 "bonus_tokens": result.bonus_tokens,
+                "deferred_correction_tokens": result.deferred_correction_tokens,
                 "tree_candidates": result.tree_candidates,
                 "tree_verifies": result.tree_verifies,
                 "tree_anchor_candidates": result.tree_anchor_candidates,
@@ -3145,6 +3189,7 @@ def evaluate_pattern_drafter(
         "lookahead": int(lookahead),
         "reuse_full_blocks": bool(reuse_full_blocks),
         "emit_bonus_token": bool(emit_bonus_token),
+        "defer_correction_token": bool(defer_correction_token),
         "dynamic_lookahead": bool(dynamic_lookahead),
         "min_lookahead": int(min_lookahead),
         "lookahead_growth": int(lookahead_growth),
@@ -3169,6 +3214,7 @@ def evaluate_pattern_drafter(
         "draft_misses": total_misses,
         "full_block_reuses": total_full_block_reuses,
         "bonus_tokens": total_bonus_tokens,
+        "deferred_correction_tokens": total_deferred_correction_tokens,
         "tree_candidates": total_tree_candidates,
         "tree_verifies": total_tree_verifies,
         "tree_anchor_candidates": total_tree_anchor_candidates,
@@ -3289,6 +3335,7 @@ def evaluate_pattern_drafter(
         task_misses = sum(row.draft_misses for row in values)
         task_full_block_reuses = sum(row.full_block_reuses for row in values)
         task_bonus_tokens = sum(row.bonus_tokens for row in values)
+        task_deferred_correction_tokens = sum(row.deferred_correction_tokens for row in values)
         task_tree_candidates = sum(row.tree_candidates for row in values)
         task_tree_verifies = sum(row.tree_verifies for row in values)
         task_tree_anchor_candidates = sum(row.tree_anchor_candidates for row in values)
@@ -3365,6 +3412,7 @@ def evaluate_pattern_drafter(
             "draft_miss_rate": task_misses / max(len(values), 1),
             "full_block_reuses": task_full_block_reuses,
             "bonus_tokens": task_bonus_tokens,
+            "deferred_correction_tokens": task_deferred_correction_tokens,
             "tree_candidates": task_tree_candidates,
             "tree_verifies": task_tree_verifies,
             "tree_anchor_candidates": task_tree_anchor_candidates,

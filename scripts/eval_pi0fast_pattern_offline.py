@@ -254,6 +254,7 @@ def format_markdown(summary: dict) -> str:
             f"| acceptance rate | {summary['acceptance_rate']:.2%} |",
             f"| full block reuses | {summary['full_block_reuses']} |",
             f"| bonus tokens | {summary['bonus_tokens']} |",
+            f"| deferred correction tokens | {summary.get('deferred_correction_tokens', 0)} |",
             f"| tree width | {summary.get('tree_width', 1)} |",
             f"| mean tree candidates | {summary.get('mean_tree_candidates', 0.0):.1f} |",
             f"| tree anchor verifies | {summary.get('tree_anchor_verifies', 0)} |",
@@ -588,6 +589,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pattern-source-acceptance-bias-min-observations", type=int, default=2)
     parser.add_argument("--reuse-full-blocks", action="store_true")
     parser.add_argument("--emit-bonus-token", action="store_true")
+    parser.add_argument(
+        "--defer-correction-token",
+        action="store_true",
+        help="Model rejected verifier correction tokens as pending tokens folded into the next verify pass.",
+    )
     parser.add_argument("--dynamic-lookahead", action="store_true")
     parser.add_argument("--min-lookahead", type=int, default=1)
     parser.add_argument("--lookahead-growth", type=int, default=1)
@@ -781,6 +787,7 @@ def main() -> int:
         tree_anchor_target_continuation=args.tree_anchor_target_continuation,
         target_forward_ms=args.target_forward_ms,
         draft_token_ms=args.draft_token_ms,
+        defer_correction_token=args.defer_correction_token,
     )
     summary["config"] = {
         "data_dir": args.data_dir,
@@ -883,6 +890,7 @@ def main() -> int:
         "source_acceptance_bias_min_observations": args.pattern_source_acceptance_bias_min_observations,
         "reuse_full_blocks": args.reuse_full_blocks,
         "emit_bonus_token": args.emit_bonus_token,
+        "defer_correction_token": args.defer_correction_token,
         "dynamic_lookahead": args.dynamic_lookahead,
         "min_lookahead": args.min_lookahead,
         "lookahead_growth": args.lookahead_growth,

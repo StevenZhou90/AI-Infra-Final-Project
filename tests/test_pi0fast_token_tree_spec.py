@@ -830,6 +830,28 @@ class _BranchingDrafter:
         return [list(row) for row in self._last_many_sources]
 
 
+class _SecondTokenMissDrafter:
+    def __init__(self, target: list[int]) -> None:
+        self.target = target
+        self._last_sources: list[str] = []
+
+    def draft(self, prefix: list[int], lookahead: int | None = None) -> list[int]:
+        pos = len(prefix)
+        if pos >= len(self.target):
+            self._last_sources = []
+            return []
+        steps = max(1, int(lookahead or 1))
+        if pos == 0:
+            row = [self.target[0], self.target[1] + 1][:steps]
+        else:
+            row = self.target[pos : pos + steps]
+        self._last_sources = ["ngram_continuation"] * len(row)
+        return row
+
+    def last_draft_sources(self) -> list[str]:
+        return list(self._last_sources)
+
+
 class _AnchorMissDrafter:
     def __init__(self, target: list[int]) -> None:
         self.target = target
@@ -917,6 +939,70 @@ def test_pi0fast_online_tree_spec_selects_best_verified_candidate() -> None:
     assert stats["tree_accepted_tokens"] >= 2
     assert stats["previous_chunk_position_drafted_tokens"] > 0
     assert stats["previous_chunk_position_accepted_tokens"] >= 2
+
+
+def test_pi0fast_online_can_defer_rejected_correction_token() -> None:
+    target = [10, 20, 30, 40, 50]
+    prefix_len = 3
+
+    def make_adapter() -> PI0FastTokenLogitAdapter:
+        adapter = PI0FastTokenLogitAdapter(_FakePolicy())
+        adapter._match_model_precision = lambda tensor: tensor
+
+        def fake_forward(
+            self,
+            *,
+            attention_mask,
+            position_ids,
+            past_key_values,
+            inputs_embeds,
+            use_cache,
+            cache_position=None,
+        ):
+            batch, seq_len, vocab = inputs_embeds.shape
+            hidden = torch.zeros((batch, seq_len, vocab), dtype=torch.float32)
+            for row in range(batch):
+                for col in range(seq_len):
+                    pos = int(position_ids[row, col].item()) if position_ids is not None else col
+                    target_idx = max(0, pos - prefix_len + 1)
+                    token = target[min(target_idx, len(target) - 1)]
+                    hidden[row, col, token] = 100.0
+            cache_len = int(cache_position.max().item()) + 1 if cache_position is not None else seq_len
+            key = torch.zeros((batch, 1, cache_len, 1), dtype=torch.float32)
+            value = torch.zeros_like(key)
+            return [hidden, None], ((key, value),)
+
+        adapter._forward_prefix_language_model = MethodType(fake_forward, adapter)
+        return adapter
+
+    plain_tokens, _plain_logits, plain_stats = make_adapter().sample_actions_fast_ngram_speculative(
+        images=torch.empty(1),
+        img_masks=torch.empty(1),
+        tokens=torch.zeros((1, 3), dtype=torch.long),
+        masks=torch.ones((1, 3), dtype=torch.bool),
+        drafter=_SecondTokenMissDrafter(target),
+        max_decoding_steps=len(target),
+        lookahead=2,
+        reuse_full_blocks=True,
+    )
+    deferred_tokens, _deferred_logits, deferred_stats = make_adapter().sample_actions_fast_ngram_speculative(
+        images=torch.empty(1),
+        img_masks=torch.empty(1),
+        tokens=torch.zeros((1, 3), dtype=torch.long),
+        masks=torch.ones((1, 3), dtype=torch.bool),
+        drafter=_SecondTokenMissDrafter(target),
+        max_decoding_steps=len(target),
+        lookahead=2,
+        reuse_full_blocks=True,
+        defer_correction_token=True,
+    )
+
+    assert plain_tokens.tolist()[0] == target
+    assert deferred_tokens.tolist()[0] == target
+    assert deferred_stats["target_forwards"] < plain_stats["target_forwards"]
+    assert deferred_stats["fallback_forwards"] < plain_stats["fallback_forwards"]
+    assert deferred_stats["pending_corrections"] > plain_stats["pending_corrections"]
+    assert deferred_stats["defer_correction_token"] is True
 
 
 def test_pi0fast_online_tree_anchor_verifies_future_after_first_token_miss() -> None:

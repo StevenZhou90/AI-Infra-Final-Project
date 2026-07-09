@@ -290,6 +290,7 @@ def build_sweep_command(
     source_acceptance_bias_min_observations: str,
     reuse_full_blocks: str,
     emit_bonus_token: str,
+    defer_correction_token: str,
     dynamic_lookahead: str,
     min_lookaheads: str,
     lookahead_growths: str,
@@ -525,6 +526,8 @@ def build_sweep_command(
         reuse_full_blocks,
         "--emit-bonus-token",
         emit_bonus_token,
+        "--defer-correction-token",
+        defer_correction_token,
         "--dynamic-lookahead",
         dynamic_lookahead,
         "--min-lookaheads",
@@ -860,6 +863,7 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
         source_acceptance_bias_min_observations=args.source_acceptance_bias_min_observations,
         reuse_full_blocks=args.reuse_full_blocks,
         emit_bonus_token=args.emit_bonus_token,
+        defer_correction_token=args.defer_correction_token,
         dynamic_lookahead=args.dynamic_lookahead,
         min_lookaheads=args.min_lookaheads,
         lookahead_growths=args.lookahead_growths,
@@ -1104,6 +1108,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-acceptance-bias-min-observations", default="1")
     parser.add_argument("--reuse-full-blocks", default="true")
     parser.add_argument("--emit-bonus-token", default="both")
+    parser.add_argument("--defer-correction-token", default="false")
     parser.add_argument("--dynamic-lookahead", default="both")
     parser.add_argument("--min-lookaheads", default="1,2")
     parser.add_argument("--lookahead-growths", default="1")

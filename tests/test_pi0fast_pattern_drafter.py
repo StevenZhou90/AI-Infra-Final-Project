@@ -1243,6 +1243,30 @@ def test_pattern_spec_decode_can_emit_standard_bonus_token() -> None:
     assert bonus.target_forward_reduction >= reused.target_forward_reduction
 
 
+def test_pattern_spec_decode_can_defer_rejected_correction_token() -> None:
+    tokens = [10, 20, 30, 10, 20, 31, 10, 20, 32]
+    config = PatternDraftConfig(action_dim=2, lookahead=4, vocab_size=100)
+
+    plain = simulate_exact_pattern_spec_decode(
+        tokens,
+        PatternFastTokenDrafter(config),
+        lookahead=2,
+        reuse_full_blocks=True,
+    )
+    deferred = simulate_exact_pattern_spec_decode(
+        tokens,
+        PatternFastTokenDrafter(config),
+        lookahead=2,
+        reuse_full_blocks=True,
+        defer_correction_token=True,
+    )
+
+    assert deferred.rejected_blocks == plain.rejected_blocks
+    assert deferred.deferred_correction_tokens == plain.rejected_blocks
+    assert deferred.target_forwards < plain.target_forwards
+    assert deferred.target_forward_reduction > plain.target_forward_reduction
+
+
 def test_pattern_spec_decode_dynamic_lookahead_records_schedule() -> None:
     drafter = PatternFastTokenDrafter(PatternDraftConfig(action_dim=2, lookahead=4, vocab_size=100))
 
