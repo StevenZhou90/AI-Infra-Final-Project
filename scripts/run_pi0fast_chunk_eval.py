@@ -83,6 +83,34 @@ def _load_token_id_file(path: Path | str | None) -> list[int]:
     return sorted({int(token_id) for token_id in raw_ids})
 
 
+def parse_checkpoint_stable_checks(value: str) -> dict[int, int]:
+    """Parse comma-separated CHECKPOINT=CHECKS adaptive stop overrides."""
+
+    overrides: dict[int, int] = {}
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise argparse.ArgumentTypeError(
+                f"checkpoint stable override must use CHECKPOINT=CHECKS syntax, got {part!r}"
+            )
+        raw_checkpoint, raw_checks = part.split("=", 1)
+        try:
+            checkpoint = int(raw_checkpoint.strip())
+            checks = int(raw_checks.strip())
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                f"checkpoint stable override must contain integers, got {part!r}"
+            ) from exc
+        if checkpoint <= 0:
+            raise argparse.ArgumentTypeError(f"checkpoint must be positive, got {checkpoint}")
+        if checks <= 0:
+            raise argparse.ArgumentTypeError(f"stable checks must be positive, got {checks}")
+        overrides[checkpoint] = checks
+    return overrides
+
+
 def _pi05_unsupported_fast_token_modes(modes: list[str]) -> list[str]:
     return [
         mode
@@ -497,6 +525,7 @@ def _predict_adaptive_prefix_chunk(
     stable_checks: int,
     early_stable_checks: int | None,
     early_max_stable_checkpoint: int | None,
+    checkpoint_stable_checks: dict[int, int] | None,
     skip_unproductive_checks: bool,
     skip_unproductive_after_checkpoint: int,
     continue_to_action_end_on_unstable: bool,
@@ -513,6 +542,7 @@ def _predict_adaptive_prefix_chunk(
         stable_checks=stable_checks,
         early_stable_checks=early_stable_checks,
         early_max_stable_checkpoint=early_max_stable_checkpoint,
+        checkpoint_stable_checks=checkpoint_stable_checks,
         skip_unproductive_checks=skip_unproductive_checks,
         skip_unproductive_after_checkpoint=skip_unproductive_after_checkpoint,
         continue_to_action_end_on_unstable=continue_to_action_end_on_unstable,
@@ -1170,9 +1200,12 @@ def run_episode(
     adaptive_stable_checks: int,
     adaptive_early_stable_checks: int | None,
     adaptive_early_max_stable_checkpoint: int | None,
+    adaptive_checkpoint_stable_checks: dict[int, int],
     adaptive_skip_unproductive_checks: bool,
     adaptive_skip_unproductive_after_checkpoint: int,
     adaptive_continue_to_action_end_on_unstable: bool,
+    adaptive_stability_target_eos_after_step: int | None,
+    adaptive_stability_target_eos_max_fallbacks: int,
     adaptive_prefix_gate,
     adaptive_prefix_gate_threshold: float,
     target_eos_constrained_action_vocab_size: int,
@@ -1207,6 +1240,7 @@ def run_episode(
     observation, _info = env.reset(seed=[seed])
     done = False
     steps = 0
+    late_stability_target_eos_fallbacks = 0
     reward_sum = 0.0
     success = False
     control_step_ms: list[float] = []
@@ -2161,11 +2195,50 @@ def run_episode(
                                 stable_checks=adaptive_stable_checks,
                                 early_stable_checks=adaptive_early_stable_checks,
                                 early_max_stable_checkpoint=adaptive_early_max_stable_checkpoint,
+                                checkpoint_stable_checks=adaptive_checkpoint_stable_checks,
                                 skip_unproductive_checks=adaptive_skip_unproductive_checks,
                                 skip_unproductive_after_checkpoint=adaptive_skip_unproductive_after_checkpoint,
                                 continue_to_action_end_on_unstable=adaptive_continue_to_action_end_on_unstable,
                                 prefix_gate=adaptive_prefix_gate,
                                 prefix_gate_threshold=adaptive_prefix_gate_threshold,
+                            )
+                        if (
+                            adaptive_stability_target_eos_after_step is not None
+                            and steps >= adaptive_stability_target_eos_after_step
+                            and bool((prediction.stats or {}).get("stopped_on_stability", False))
+                            and (
+                                adaptive_stability_target_eos_max_fallbacks < 0
+                                or late_stability_target_eos_fallbacks
+                                < adaptive_stability_target_eos_max_fallbacks
+                            )
+                        ):
+                            with autocast_ctx:
+                                target_prediction = _predict_action_chunk(
+                                    policy,
+                                    batch,
+                                    policy_postprocessor,
+                                    device,
+                                    token_adapter,
+                                    early_stop_action_end=True,
+                                )
+                            controller.stats.guard_reasons.update(["adaptive_late_stability_target_eos_fallback"])
+                            late_stability_target_eos_fallbacks += 1
+                            prediction = PredictionTrace(
+                                actions=target_prediction.actions,
+                                elapsed_ms=prediction.elapsed_ms + target_prediction.elapsed_ms,
+                                token_count=target_prediction.token_count,
+                                token_ids=target_prediction.token_ids,
+                                stats={
+                                    **(prediction.stats or {}),
+                                    "late_stability_target_eos_fallback": 1.0,
+                                    "late_stability_target_eos_after_step": float(
+                                        adaptive_stability_target_eos_after_step
+                                    ),
+                                    "late_stability_target_eos_fallback_index": float(
+                                        late_stability_target_eos_fallbacks
+                                    ),
+                                    "late_stability_target_eos_ms": target_prediction.elapsed_ms,
+                                },
                             )
                         controller.stats.record_trace_stats(prediction.stats)
                         if mode.startswith("target_eos_adaptive_validate"):
@@ -3300,9 +3373,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adaptive-stable-checks", type=int, default=3)
     parser.add_argument("--adaptive-early-stable-checks", type=int, default=0)
     parser.add_argument("--adaptive-early-max-stable-checkpoint", type=int, default=0)
+    parser.add_argument(
+        "--adaptive-checkpoint-stable-checks",
+        default="",
+        help="Comma-separated CHECKPOINT=CHECKS overrides for adaptive stability stops, e.g. 152=5.",
+    )
     parser.add_argument("--adaptive-skip-unproductive-checks", action="store_true")
     parser.add_argument("--adaptive-skip-unproductive-after-checkpoint", type=int, default=0)
     parser.add_argument("--adaptive-continue-to-action-end-on-unstable", action="store_true")
+    parser.add_argument(
+        "--adaptive-stability-target-eos-after-step",
+        type=int,
+        default=-1,
+        help="Fallback stability-stop chunks at or after this control step to target-EOS; negative disables it.",
+    )
+    parser.add_argument(
+        "--adaptive-stability-target-eos-max-fallbacks",
+        type=int,
+        default=-1,
+        help="Maximum late stability target-EOS fallbacks per episode; negative leaves uncapped.",
+    )
     parser.add_argument("--adaptive-prefix-gate-checkpoint", default=None)
     parser.add_argument("--adaptive-prefix-gate-threshold", type=float, default=0.98)
     parser.add_argument(
@@ -3433,6 +3523,7 @@ def main() -> None:
     task_ids = selected_task_ids if selected_task_ids is not None else sorted(env_map[args.task])
 
     adaptive_prefix_checkpoints = [int(part.strip()) for part in args.adaptive_prefix_checkpoints.split(",") if part.strip()]
+    adaptive_checkpoint_stable_checks = parse_checkpoint_stable_checks(args.adaptive_checkpoint_stable_checks)
     ngram_drafter = None
     block_drafter = None
     block_token_map = None
@@ -3863,9 +3954,16 @@ def main() -> None:
                     adaptive_stable_checks=args.adaptive_stable_checks,
                     adaptive_early_stable_checks=args.adaptive_early_stable_checks or None,
                     adaptive_early_max_stable_checkpoint=args.adaptive_early_max_stable_checkpoint or None,
+                    adaptive_checkpoint_stable_checks=adaptive_checkpoint_stable_checks,
                     adaptive_skip_unproductive_checks=args.adaptive_skip_unproductive_checks,
                     adaptive_skip_unproductive_after_checkpoint=args.adaptive_skip_unproductive_after_checkpoint,
                     adaptive_continue_to_action_end_on_unstable=args.adaptive_continue_to_action_end_on_unstable,
+                    adaptive_stability_target_eos_after_step=(
+                        None
+                        if args.adaptive_stability_target_eos_after_step < 0
+                        else args.adaptive_stability_target_eos_after_step
+                    ),
+                    adaptive_stability_target_eos_max_fallbacks=args.adaptive_stability_target_eos_max_fallbacks,
                     adaptive_prefix_gate=adaptive_prefix_gate,
                     adaptive_prefix_gate_threshold=args.adaptive_prefix_gate_threshold,
                     target_eos_constrained_action_vocab_size=args.target_eos_constrained_action_vocab_size,
@@ -4167,9 +4265,12 @@ def main() -> None:
         "adaptive_stable_checks": args.adaptive_stable_checks,
         "adaptive_early_stable_checks": args.adaptive_early_stable_checks,
         "adaptive_early_max_stable_checkpoint": args.adaptive_early_max_stable_checkpoint,
+        "adaptive_checkpoint_stable_checks": adaptive_checkpoint_stable_checks,
         "adaptive_skip_unproductive_checks": args.adaptive_skip_unproductive_checks,
         "adaptive_skip_unproductive_after_checkpoint": args.adaptive_skip_unproductive_after_checkpoint,
         "adaptive_continue_to_action_end_on_unstable": args.adaptive_continue_to_action_end_on_unstable,
+        "adaptive_stability_target_eos_after_step": args.adaptive_stability_target_eos_after_step,
+        "adaptive_stability_target_eos_max_fallbacks": args.adaptive_stability_target_eos_max_fallbacks,
         "adaptive_prefix_gate_checkpoint": args.adaptive_prefix_gate_checkpoint,
         "adaptive_prefix_gate_threshold": args.adaptive_prefix_gate_threshold,
         "adaptive_prefix_gate_summary": adaptive_prefix_gate_summary,

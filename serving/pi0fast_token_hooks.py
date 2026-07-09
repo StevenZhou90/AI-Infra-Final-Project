@@ -863,6 +863,7 @@ class PI0FastTokenLogitAdapter:
         stable_checks: int = 1,
         early_stable_checks: int | None = None,
         early_max_stable_checkpoint: int | None = None,
+        checkpoint_stable_checks: dict[int, int] | None = None,
         max_stable_checkpoint: int | None = None,
         skip_unproductive_checks: bool = False,
         skip_unproductive_after_checkpoint: int = 0,
@@ -1029,6 +1030,8 @@ class PI0FastTokenLogitAdapter:
                     and checkpoint <= early_max_stable_checkpoint
                 ):
                     required_stable_checks = early_stable_checks
+                if checkpoint_stable_checks and checkpoint in checkpoint_stable_checks:
+                    required_stable_checks = checkpoint_stable_checks[checkpoint]
                 can_stop_at_checkpoint = max_stable_checkpoint is None or checkpoint <= max_stable_checkpoint
                 if stable_count >= required_stable_checks and can_stop_at_checkpoint:
                     gate_prob = gate_probability(checkpoint, token_ids, actions)

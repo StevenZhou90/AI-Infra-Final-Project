@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import argparse
+
+import pytest
 import torch
 
 from scripts.run_pi0fast_chunk_eval import (
@@ -8,6 +11,7 @@ from scripts.run_pi0fast_chunk_eval import (
     _pi05_unsupported_fast_token_modes,
     _predict_prefix_cutoff_chunk,
     _predict_target_eos_chunk,
+    parse_checkpoint_stable_checks,
 )
 from serving.pi0fast_token_hooks import PI0FastGenerationTrace
 
@@ -130,6 +134,20 @@ def test_load_token_id_file_accepts_payload_dict(tmp_path) -> None:
     empty_path = tmp_path / "empty_tokens.json"
     empty_path.write_text('{"token_ids": []}')
     assert _load_token_id_file(empty_path) == []
+
+
+def test_parse_checkpoint_stable_checks_accepts_csv_overrides() -> None:
+    assert parse_checkpoint_stable_checks("") == {}
+    assert parse_checkpoint_stable_checks("152=5, 160 = 4") == {152: 5, 160: 4}
+
+
+def test_parse_checkpoint_stable_checks_rejects_invalid_values() -> None:
+    with pytest.raises(argparse.ArgumentTypeError):
+        parse_checkpoint_stable_checks("152")
+    with pytest.raises(argparse.ArgumentTypeError):
+        parse_checkpoint_stable_checks("0=4")
+    with pytest.raises(argparse.ArgumentTypeError):
+        parse_checkpoint_stable_checks("152=0")
 
 
 def test_prefix_cutoff_chunk_uses_no_logits_path_by_default() -> None:
