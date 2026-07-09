@@ -530,6 +530,7 @@ def _predict_adaptive_prefix_chunk(
     skip_unproductive_after_checkpoint: int,
     continue_to_action_end_on_unstable: bool,
     stability_continue_to_action_end: bool,
+    stability_risk_gate: dict[str, float] | None,
     prefix_gate,
     prefix_gate_threshold: float,
 ) -> PredictionTrace:
@@ -548,6 +549,7 @@ def _predict_adaptive_prefix_chunk(
         skip_unproductive_after_checkpoint=skip_unproductive_after_checkpoint,
         continue_to_action_end_on_unstable=continue_to_action_end_on_unstable,
         stability_continue_to_action_end=stability_continue_to_action_end,
+        stability_risk_gate=stability_risk_gate,
         prefix_gate=prefix_gate,
         prefix_gate_threshold=prefix_gate_threshold,
         early_stop_action_end=True,
@@ -1210,6 +1212,9 @@ def run_episode(
     adaptive_stability_target_eos_max_fallbacks: int,
     adaptive_stability_continue_to_action_end_after_step: int | None,
     adaptive_stability_continue_to_action_end_max_fallbacks: int,
+    adaptive_stability_risk_after_step: int | None,
+    adaptive_stability_risk_max_rejections: int,
+    adaptive_stability_risk_gate: dict[str, float],
     adaptive_validate_label_all_stability_stops: bool,
     adaptive_validate_stability_stops_only: bool,
     adaptive_prefix_gate,
@@ -1248,6 +1253,7 @@ def run_episode(
     steps = 0
     late_stability_target_eos_fallbacks = 0
     late_stability_action_end_continues = 0
+    late_stability_risk_rejections = 0
     reward_sum = 0.0
     success = False
     control_step_ms: list[float] = []
@@ -2200,6 +2206,16 @@ def run_episode(
                                 < adaptive_stability_continue_to_action_end_max_fallbacks
                             )
                         )
+                        stability_risk_gate = (
+                            adaptive_stability_risk_gate
+                            if adaptive_stability_risk_after_step is not None
+                            and steps >= adaptive_stability_risk_after_step
+                            and (
+                                adaptive_stability_risk_max_rejections < 0
+                                or late_stability_risk_rejections < adaptive_stability_risk_max_rejections
+                            )
+                            else None
+                        )
                         with autocast_ctx:
                             prediction = _predict_adaptive_prefix_chunk(
                                 token_adapter,
@@ -2216,9 +2232,14 @@ def run_episode(
                                 skip_unproductive_after_checkpoint=adaptive_skip_unproductive_after_checkpoint,
                                 continue_to_action_end_on_unstable=adaptive_continue_to_action_end_on_unstable,
                                 stability_continue_to_action_end=stability_continue_to_action_end,
+                                stability_risk_gate=stability_risk_gate,
                                 prefix_gate=adaptive_prefix_gate,
                                 prefix_gate_threshold=adaptive_prefix_gate_threshold,
                             )
+                        risk_rejections = int((prediction.stats or {}).get("stability_risk_gate_rejections", 0))
+                        if risk_rejections:
+                            late_stability_risk_rejections += risk_rejections
+                            controller.stats.guard_reasons.update(["adaptive_stability_risk_gate_reject"])
                         if bool((prediction.stats or {}).get("continued_after_stability_stop", False)):
                             late_stability_action_end_continues += 1
                             controller.stats.guard_reasons.update(["adaptive_late_stability_action_end_continue"])
@@ -3472,6 +3493,27 @@ def parse_args() -> argparse.Namespace:
         help="Maximum late stability action-end continuations per episode; negative leaves uncapped.",
     )
     parser.add_argument(
+        "--adaptive-stability-risk-after-step",
+        type=int,
+        default=-1,
+        help="Enable threshold-based stability-stop rejection at or after this control step; negative disables it.",
+    )
+    parser.add_argument(
+        "--adaptive-stability-risk-max-rejections",
+        type=int,
+        default=-1,
+        help="Maximum risk-gate stability-stop rejections per episode; negative leaves uncapped.",
+    )
+    parser.add_argument("--adaptive-stability-risk-min-checkpoint", type=int, default=-1)
+    parser.add_argument("--adaptive-stability-risk-max-checkpoint", type=int, default=-1)
+    parser.add_argument("--adaptive-stability-risk-max-token-count", type=int, default=-1)
+    parser.add_argument("--adaptive-stability-risk-logprob-mean-max", type=float, default=None)
+    parser.add_argument("--adaptive-stability-risk-entropy-mean-min", type=float, default=None)
+    parser.add_argument("--adaptive-stability-risk-action-abs-min", type=float, default=None)
+    parser.add_argument("--adaptive-stability-risk-position-span-max", type=float, default=None)
+    parser.add_argument("--adaptive-stability-risk-rotation-span-max", type=float, default=None)
+    parser.add_argument("--adaptive-stability-risk-max-step-delta-max", type=float, default=None)
+    parser.add_argument(
         "--adaptive-validate-label-all-stability-stops",
         action="store_true",
         help=(
@@ -3539,6 +3581,30 @@ def _mode_int_after(mode: str, marker: str, default: int = 0) -> int:
     if marker not in mode:
         return default
     return _leading_int(mode.split(marker, 1)[1], default)
+
+
+def _adaptive_stability_risk_gate_from_args(args: argparse.Namespace) -> dict[str, float]:
+    gate: dict[str, float] = {}
+    int_options = {
+        "min_checkpoint": args.adaptive_stability_risk_min_checkpoint,
+        "max_checkpoint": args.adaptive_stability_risk_max_checkpoint,
+        "max_token_count": args.adaptive_stability_risk_max_token_count,
+    }
+    for key, value in int_options.items():
+        if value >= 0:
+            gate[key] = float(value)
+    float_options = {
+        "max_logprob_mean": args.adaptive_stability_risk_logprob_mean_max,
+        "min_entropy_mean": args.adaptive_stability_risk_entropy_mean_min,
+        "min_action_abs_max": args.adaptive_stability_risk_action_abs_min,
+        "max_position_span": args.adaptive_stability_risk_position_span_max,
+        "max_rotation_span": args.adaptive_stability_risk_rotation_span_max,
+        "max_max_step_delta": args.adaptive_stability_risk_max_step_delta_max,
+    }
+    for key, value in float_options.items():
+        if value is not None:
+            gate[key] = float(value)
+    return gate
 
 
 def main() -> None:
@@ -3618,6 +3684,7 @@ def main() -> None:
 
     adaptive_prefix_checkpoints = [int(part.strip()) for part in args.adaptive_prefix_checkpoints.split(",") if part.strip()]
     adaptive_checkpoint_stable_checks = parse_checkpoint_stable_checks(args.adaptive_checkpoint_stable_checks)
+    adaptive_stability_risk_gate = _adaptive_stability_risk_gate_from_args(args)
     ngram_drafter = None
     block_drafter = None
     block_token_map = None
@@ -4066,6 +4133,13 @@ def main() -> None:
                     adaptive_stability_continue_to_action_end_max_fallbacks=(
                         args.adaptive_stability_continue_to_action_end_max_fallbacks
                     ),
+                    adaptive_stability_risk_after_step=(
+                        None
+                        if args.adaptive_stability_risk_after_step < 0 or not adaptive_stability_risk_gate
+                        else args.adaptive_stability_risk_after_step
+                    ),
+                    adaptive_stability_risk_max_rejections=args.adaptive_stability_risk_max_rejections,
+                    adaptive_stability_risk_gate=adaptive_stability_risk_gate,
                     adaptive_validate_label_all_stability_stops=args.adaptive_validate_label_all_stability_stops,
                     adaptive_validate_stability_stops_only=args.adaptive_validate_stability_stops_only,
                     adaptive_prefix_gate=adaptive_prefix_gate,
@@ -4381,6 +4455,9 @@ def main() -> None:
         "adaptive_stability_continue_to_action_end_max_fallbacks": (
             args.adaptive_stability_continue_to_action_end_max_fallbacks
         ),
+        "adaptive_stability_risk_after_step": args.adaptive_stability_risk_after_step,
+        "adaptive_stability_risk_max_rejections": args.adaptive_stability_risk_max_rejections,
+        "adaptive_stability_risk_gate": adaptive_stability_risk_gate,
         "adaptive_validate_label_all_stability_stops": args.adaptive_validate_label_all_stability_stops,
         "adaptive_validate_stability_stops_only": args.adaptive_validate_stability_stops_only,
         "adaptive_prefix_gate_checkpoint": args.adaptive_prefix_gate_checkpoint,

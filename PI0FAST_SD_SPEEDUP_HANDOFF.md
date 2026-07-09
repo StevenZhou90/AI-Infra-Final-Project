@@ -202,6 +202,11 @@ target-EOS fallback had `197` tokens. This motivated the new runner knobs in
   `target_eos_adaptive_validate` label collection. This is not a full exactness
   audit; it exists to collect stop-candidate labels at roughly adaptive-run
   speed plus only the stop-candidate target-EOS compares.
+- `--adaptive-stability-risk-*` thresholds for a configurable risk gate. When
+  active, a stability-stop candidate that matches all supplied thresholds is
+  rejected and generation continues to later checkpoints/action-end using the
+  same KV cache. This is the robotics analogue of confidence/risk-conditioned
+  dynamic speculation: spend extra decode only on uncertain candidates.
 
 Stability-stop feature export now exists in
 `serving/pi0fast_token_hooks.py`. Stop candidates record scalar
@@ -231,6 +236,33 @@ rows while catching the single unsafe row. Do not hard-code a one-negative rule
 as a final safety gate without more heldout negatives or a separate robustness
 argument.
 
+A first risk-gate probe used the rule:
+
+```bash
+--adaptive-stability-risk-after-step 200 \
+--adaptive-stability-risk-max-rejections 2 \
+--adaptive-stability-risk-max-checkpoint 160 \
+--adaptive-stability-risk-max-token-count 153 \
+--adaptive-stability-risk-logprob-mean-max -1.04 \
+--adaptive-stability-risk-entropy-mean-min 2.9 \
+--adaptive-stability-risk-position-span-max 0.0 \
+--adaptive-stability-risk-rotation-span-max 0.0 \
+--adaptive-stability-risk-max-step-delta-max 0.0
+```
+
+On the current `87` labeled stop rows, this exact rule rejects only the known
+unsafe row. Focused validation on `libero_object` task `0`, episode `1`, seed
+`43` at
+`outputs/pi0fast_adaptive_mismatch_object0_ep1_ck152_stable4_riskgate_rq`
+fixed the bad row with `max_action_diff=0.0`; speed mode was
+`256.5 ms/control` with one risk-gate rejection. A candidate-only object
+episode-1 speed shard at
+`outputs/pi0fast_adaptive_object_ep1_ck152_stable4_riskgate_speed_rq` averaged
+`260.8 ms/control` over `10` rows and triggered the risk gate only on task `0`.
+Treat that shard as diagnostic, not proof: it was not a matched
+baseline/target-EOS gate run and produced different early-success step counts
+than the existing strict speed artifact.
+
 The checkpoint-level threshold probe (`152=5`) did not fix task `0`; it delayed
 the false positive to checkpoint `160`. The more promising focused candidate is
 the once-capped late fallback: object checkpoint `152`, stable checks `4`,
@@ -251,15 +283,14 @@ checkpoint `192` was also exact but slower at `279.3 ms/control`. Both are too
 slow if applied broadly. The next required evidence step is not a full 120-row
 run; it is a narrower late-stability safety gate. Recommended next moves:
 
-- Use the corrected stop-only label path to collect more heldout stop-candidate
-  rows cheaply:
-  `--adaptive-validate-label-all-stability-stops --adaptive-validate-stability-stops-only`
-  plus `scripts/extract_pi0fast_stability_gate_rows.py`.
-- Prioritize rows likely to expose negatives: remaining object episodes for
-  task IDs `2-9`, then spatial/goal rows that supply the hybrid speed margin.
-- Train or hand-check a conservative gate on stop candidates, with heldout
-  tasks, that rejects the one bad late stability stop while keeping most safe
-  checkpoint-`152` stops.
+- Run a matched mini gate for the risk-gate policy before trusting the
+  candidate-only speed shard. The minimum useful slice is object task IDs
+  `0-9`, episode `1`, with baseline/target-EOS/adaptive all in the same run.
+- If the matched mini gate preserves steps/success and stays near the object
+  budget, rerun the full object speed shard with the risk gate. Spatial/goal can
+  keep the stable-checks `3` policy unless new validation failures appear.
+- Continue collecting stop-only labels on heldout rows if the risk gate fires on
+  safe rows or another object validation failure appears.
 - Only after a gate keeps the object speed estimate below `255.8 ms/control`,
   rerun the full object speed shard and then the 120-row speed gate.
 

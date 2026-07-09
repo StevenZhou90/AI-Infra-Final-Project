@@ -869,6 +869,7 @@ class PI0FastTokenLogitAdapter:
         skip_unproductive_after_checkpoint: int = 0,
         continue_to_action_end_on_unstable: bool = False,
         stability_continue_to_action_end: bool = False,
+        stability_risk_gate: dict[str, float] | None = None,
         prefix_gate: Any | None = None,
         prefix_gate_threshold: float = 0.98,
         early_stop_action_end: bool = True,
@@ -926,6 +927,7 @@ class PI0FastTokenLogitAdapter:
         action_snapshots = 0
         checked: list[dict[str, Any]] = []
         continuing_after_stability_stop: dict[str, float] | None = None
+        stability_risk_gate_rejections = 0
 
         def candidate_trace() -> tuple[torch.Tensor, torch.Tensor]:
             token_ids = torch.tensor([generated_tokens], dtype=torch.long, device=device)
@@ -991,6 +993,40 @@ class PI0FastTokenLogitAdapter:
             with torch.no_grad():
                 return float(prefix_gate.probability(features).item())
 
+        def risk_gate_rejects(row: dict[str, float]) -> bool:
+            if not stability_risk_gate:
+                return False
+            checks = {
+                "min_checkpoint": ("checkpoint", ">="),
+                "max_checkpoint": ("checkpoint", "<="),
+                "max_token_count": ("token_count", "<="),
+                "max_logprob_mean": ("logprob_mean", "<="),
+                "min_entropy_mean": ("entropy_mean", ">="),
+                "min_action_abs_max": ("action_abs_max", ">="),
+                "max_position_span": ("position_span", "<="),
+                "max_rotation_span": ("rotation_span", "<="),
+                "max_max_step_delta": ("max_step_delta", "<="),
+            }
+            matched = False
+            for threshold_name, (feature_name, op) in checks.items():
+                if threshold_name not in stability_risk_gate:
+                    continue
+                matched = True
+                value = float(row.get(feature_name, 0.0))
+                threshold = float(stability_risk_gate[threshold_name])
+                if op == ">=" and value < threshold:
+                    return False
+                if op == "<=" and value > threshold:
+                    return False
+            return matched
+
+        def risk_gate_stats() -> dict[str, float]:
+            if stability_risk_gate_rejections <= 0:
+                return {}
+            return {
+                "stability_risk_gate_rejections": float(stability_risk_gate_rejections),
+            }
+
         while len(generated_tokens) < max_decoding_steps:
             next_token = torch.argmax(prev_logits[:, -1], dim=-1, keepdim=True)
             logits_by_step.append(prev_logits)
@@ -1004,6 +1040,7 @@ class PI0FastTokenLogitAdapter:
                     "checked": checked,
                     "stopped_on_stability": False,
                     "stopped_on_action_end": True,
+                    **risk_gate_stats(),
                 }
                 if continuing_after_stability_stop is not None:
                     stats.update(
@@ -1088,6 +1125,11 @@ class PI0FastTokenLogitAdapter:
                             **feature_stats,
                         }
                         continue
+                    if risk_gate_rejects(feature_row):
+                        stability_risk_gate_rejections += 1
+                        checked[-1]["risk_gate_rejected"] = True
+                        checked[-1]["risk_gate_rejection_index"] = stability_risk_gate_rejections
+                        continue
                     gate_prob = gate_probability(feature_row)
                     if gate_prob is not None and gate_prob < prefix_gate_threshold:
                         checked[-1]["gate_probability"] = gate_prob
@@ -1104,6 +1146,7 @@ class PI0FastTokenLogitAdapter:
                         "stable_stop_checkpoint": float(checkpoint),
                         "stable_stop_required_checks": float(required_stable_checks),
                         "stable_stop_stable_count": float(stable_count),
+                        **risk_gate_stats(),
                         **feature_stats,
                     }
                     return PI0FastGenerationTrace(
@@ -1148,6 +1191,7 @@ class PI0FastTokenLogitAdapter:
                         "stopped_on_stability": False,
                         "stopped_on_action_end": True,
                         "continued_on_unstable": True,
+                        **risk_gate_stats(),
                     }
                     if continuing_after_stability_stop is not None:
                         stats.update(
@@ -1194,6 +1238,7 @@ class PI0FastTokenLogitAdapter:
                 "stopped_on_stability": False,
                 "stopped_on_action_end": False,
                 "continued_on_unstable": True,
+                **risk_gate_stats(),
             }
             if continuing_after_stability_stop is not None:
                 stats.update(
@@ -1216,6 +1261,7 @@ class PI0FastTokenLogitAdapter:
             "checked": checked,
             "stopped_on_stability": False,
             "stopped_on_action_end": False,
+            **risk_gate_stats(),
         }
         return PI0FastGenerationTrace(actions=actions, token_ids=token_ids, logits=torch.cat(logits_by_step, dim=1), stats=stats)
 

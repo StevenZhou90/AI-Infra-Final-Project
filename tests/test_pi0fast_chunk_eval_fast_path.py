@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from scripts.run_pi0fast_chunk_eval import (
+    _adaptive_stability_risk_gate_from_args,
     _adapter_action_end_token_id,
     _load_token_id_file,
     _pi05_unsupported_fast_token_modes,
@@ -148,6 +149,30 @@ def test_parse_checkpoint_stable_checks_rejects_invalid_values() -> None:
         parse_checkpoint_stable_checks("0=4")
     with pytest.raises(argparse.ArgumentTypeError):
         parse_checkpoint_stable_checks("152=0")
+
+
+def test_adaptive_stability_risk_gate_from_args_omits_disabled_thresholds() -> None:
+    args = argparse.Namespace(
+        adaptive_stability_risk_min_checkpoint=-1,
+        adaptive_stability_risk_max_checkpoint=160,
+        adaptive_stability_risk_max_token_count=153,
+        adaptive_stability_risk_logprob_mean_max=-1.04,
+        adaptive_stability_risk_entropy_mean_min=2.9,
+        adaptive_stability_risk_action_abs_min=None,
+        adaptive_stability_risk_position_span_max=0.0,
+        adaptive_stability_risk_rotation_span_max=0.0,
+        adaptive_stability_risk_max_step_delta_max=0.0,
+    )
+
+    assert _adaptive_stability_risk_gate_from_args(args) == {
+        "max_checkpoint": 160.0,
+        "max_token_count": 153.0,
+        "max_logprob_mean": -1.04,
+        "min_entropy_mean": 2.9,
+        "max_position_span": 0.0,
+        "max_rotation_span": 0.0,
+        "max_max_step_delta": 0.0,
+    }
 
 
 def test_prefix_cutoff_chunk_uses_no_logits_path_by_default() -> None:
