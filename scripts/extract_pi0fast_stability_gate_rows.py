@@ -10,6 +10,8 @@ from typing import Any
 
 import torch
 
+from serving.pi0fast_prefix_gate import PREFIX_GATE_FEATURES
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -56,6 +58,9 @@ def stability_row(row: dict[str, Any], *, require_label: bool) -> dict[str, Any]
     for key, value in sorted(stats.items()):
         if key.startswith("stability_stop_"):
             out[key] = float(value)
+            unprefixed = key.removeprefix("stability_stop_")
+            if unprefixed in PREFIX_GATE_FEATURES:
+                out[unprefixed] = float(value)
     return out
 
 

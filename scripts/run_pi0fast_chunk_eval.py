@@ -1211,6 +1211,7 @@ def run_episode(
     adaptive_stability_continue_to_action_end_after_step: int | None,
     adaptive_stability_continue_to_action_end_max_fallbacks: int,
     adaptive_validate_label_all_stability_stops: bool,
+    adaptive_validate_stability_stops_only: bool,
     adaptive_prefix_gate,
     adaptive_prefix_gate_threshold: float,
     target_eos_constrained_action_vocab_size: int,
@@ -2261,50 +2262,61 @@ def run_episode(
                             )
                         controller.stats.record_trace_stats(prediction.stats)
                         if mode.startswith("target_eos_adaptive_validate"):
-                            with autocast_ctx:
-                                target_prediction = _predict_action_chunk(
-                                    policy,
-                                    batch,
-                                    policy_postprocessor,
-                                    device,
-                                    token_adapter,
-                                    early_stop_action_end=True,
-                                )
-                            max_diff, mean_diff = _prediction_action_diff(prediction.actions, target_prediction.actions)
-                            controller.stats.exact_verifies += 1
-                            controller.stats.action_max_diffs.append(max_diff)
-                            controller.stats.action_mean_diffs.append(mean_diff)
                             prediction_stats = prediction.stats or {}
                             is_stability_candidate = bool(
                                 prediction_stats.get("stopped_on_stability", False)
                                 or prediction_stats.get("continued_after_stability_stop", False)
                             )
-                            validate_stats = {
-                                "validate_target_ms": target_prediction.elapsed_ms,
-                                "validate_action_max_diff": max_diff,
-                                "validate_action_mean_diff": mean_diff,
-                            }
-                            if max_diff != 0.0 or (
-                                adaptive_validate_label_all_stability_stops and is_stability_candidate
-                            ):
-                                validate_stats["fallback_action_max_diff"] = max_diff
-                            if max_diff != 0.0:
-                                controller.stats.guard_reasons.update(["adaptive_action_diff_fallback"])
-                                prediction = PredictionTrace(
-                                    actions=target_prediction.actions,
-                                    elapsed_ms=prediction.elapsed_ms + target_prediction.elapsed_ms,
-                                    token_count=target_prediction.token_count,
-                                    token_ids=target_prediction.token_ids,
-                                    stats={
+                            should_validate_adaptive = (
+                                not adaptive_validate_stability_stops_only or is_stability_candidate
+                            )
+                            if should_validate_adaptive:
+                                with autocast_ctx:
+                                    target_prediction = _predict_action_chunk(
+                                        policy,
+                                        batch,
+                                        policy_postprocessor,
+                                        device,
+                                        token_adapter,
+                                        early_stop_action_end=True,
+                                    )
+                                max_diff, mean_diff = _prediction_action_diff(
+                                    prediction.actions, target_prediction.actions
+                                )
+                                controller.stats.exact_verifies += 1
+                                controller.stats.action_max_diffs.append(max_diff)
+                                controller.stats.action_mean_diffs.append(mean_diff)
+                                validate_stats = {
+                                    "validate_target_ms": target_prediction.elapsed_ms,
+                                    "validate_action_max_diff": max_diff,
+                                    "validate_action_mean_diff": mean_diff,
+                                }
+                                if max_diff != 0.0 or (
+                                    adaptive_validate_label_all_stability_stops and is_stability_candidate
+                                ):
+                                    validate_stats["fallback_action_max_diff"] = max_diff
+                                if max_diff != 0.0:
+                                    controller.stats.guard_reasons.update(["adaptive_action_diff_fallback"])
+                                    prediction = PredictionTrace(
+                                        actions=target_prediction.actions,
+                                        elapsed_ms=prediction.elapsed_ms + target_prediction.elapsed_ms,
+                                        token_count=target_prediction.token_count,
+                                        token_ids=target_prediction.token_ids,
+                                        stats={
+                                            **prediction_stats,
+                                            **validate_stats,
+                                            "fallback_target_ms": target_prediction.elapsed_ms,
+                                        },
+                                    )
+                                else:
+                                    prediction.stats = {
                                         **prediction_stats,
                                         **validate_stats,
-                                        "fallback_target_ms": target_prediction.elapsed_ms,
-                                    },
-                                )
-                            elif validate_stats:
+                                    }
+                            else:
                                 prediction.stats = {
                                     **prediction_stats,
-                                    **validate_stats,
+                                    "validate_skipped_non_stability_stop": 1.0,
                                 }
                     elif mode.startswith("target_eos"):
                         with autocast_ctx:
@@ -2425,7 +2437,15 @@ def run_episode(
                                     "fallback_action_max_diff": max_diff,
                                 },
                             )
-                    if mode.startswith("target_eos") and "validate" in mode:
+                    skip_target_eos_validate_for_stop_labels = (
+                        mode.startswith("target_eos_adaptive_validate")
+                        and adaptive_validate_stability_stops_only
+                    )
+                    if (
+                        mode.startswith("target_eos")
+                        and "validate" in mode
+                        and not skip_target_eos_validate_for_stop_labels
+                    ):
                         with autocast_ctx:
                             if "constrained" in mode or "_prefix" in mode:
                                 full_prediction = _predict_target_eos_chunk(
@@ -2505,6 +2525,11 @@ def run_episode(
                             )
                         if max_diff != 0.0:
                             controller.stats.guard_reasons.update(["target_eos_action_diff"])
+                    elif skip_target_eos_validate_for_stop_labels:
+                        prediction.stats = {
+                            **(prediction.stats or {}),
+                            "target_eos_validate_skipped_for_stability_stop_collection": 1.0,
+                        }
                     chunk = prediction.actions
                     relaxed_tail = False
                     chunk_extend_handled = False
@@ -3454,6 +3479,14 @@ def parse_args() -> argparse.Namespace:
             "candidate trace row, including exact matches. This is for gate-label extraction only."
         ),
     )
+    parser.add_argument(
+        "--adaptive-validate-stability-stops-only",
+        action="store_true",
+        help=(
+            "In target_eos_adaptive_validate modes, only run the target-EOS validation fallback for "
+            "stability-stop candidates. This speeds gate-label collection and is not a full exactness audit."
+        ),
+    )
     parser.add_argument("--adaptive-prefix-gate-checkpoint", default=None)
     parser.add_argument("--adaptive-prefix-gate-threshold", type=float, default=0.98)
     parser.add_argument(
@@ -4034,6 +4067,7 @@ def main() -> None:
                         args.adaptive_stability_continue_to_action_end_max_fallbacks
                     ),
                     adaptive_validate_label_all_stability_stops=args.adaptive_validate_label_all_stability_stops,
+                    adaptive_validate_stability_stops_only=args.adaptive_validate_stability_stops_only,
                     adaptive_prefix_gate=adaptive_prefix_gate,
                     adaptive_prefix_gate_threshold=args.adaptive_prefix_gate_threshold,
                     target_eos_constrained_action_vocab_size=args.target_eos_constrained_action_vocab_size,
@@ -4348,6 +4382,7 @@ def main() -> None:
             args.adaptive_stability_continue_to_action_end_max_fallbacks
         ),
         "adaptive_validate_label_all_stability_stops": args.adaptive_validate_label_all_stability_stops,
+        "adaptive_validate_stability_stops_only": args.adaptive_validate_stability_stops_only,
         "adaptive_prefix_gate_checkpoint": args.adaptive_prefix_gate_checkpoint,
         "adaptive_prefix_gate_threshold": args.adaptive_prefix_gate_threshold,
         "adaptive_prefix_gate_summary": adaptive_prefix_gate_summary,
