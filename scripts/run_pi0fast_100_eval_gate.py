@@ -118,6 +118,17 @@ def resolve_min_unique_tasks(value: int | None, *, suites: list[str], task_ids: 
     return len(suites) * len(parse_csv(task_ids))
 
 
+def selected_episode_ids(episodes: int, episode_ids: str | None) -> list[int]:
+    if episode_ids is None or not episode_ids.strip():
+        return list(range(int(episodes)))
+    values = sorted({int(part) for part in parse_csv(episode_ids)})
+    if not values:
+        raise ValueError("--episode-ids must contain at least one id when provided")
+    if any(ep < 0 or ep >= int(episodes) for ep in values):
+        raise ValueError("--episode-ids entries must be in [0, --episodes)")
+    return values
+
+
 def _parse_metric_rows(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -141,16 +152,18 @@ def eval_shard_complete(
     mode: str,
     task_ids: str,
     episodes: int,
+    episode_ids: str | None,
     seed: int,
 ) -> bool:
     """Return true when one suite/mode output dir has every expected row."""
 
     rows = _parse_metric_rows(output_dir / "metrics.jsonl")
     expected_task_ids = {int(part) for part in parse_csv(task_ids)}
+    expected_episode_ids = selected_episode_ids(episodes, episode_ids)
     expected = {
         (task_id, episode, seed + episode)
         for task_id in expected_task_ids
-        for episode in range(int(episodes))
+        for episode in expected_episode_ids
     }
     seen: set[tuple[int, int, int]] = set()
     for row in rows:
@@ -173,6 +186,7 @@ def build_eval_command(
     suite: str,
     task_ids: str,
     episodes: int,
+    episode_ids: str | None,
     steps: int,
     mode: str,
     output_dir: Path,
@@ -212,6 +226,13 @@ def build_eval_command(
     ]
     if enable_fast_token_hooks:
         cmd.append("--enable-fast-token-hooks")
+    if episode_ids is not None and episode_ids.strip():
+        cmd.extend(
+            [
+                "--episode-ids",
+                ",".join(str(ep) for ep in selected_episode_ids(episodes, episode_ids)),
+            ]
+        )
     cmd.extend(extra_args)
     return cmd
 
@@ -986,6 +1007,9 @@ def build_manifest(args: argparse.Namespace, extra_args: list[str]) -> dict[str,
     speed_modes = parse_csv(args.speed_modes)
     suites = parse_csv(args.suites)
     task_ids = _task_ids_arg(args.task_ids)
+    raw_episode_ids = getattr(args, "episode_ids", "") or ""
+    episode_ids = selected_episode_ids(args.episodes, raw_episode_ids)
+    episode_ids_arg = ",".join(str(ep) for ep in episode_ids) if raw_episode_ids.strip() else None
     if not speed_modes:
         raise ValueError("--speed-modes must contain at least one mode")
     if not suites:
@@ -1069,6 +1093,7 @@ def build_manifest(args: argparse.Namespace, extra_args: list[str]) -> dict[str,
                     mode=mode,
                     task_ids=task_ids,
                     episodes=args.episodes,
+                    episode_ids=episode_ids_arg,
                     seed=args.seed,
                 ):
                     skipped_existing.append(str(output_dir))
@@ -1080,6 +1105,7 @@ def build_manifest(args: argparse.Namespace, extra_args: list[str]) -> dict[str,
                         suite=suite,
                         task_ids=task_ids,
                         episodes=args.episodes,
+                        episode_ids=episode_ids_arg,
                         steps=args.steps,
                         mode=mode,
                         output_dir=output_dir,
@@ -1104,6 +1130,7 @@ def build_manifest(args: argparse.Namespace, extra_args: list[str]) -> dict[str,
                     mode=mode,
                     task_ids=task_ids,
                     episodes=args.episodes,
+                    episode_ids=episode_ids_arg,
                     seed=args.seed,
                 ):
                     skipped_existing.append(str(output_dir))
@@ -1115,6 +1142,7 @@ def build_manifest(args: argparse.Namespace, extra_args: list[str]) -> dict[str,
                         suite=suite,
                         task_ids=task_ids,
                         episodes=args.episodes,
+                        episode_ids=episode_ids_arg,
                         steps=args.steps,
                         mode=mode,
                         output_dir=output_dir,
@@ -1361,7 +1389,8 @@ def build_manifest(args: argparse.Namespace, extra_args: list[str]) -> dict[str,
         "suites": suites,
         "task_ids": task_ids,
         "episodes": args.episodes,
-        "matched_eval_count": len(suites) * len(parse_csv(task_ids)) * args.episodes,
+        "episode_ids": episode_ids,
+        "matched_eval_count": len(suites) * len(parse_csv(task_ids)) * len(episode_ids),
         "min_unique_tasks": min_unique_tasks,
         "candidate_mode": args.candidate_mode,
         "eval_metadata": run_metadata,
@@ -1411,6 +1440,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--suites", default="libero_object,libero_spatial,libero_goal")
     parser.add_argument("--task-ids", default="0,1,2,3,4,5,6,7,8,9")
     parser.add_argument("--episodes", type=int, default=4)
+    parser.add_argument(
+        "--episode-ids",
+        default="",
+        help="Optional comma-separated episode indices to run. Seeds remain --seed + episode_index.",
+    )
     parser.add_argument("--steps", type=int, default=300)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")

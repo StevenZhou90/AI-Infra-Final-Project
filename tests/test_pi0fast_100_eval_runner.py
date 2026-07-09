@@ -20,6 +20,7 @@ def _args(**overrides):
         "suites": "libero_object,libero_goal",
         "task_ids": "0,1,2",
         "episodes": 4,
+        "episode_ids": "",
         "steps": 300,
         "seed": 42,
         "device": "cuda",
@@ -1546,6 +1547,7 @@ def test_eval_shard_complete_requires_all_task_episode_rows(tmp_path: Path) -> N
         mode="baseline",
         task_ids="0,1",
         episodes=2,
+        episode_ids=None,
         seed=42,
     )
     assert not eval_shard_complete(
@@ -1554,8 +1556,59 @@ def test_eval_shard_complete_requires_all_task_episode_rows(tmp_path: Path) -> N
         mode="baseline",
         task_ids="0,1,2",
         episodes=2,
+        episode_ids=None,
         seed=42,
     )
+
+
+def test_episode_ids_limit_shard_completion_and_commands(tmp_path: Path) -> None:
+    output_dir = tmp_path / "run" / "speed" / "baseline" / "libero_object"
+    _write_metrics(
+        output_dir / "metrics.jsonl",
+        suite="libero_object",
+        mode="baseline",
+        task_ids=[0, 1],
+        episodes=2,
+        seed=42,
+    )
+
+    assert eval_shard_complete(
+        output_dir,
+        suite="libero_object",
+        mode="baseline",
+        task_ids="0,1",
+        episodes=4,
+        episode_ids="1",
+        seed=42,
+    )
+    assert not eval_shard_complete(
+        output_dir,
+        suite="libero_object",
+        mode="baseline",
+        task_ids="0,1",
+        episodes=4,
+        episode_ids=None,
+        seed=42,
+    )
+
+    manifest = build_manifest(
+        _args(
+            root=tmp_path / "run",
+            suites="libero_object",
+            task_ids="0,1",
+            episodes=4,
+            episode_ids="1",
+            speed_modes="baseline,target_eos",
+            candidate_mode="target_eos",
+            skip_validation=True,
+        ),
+        [],
+    )
+
+    assert manifest["episode_ids"] == [1]
+    assert manifest["matched_eval_count"] == 2
+    command = manifest["speed_commands"][0]
+    assert command[command.index("--episode-ids") + 1] == "1"
 
 
 def test_manifest_skip_existing_omits_completed_shards(tmp_path: Path) -> None:
