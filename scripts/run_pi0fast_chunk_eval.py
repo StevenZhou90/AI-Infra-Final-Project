@@ -2167,6 +2167,7 @@ def run_episode(
                                 prefix_gate=adaptive_prefix_gate,
                                 prefix_gate_threshold=adaptive_prefix_gate_threshold,
                             )
+                        controller.stats.record_trace_stats(prediction.stats)
                         if mode.startswith("target_eos_adaptive_validate"):
                             with autocast_ctx:
                                 target_prediction = _predict_action_chunk(

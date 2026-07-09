@@ -1044,6 +1044,9 @@ class PI0FastTokenLogitAdapter:
                         "checked": checked,
                         "stopped_on_stability": True,
                         "stopped_on_action_end": False,
+                        "stable_stop_checkpoint": float(checkpoint),
+                        "stable_stop_required_checks": float(required_stable_checks),
+                        "stable_stop_stable_count": float(stable_count),
                     }
                     return PI0FastGenerationTrace(
                         actions=actions,
