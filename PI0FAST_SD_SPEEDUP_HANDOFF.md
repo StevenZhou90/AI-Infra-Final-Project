@@ -48,6 +48,8 @@ Recent 2026-07-09 probes on the matched task-id/seed subset:
 | `outputs/pi0fast_empirical_vocab_smoke/shrunk_candidate_prefix32_margin001` | same-slice empirical vocab, full-head prefix 32 | `1` | exact tokens/actions | `187.5` | `2.06x` vs target-EOS smoke | overfit smoke only; useful mechanism check |
 | `outputs/pi0fast_empirical_vocab_probe_3task/heldout_task3_prefix32` | tasks 0-2 calibration, task 3 heldout | `1` | not exact | `209.1` | `1.85x` vs target-EOS smoke | heldout mismatch after prefix; needs broader calibration/adaptive fallback |
 | `outputs/pi0fast_empirical_vocab_probe_3task/heldout_task3_prefix64` | tasks 0-2 calibration, task 3 heldout, prefix 64 | `1` | exact tokens/actions | `210.0` | `1.85x` vs target-EOS smoke | exact because restricted tail unused on this slice; not proof of generalization |
+| `outputs/pi0fast_empirical_vocab_probe_3task/heldout_task3_prefix32_expand8` | tasks 0-2 vocab plus high-token radius 8, task 3 heldout | `1` | not exact | `211.4` | `1.84x` vs target-EOS smoke | neighborhood expansion alone did not fix action diff |
+| `outputs/pi0fast_empirical_vocab_probe_3task/heldout_task3_prefix32_expand8_action4096` | expanded vocab, 4096 high-action band, task 3 heldout | `1` | `max_action_diff=0.0`, token mismatch in one chunk | `210.7` | `1.85x` vs target-EOS smoke | promising action-exact candidate; scale before trusting |
 
 The empirical-vocab path now has two important correctness fixes in
 `serving/pi0fast_token_hooks.py`: the sliced restricted LM head includes
@@ -55,6 +57,14 @@ The empirical-vocab path now has two important correctness fixes in
 instead of `topk` tie ordering. These are required for parity with the full
 head, but the heldout probe shows whitelist coverage is still the limiting
 factor.
+
+`scripts/build_pi0fast_empirical_vocab.py` can now expand observed token IDs by
+a bounded neighborhood, e.g. `--expand-radius 8 --expand-min-token-id 240000
+--expand-max-token-id 257151`. This is a training-free robotics analogue of
+dynamic-vocabulary speculation: keep the active vocabulary compact, but cover
+nearby FAST quantization bins around target-observed action tokens. The
+`action4096` heldout probe suggests action equivalence may be recoverable with
+a wider high-action band even when exact token identity differs.
 
 The next required evidence step is still the strict 120 matched-eval gate:
 

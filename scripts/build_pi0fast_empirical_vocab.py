@@ -82,6 +82,35 @@ def select_token_ids(counts: Counter[int], *, min_count: int = 1, top_k: int = 0
     return sorted(token_id for token_id, _count in selected)
 
 
+def expand_token_ids(
+    token_ids: list[int],
+    *,
+    radius: int = 0,
+    min_token_id: int | None = None,
+    max_token_id: int | None = None,
+) -> list[int]:
+    """Return token ids plus optional local neighborhoods around eligible ids."""
+
+    radius = max(0, int(radius))
+    expanded = {int(token_id) for token_id in token_ids}
+    if radius <= 0:
+        return sorted(expanded)
+    for token_id in token_ids:
+        token_id = int(token_id)
+        if min_token_id is not None and token_id < int(min_token_id):
+            continue
+        if max_token_id is not None and token_id > int(max_token_id):
+            continue
+        lo = token_id - radius
+        hi = token_id + radius
+        if min_token_id is not None:
+            lo = max(lo, int(min_token_id))
+        if max_token_id is not None:
+            hi = min(hi, int(max_token_id))
+        expanded.update(range(lo, hi + 1))
+    return sorted(expanded)
+
+
 def build_vocab_payload(
     data_dir: Path,
     *,
@@ -89,17 +118,28 @@ def build_vocab_payload(
     min_count: int = 1,
     top_k: int = 0,
     include_stop_tokens: bool = False,
+    expand_radius: int = 0,
+    expand_min_token_id: int | None = None,
+    expand_max_token_id: int | None = None,
 ) -> dict[str, Any]:
     counts, metadata = collect_token_counts(
         data_dir,
         modes=modes,
         include_stop_tokens=include_stop_tokens,
     )
-    token_ids = select_token_ids(counts, min_count=min_count, top_k=top_k)
-    selected_counts = {str(token_id): int(counts[token_id]) for token_id in token_ids}
+    base_token_ids = select_token_ids(counts, min_count=min_count, top_k=top_k)
+    token_ids = expand_token_ids(
+        base_token_ids,
+        radius=expand_radius,
+        min_token_id=expand_min_token_id,
+        max_token_id=expand_max_token_id,
+    )
+    selected_counts = {str(token_id): int(counts[token_id]) for token_id in base_token_ids}
     return {
         "token_ids": token_ids,
         "token_count": len(token_ids),
+        "base_token_count": len(base_token_ids),
+        "expanded_token_count": len(token_ids) - len(base_token_ids),
         "source_dir": str(data_dir),
         "shards": metadata["shards"],
         "rows": metadata["rows"],
@@ -108,6 +148,9 @@ def build_vocab_payload(
         "top_k": max(0, int(top_k)),
         "mode_filter": None if modes is None else sorted(modes),
         "include_stop_tokens": bool(include_stop_tokens),
+        "expand_radius": max(0, int(expand_radius)),
+        "expand_min_token_id": None if expand_min_token_id is None else int(expand_min_token_id),
+        "expand_max_token_id": None if expand_max_token_id is None else int(expand_max_token_id),
         "counts": selected_counts,
     }
 
@@ -119,6 +162,24 @@ def main() -> None:
     parser.add_argument("--modes", default=None, help="Comma-separated trace modes to include, or all/*.")
     parser.add_argument("--min-count", type=int, default=1, help="Keep tokens seen at least this many times.")
     parser.add_argument("--top-k", type=int, default=0, help="Keep only the k most frequent tokens after min-count.")
+    parser.add_argument(
+        "--expand-radius",
+        type=int,
+        default=0,
+        help="Add +/- radius token-id neighborhoods around selected tokens.",
+    )
+    parser.add_argument(
+        "--expand-min-token-id",
+        type=int,
+        default=None,
+        help="Only expand neighborhoods for selected tokens at or above this id.",
+    )
+    parser.add_argument(
+        "--expand-max-token-id",
+        type=int,
+        default=None,
+        help="Only expand neighborhoods for selected tokens at or below this id.",
+    )
     parser.add_argument(
         "--include-stop-tokens",
         action="store_true",
@@ -132,6 +193,9 @@ def main() -> None:
         min_count=args.min_count,
         top_k=args.top_k,
         include_stop_tokens=args.include_stop_tokens,
+        expand_radius=args.expand_radius,
+        expand_min_token_id=args.expand_min_token_id,
+        expand_max_token_id=args.expand_max_token_id,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
