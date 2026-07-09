@@ -194,6 +194,30 @@ target-EOS fallback had `197` tokens. This motivated the new runner knobs in
   risky stability stop to the action-end token using the existing KV cache.
 - `--adaptive-stability-continue-to-action-end-max-fallbacks N` to cap those
   continuations per episode.
+- `--adaptive-validate-label-all-stability-stops` to attach
+  `fallback_action_max_diff` labels to every stability-stop candidate in
+  `target_eos_adaptive_validate` traces, including exact matches. This is for
+  gate-data collection only, not speed measurement.
+
+Stability-stop feature export now exists in
+`serving/pi0fast_token_hooks.py`. Stop candidates record scalar
+`stability_stop_*` fields for checkpoint, token count, forced-EOS status,
+logprob/entropy summaries, stable-check metadata, and action-shape features.
+`scripts/extract_pi0fast_stability_gate_rows.py` turns token-trace shards into
+JSONL rows filtered to stability stops.
+
+Two focused label-all traces have been collected:
+
+| Artifact | Task row | Stability rows | Safe / unsafe | Key result |
+|---|---:|---:|---:|---|
+| `outputs/pi0fast_adaptive_mismatch_object0_ep1_ck152_stable4_feature_trace_labeled_rq/stability_gate_rows.jsonl` | object task `0`, episode `1`, seed `43` | `8` | `7 / 1` | reproduces the bad step `210` row with `fallback_action_max_diff=0.3084411323070526` |
+| `outputs/pi0fast_adaptive_mismatch_object1_ep1_ck152_stable4_feature_trace_labeled_rq/stability_gate_rows.jsonl` | object task `1`, episode `1`, seed `43` | `6` | `6 / 0` | all stability stops exact under the same checkpoint-`152`, stable-checks-`4` policy |
+
+The combined labeled set is `13` safe rows and `1` unsafe row. A broad hand
+threshold is not defensible yet: the unsafe step-`210` row is close to a safe
+step-`220` row on the exported confidence/action features (`action_abs_max`
+matches, entropy/logprob are nearby). Do not hard-code a one-negative rule as a
+final safety gate without more labeled heldout rows.
 
 The checkpoint-level threshold probe (`152=5`) did not fix task `0`; it delayed
 the false positive to checkpoint `160`. The more promising focused candidate is
@@ -215,9 +239,12 @@ checkpoint `192` was also exact but slower at `279.3 ms/control`. Both are too
 slow if applied broadly. The next required evidence step is not a full 120-row
 run; it is a narrower late-stability safety gate. Recommended next moves:
 
-- Export richer scalar features for stability-stop candidates, including stop
-  checkpoint, generated token count, logprob/entropy summary, and action-shape
-  features already used by `serving/pi0fast_prefix_gate.py`.
+- Use the existing feature export and extractor to build a larger labeled
+  stop-candidate table:
+  `--adaptive-validate-label-all-stability-stops` plus
+  `scripts/extract_pi0fast_stability_gate_rows.py`.
+- Collect more label-all stability-stop traces on heldout object tasks and the
+  spatial/goal rows that supply the hybrid speed margin.
 - Train or hand-check a conservative gate on stop candidates, with heldout
   tasks, that rejects the one bad late stability stop while keeping most safe
   checkpoint-`152` stops.

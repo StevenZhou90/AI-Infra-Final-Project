@@ -1210,6 +1210,7 @@ def run_episode(
     adaptive_stability_target_eos_max_fallbacks: int,
     adaptive_stability_continue_to_action_end_after_step: int | None,
     adaptive_stability_continue_to_action_end_max_fallbacks: int,
+    adaptive_validate_label_all_stability_stops: bool,
     adaptive_prefix_gate,
     adaptive_prefix_gate_threshold: float,
     target_eos_constrained_action_vocab_size: int,
@@ -2273,6 +2274,20 @@ def run_episode(
                             controller.stats.exact_verifies += 1
                             controller.stats.action_max_diffs.append(max_diff)
                             controller.stats.action_mean_diffs.append(mean_diff)
+                            prediction_stats = prediction.stats or {}
+                            is_stability_candidate = bool(
+                                prediction_stats.get("stopped_on_stability", False)
+                                or prediction_stats.get("continued_after_stability_stop", False)
+                            )
+                            validate_stats = {
+                                "validate_target_ms": target_prediction.elapsed_ms,
+                                "validate_action_max_diff": max_diff,
+                                "validate_action_mean_diff": mean_diff,
+                            }
+                            if max_diff != 0.0 or (
+                                adaptive_validate_label_all_stability_stops and is_stability_candidate
+                            ):
+                                validate_stats["fallback_action_max_diff"] = max_diff
                             if max_diff != 0.0:
                                 controller.stats.guard_reasons.update(["adaptive_action_diff_fallback"])
                                 prediction = PredictionTrace(
@@ -2281,11 +2296,16 @@ def run_episode(
                                     token_count=target_prediction.token_count,
                                     token_ids=target_prediction.token_ids,
                                     stats={
-                                        **(prediction.stats or {}),
+                                        **prediction_stats,
+                                        **validate_stats,
                                         "fallback_target_ms": target_prediction.elapsed_ms,
-                                        "fallback_action_max_diff": max_diff,
                                     },
                                 )
+                            elif validate_stats:
+                                prediction.stats = {
+                                    **prediction_stats,
+                                    **validate_stats,
+                                }
                     elif mode.startswith("target_eos"):
                         with autocast_ctx:
                             prediction = _predict_target_eos_chunk(
@@ -3426,6 +3446,14 @@ def parse_args() -> argparse.Namespace:
         default=-1,
         help="Maximum late stability action-end continuations per episode; negative leaves uncapped.",
     )
+    parser.add_argument(
+        "--adaptive-validate-label-all-stability-stops",
+        action="store_true",
+        help=(
+            "In target_eos_adaptive_validate modes, attach fallback_action_max_diff to every stability-stop "
+            "candidate trace row, including exact matches. This is for gate-label extraction only."
+        ),
+    )
     parser.add_argument("--adaptive-prefix-gate-checkpoint", default=None)
     parser.add_argument("--adaptive-prefix-gate-threshold", type=float, default=0.98)
     parser.add_argument(
@@ -4005,6 +4033,7 @@ def main() -> None:
                     adaptive_stability_continue_to_action_end_max_fallbacks=(
                         args.adaptive_stability_continue_to_action_end_max_fallbacks
                     ),
+                    adaptive_validate_label_all_stability_stops=args.adaptive_validate_label_all_stability_stops,
                     adaptive_prefix_gate=adaptive_prefix_gate,
                     adaptive_prefix_gate_threshold=args.adaptive_prefix_gate_threshold,
                     target_eos_constrained_action_vocab_size=args.target_eos_constrained_action_vocab_size,
@@ -4318,6 +4347,7 @@ def main() -> None:
         "adaptive_stability_continue_to_action_end_max_fallbacks": (
             args.adaptive_stability_continue_to_action_end_max_fallbacks
         ),
+        "adaptive_validate_label_all_stability_stops": args.adaptive_validate_label_all_stability_stops,
         "adaptive_prefix_gate_checkpoint": args.adaptive_prefix_gate_checkpoint,
         "adaptive_prefix_gate_threshold": args.adaptive_prefix_gate_threshold,
         "adaptive_prefix_gate_summary": adaptive_prefix_gate_summary,

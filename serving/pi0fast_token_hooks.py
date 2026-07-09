@@ -934,9 +934,15 @@ class PI0FastTokenLogitAdapter:
                 token_ids = torch.cat([token_ids, eos], dim=1)
             return token_ids, self._detokenize_generated_actions(token_ids)
 
-        def gate_probability(checkpoint: int, token_ids: torch.Tensor, actions: torch.Tensor) -> float | None:
-            if prefix_gate is None:
-                return None
+        def candidate_feature_row(
+            checkpoint: int,
+            token_ids: torch.Tensor,
+            actions: torch.Tensor,
+            *,
+            max_delta: float | None,
+            stable_count: int,
+            required_stable_checks: int,
+        ) -> dict[str, float]:
             steps = min(token_ids.shape[1], len(logits_by_step))
             if steps:
                 logits = torch.cat(logits_by_step[:steps], dim=1).float()
@@ -960,6 +966,23 @@ class PI0FastTokenLogitAdapter:
                 **token_stats,
                 **action_feature_values(actions.detach().float().cpu().numpy()),
             }
+            row.update(
+                {
+                    "checkpoint": float(checkpoint),
+                    "token_count": float(token_ids.shape[1]),
+                    "max_delta": 0.0 if max_delta is None else float(max_delta),
+                    "stable_count": float(stable_count),
+                    "required_stable_checks": float(required_stable_checks),
+                }
+            )
+            return row
+
+        def prefixed_feature_stats(row: dict[str, float]) -> dict[str, float]:
+            return {f"stability_stop_{key}": float(value) for key, value in row.items()}
+
+        def gate_probability(row: dict[str, float]) -> float | None:
+            if prefix_gate is None:
+                return None
             features = torch.tensor(
                 [[float(row.get(name, 0.0)) for name in PREFIX_GATE_FEATURES]],
                 dtype=torch.float32,
@@ -1047,15 +1070,25 @@ class PI0FastTokenLogitAdapter:
                     and can_stop_at_checkpoint
                     and continuing_after_stability_stop is None
                 ):
+                    feature_row = candidate_feature_row(
+                        checkpoint,
+                        token_ids,
+                        actions,
+                        max_delta=max_delta,
+                        stable_count=stable_count,
+                        required_stable_checks=required_stable_checks,
+                    )
+                    feature_stats = prefixed_feature_stats(feature_row)
                     if stability_continue_to_action_end:
                         checked[-1]["continued_to_action_end"] = True
                         continuing_after_stability_stop = {
                             "stability_continue_checkpoint": float(checkpoint),
                             "stability_continue_required_checks": float(required_stable_checks),
                             "stability_continue_stable_count": float(stable_count),
+                            **feature_stats,
                         }
                         continue
-                    gate_prob = gate_probability(checkpoint, token_ids, actions)
+                    gate_prob = gate_probability(feature_row)
                     if gate_prob is not None and gate_prob < prefix_gate_threshold:
                         checked[-1]["gate_probability"] = gate_prob
                         checked[-1]["gate_rejected"] = True
@@ -1071,6 +1104,7 @@ class PI0FastTokenLogitAdapter:
                         "stable_stop_checkpoint": float(checkpoint),
                         "stable_stop_required_checks": float(required_stable_checks),
                         "stable_stop_stable_count": float(stable_count),
+                        **feature_stats,
                     }
                     return PI0FastGenerationTrace(
                         actions=actions,
