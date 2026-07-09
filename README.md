@@ -59,17 +59,28 @@ decoder: K=3 smooth head, K=2 complex head, and relaxed smooth-phase thresholds.
 
 ### PI0-FAST Target-EOS Early Stop
 
-The strongest current PI0-FAST result is action-end early stopping over FAST
+The strongest current PI0-FAST mechanism is action-end early stopping over FAST
 tokens. This compares the fixed-budget PI0-FAST decode against stopping when
 the generated action text reaches `|`; validation showed the decoded continuous
-action chunk is unchanged.
+action chunk is unchanged. It is not yet a passing final result on the strict
+120-row proof gate.
 
-Observed 90-episode LIBERO result:
+Legacy 90-episode LIBERO result:
 
 | Decoder | Success | Avg ms/step | Speedup | Drop |
 | --- | ---: | ---: | ---: | ---: |
 | Fixed-budget PI0-FAST | `81/90` | `634.3` | `1.00x` | - |
 | Target-EOS early stop | `81/90` | `259.5` | `2.44x` | `0.0%` |
+
+Current strict artifact:
+
+| Decoder | Success | Avg ms/step | Speedup | Drop |
+| --- | ---: | ---: | ---: | ---: |
+| Fixed-budget PI0-FAST | `7/120` | `607.9` | `1.00x` | - |
+| Target-EOS early stop | `7/120` | `339.8` | `1.789x` | `0.0%` |
+
+The strict row has zero regressions, but it fails the required `2.0x` speedup;
+the candidate must get below `303.9 ms/control` against that baseline.
 
 For the stricter 120 matched-eval gate, use
 `scripts/run_robotics_spec_120_proof.py` to launch the canonical proof wrapper,

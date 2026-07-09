@@ -10,14 +10,15 @@ The current experiments use `lerobot/pi0fast-libero` in LIBERO object tasks with
 
 ## Current Best Result
 
-Update: the strongest usable result is now the exact target-EOS early-stop path
-documented in `docs/pi0fast_target_eos.md`. PI0-FAST's fixed-budget decoder
-keeps generating after the FAST action-end marker (`|`), but LeRobot
-detokenization ignores the tail. Stopping when the target model emits action-end
-therefore preserves the continuous action chunk while removing wasted target
-decode steps.
+Update: there is not yet a passing strict 120-row result. The strongest usable
+mechanism remains exact target-EOS early stop, documented in
+`docs/pi0fast_target_eos.md`, but the current strict gate artifact is short of
+the required `2.0x` speedup. PI0-FAST's fixed-budget decoder keeps generating
+after the FAST action-end marker (`|`), while LeRobot detokenization ignores the
+tail. Stopping when the target model emits action-end preserves the continuous
+action chunk while removing wasted target decode steps.
 
-Observed 90-episode LIBERO result:
+Legacy 90-episode LIBERO result:
 
 | Eval | Mode | Success | ms/control | Speedup | Drop |
 |---|---:|---:|---:|---:|---:|
@@ -25,8 +26,26 @@ Observed 90-episode LIBERO result:
 | 3 suites x 10 tasks x 3 seeds | Target-EOS early stop | `81/90` | `259.5` | `2.44x` | `0.0%` |
 
 Exactness validation over the same 90-episode scale showed `1350` refreshes with
-`max_action_diff=0.0` against fixed-budget decode. The next required evidence
-step is the strict 120 matched-eval gate:
+`max_action_diff=0.0` against fixed-budget decode. That result is superseded for
+final claims by the strict 120 matched-eval gate:
+
+| Artifact | Mode | Success | ms/control | Speedup | Status |
+|---|---:|---:|---:|---:|---:|
+| `outputs/robotics_spec_120_proof/pi0fast_target_eos/speed_only_gate.json` | Fixed-budget baseline | `7/120` | `607.9` | `1.00x` | reference |
+| `outputs/robotics_spec_120_proof/pi0fast_target_eos/speed_only_gate.json` | Target-EOS early stop | `7/120` | `339.8` | `1.789x` | fails `2.0x` |
+
+This artifact has zero success drop and zero regressions, but it must get below
+`303.9 ms/control` against the same baseline to pass `2.0x`.
+
+Recent 2026-07-09 probes on the matched task-id/seed subset:
+
+| Artifact | Candidate | Rows | Success | ms/control | Speedup | Takeaway |
+|---|---:|---:|---:|---:|---:|---|
+| `outputs/pi0fast_target_eos_fastpath_probe_rq` | current no-logits target-EOS | `6` | `1 -> 1` | `331.5` | `1.83x` | object reaches `2.04x`, spatial/goal stay near `1.74x` |
+| `outputs/pi0fast_target_eos_no_gc_probe_rq` | target-EOS with `--disable-gradient-checkpointing` | `6` | `1 -> 1` | `333.3` | `1.82x` | neutral-to-worse; do not promote |
+| `outputs/pi0fast_constrained_struct_margin1_validate_6x50_rq` | constrained head, margin `1.0`, object rows only | `2` | exact actions/tokens | `416.5`, `469.5` | slower than target-EOS | exact but too many full-head fallbacks |
+
+The next required evidence step is still the strict 120 matched-eval gate:
 
 ```bash
 python scripts/run_pi0fast_100_eval_gate.py \
