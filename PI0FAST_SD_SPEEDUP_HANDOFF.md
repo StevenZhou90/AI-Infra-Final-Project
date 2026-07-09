@@ -263,6 +263,18 @@ Treat that shard as diagnostic, not proof: it was not a matched
 baseline/target-EOS gate run and produced different early-success step counts
 than the existing strict speed artifact.
 
+A canonical subprocess-isolated matched mini gate now exists at
+`outputs/pi0fast_adaptive_object_ep1_ck152_stable4_riskgate_gate_mini_rq/gate.json`.
+It used object task IDs `0-9`, episode `1`, and the same risk-gate rule above.
+The gate passed: `10` matched rows, success `2 -> 2`, zero baseline-success
+regressions, zero step mismatches, baseline `564.5 ms/control`, target-EOS
+`296.5 ms/control`, and risk-gated adaptive `258.2 ms/control`. That is `2.19x`
+versus fixed-budget baseline and `1.15x` versus target-EOS. The risk gate fired
+once, on task `0`, matching the known bad-row probe. Caveat: `258.2 ms/control`
+is still slightly above the earlier estimated object budget of about
+`255.8 ms/control` for a `2.0x` 120-row hybrid, so this is promising but not a
+full-object or full-suite proof.
+
 The checkpoint-level threshold probe (`152=5`) did not fix task `0`; it delayed
 the false positive to checkpoint `160`. The more promising focused candidate is
 the once-capped late fallback: object checkpoint `152`, stable checks `4`,
@@ -281,14 +293,14 @@ target-EOS fallback. On object task `0`, episode `1`, it had
 `max_action_diff=0.0` at `264.7 ms/control`; forcing stability confirmation to
 checkpoint `192` was also exact but slower at `279.3 ms/control`. Both are too
 slow if applied broadly. The next required evidence step is not a full 120-row
-run; it is a narrower late-stability safety gate. Recommended next moves:
+run; it is a full object speed shard with the narrower risk gate. Recommended
+next moves:
 
-- Run a matched mini gate for the risk-gate policy before trusting the
-  candidate-only speed shard. The minimum useful slice is object task IDs
-  `0-9`, episode `1`, with baseline/target-EOS/adaptive all in the same run.
-- If the matched mini gate preserves steps/success and stays near the object
-  budget, rerun the full object speed shard with the risk gate. Spatial/goal can
-  keep the stable-checks `3` policy unless new validation failures appear.
+- Rerun the full object speed shard with the risk gate. Spatial/goal can keep
+  the stable-checks `3` policy unless new validation failures appear.
+- If the full object average stays above about `255.8 ms/control`, tune the
+  late-stability risk rule or limit the fired fallback further before spending a
+  full 120-row speed run.
 - Continue collecting stop-only labels on heldout rows if the risk gate fires on
   safe rows or another object validation failure appears.
 - Only after a gate keeps the object speed estimate below `255.8 ms/control`,
