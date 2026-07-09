@@ -12,11 +12,14 @@ The current experiments use `lerobot/pi0fast-libero` in LIBERO object tasks with
 
 Update: there is not yet a final passing strict 120-row proof because full
 exact validation for adaptive prefix cutoff is still outstanding. The strongest
-strict speed evidence is adaptive prefix cutoff with stable checks `3`, which
-passes the strict 120-row speed-only gate at `301.0 ms/control` (`2.02x`) with
-matched steps and zero success drop. The strict best fully validated artifact
-remains exact target-EOS early stop, documented in `docs/pi0fast_target_eos.md`,
-but it is short of the required `2.0x` speedup.
+strict speed evidence is the suite-conditional adaptive prefix hybrid at
+`outputs/robotics_spec_120_proof/pi0fast_adaptive_object_ck152_stable4_hybrid/gate.json`:
+object uses checkpoint `152` with stable checks `4`, while spatial and goal use
+stable checks `3`. It passes the strict 120-row speed-only gate at
+`302.5 ms/control` (`2.01x`) with matched steps and zero success drop. The
+strict best fully validated artifact remains exact target-EOS early stop,
+documented in `docs/pi0fast_target_eos.md`, but it is short of the required
+`2.0x` speedup.
 PI0-FAST's fixed-budget decoder keeps generating after the FAST action-end
 marker (`|`), while LeRobot detokenization ignores the tail. Stopping when the
 target model emits action-end preserves the continuous action chunk while
@@ -70,7 +73,9 @@ Recent 2026-07-09 probes on the matched task-id/seed subset:
 | `outputs/robotics_spec_120_proof/pi0fast_adaptive_stable3/gate.json` | strict 120 adaptive speed-only, stable checks `3` | `120` | `7 -> 7` | `301.0` | `2.02x` vs baseline, `1.13x` vs target-EOS | passes strict speed-only gate; full exact validation still required |
 | `outputs/robotics_spec_120_proof/pi0fast_adaptive_stable3/validate/target_eos_adaptive_validate/libero_object/metrics.jsonl` | strict validation start, stable checks `3` | `2` | row 0 exact, row 1 not exact | `779.8` validate on bad row | blocks final proof | `libero_object` task `0`, episode `1`, seed `43` had `max_action_diff=0.07857602834701538` |
 | `outputs/pi0fast_adaptive_mismatch_object0_ep1_ck152_early4_128_rq` | focused bad-row validation, checkpoint `152` plus early checks `4<=128` | `1` | `0 -> 0`, `max_action_diff=0.0` | `257.5` speed / `796.0` validate | diagnostic only | cheapest exact focused setting found; checkpoints `144` and `148` still failed |
-| `outputs/robotics_spec_120_proof/pi0fast_adaptive_object_ck152_hybrid/gate.json` | strict 120 hybrid speed-only: object checkpoint `152`, spatial/goal stable checks `3` | `120` | `7 -> 7` | `302.4` | `2.01x` vs baseline, `1.12x` vs target-EOS | passes speed-only with zero step mismatches; full exact validation still required |
+| `outputs/robotics_spec_120_proof/pi0fast_adaptive_object_ck152_hybrid/gate.json` | strict 120 hybrid speed-only: object checkpoint `152` with early checks `4<=128`, spatial/goal stable checks `3` | `120` | `7 -> 7` | `302.4` | `2.01x` vs baseline, `1.12x` vs target-EOS | speed-only passed, but object validation failed on task `1`, episode `1` with `max_action_diff=0.3119494318962097` |
+| `outputs/pi0fast_adaptive_mismatch_object1_ep1_ck152_stable4_rq` | focused bad-row validation, object checkpoint `152`, stable checks `4` | `1` | `0 -> 0`, `max_action_diff=0.0` | `245.6` speed / `835.8` validate | diagnostic only | fixes the second object validation failure |
+| `outputs/robotics_spec_120_proof/pi0fast_adaptive_object_ck152_stable4_hybrid/gate.json` | strict 120 hybrid speed-only: object checkpoint `152` with stable checks `4`, spatial/goal stable checks `3` | `120` | `7 -> 7` | `302.5` | `2.01x` vs baseline, `1.12x` vs target-EOS | current best speed-only candidate; full exact validation still required |
 
 The empirical-vocab path now has two important correctness fixes in
 `serving/pi0fast_token_hooks.py`: the sliced restricted LM head includes
@@ -141,18 +146,32 @@ the early speed sample, but a suite-conditional hybrid is still viable:
 object uses the checkpoint-`152` conservative setting, while spatial and goal
 reuse stable checks `3`.
 
-The hybrid strict 120 speed-only diagnostic passed:
+The first hybrid strict 120 speed-only diagnostic passed:
 `outputs/robotics_spec_120_proof/pi0fast_adaptive_object_ck152_hybrid/gate.json`
 has `120` matched rows, `7 -> 7` successes, zero regressions, zero matched-step
 mismatches, and `302.4 ms/control` (`2.01x`) versus the `607.9 ms/control`
-baseline. It is not a final result until full exact validation proves the
-object checkpoint-`152` shard and the spatial/goal stable-checks-`3` shards.
+baseline. It is not usable as the final result: exact validation then failed on
+`libero_object` task `1`, episode `1`, seed `43` with
+`max_action_diff=0.3119494318962097`.
+
+Stable checks `4` with checkpoint `152` fixed that second object failure in the
+focused diagnostic
+`outputs/pi0fast_adaptive_mismatch_object1_ep1_ck152_stable4_rq`:
+`target_eos_adaptive_validate` had `60` exact verifies and
+`max_action_diff=0.0`. A second hybrid speed-only root using that conservative
+object setting passed:
+`outputs/robotics_spec_120_proof/pi0fast_adaptive_object_ck152_stable4_hybrid/gate.json`
+has `120` matched rows, `7 -> 7` successes, zero regressions, zero matched-step
+mismatches, and `302.5 ms/control` (`2.01x`) versus the `607.9 ms/control`
+baseline. Suite-level speeds were object `251.5 ms/control` (`2.25x`), spatial
+`341.2 ms/control` (`1.87x`), and goal `314.8 ms/control` (`1.97x`). This is
+the current best speed-only candidate, but it still needs full exact validation.
 
 The next required evidence step is full exact validation plus final audit for
 the hybrid root. The validation shards must use the same suite-conditional
 settings as the speed artifact:
 
-Object validation:
+Object validation for the current best stable4 hybrid:
 
 ```bash
 for mode in target_eos_adaptive_validate target_eos_validate; do
@@ -163,16 +182,14 @@ python scripts/run_pi0fast_chunk_eval.py \
   --steps 300 \
   --modes "$mode" \
   --seed 42 \
-  --output-dir outputs/robotics_spec_120_proof/pi0fast_adaptive_object_ck152_hybrid/validate/"$mode"/libero_object \
+  --output-dir outputs/robotics_spec_120_proof/pi0fast_adaptive_object_ck152_stable4_hybrid/validate/"$mode"/libero_object \
   --device cuda \
   --dtype bfloat16 \
   --smooth-position-delta 0.06 \
   --smooth-rotation-delta 0.22 \
   --enable-fast-token-hooks \
   --adaptive-prefix-checkpoints 32,64,96,128,152,160,192,224 \
-  --adaptive-stable-checks 3 \
-  --adaptive-early-stable-checks 4 \
-  --adaptive-early-max-stable-checkpoint 128 \
+  --adaptive-stable-checks 4 \
   --adaptive-stable-tolerance 0.0
 done
 ```
@@ -189,7 +206,7 @@ python scripts/run_pi0fast_chunk_eval.py \
   --steps 300 \
   --modes "$mode" \
   --seed 42 \
-  --output-dir outputs/robotics_spec_120_proof/pi0fast_adaptive_object_ck152_hybrid/validate/"$mode"/"$suite" \
+  --output-dir outputs/robotics_spec_120_proof/pi0fast_adaptive_object_ck152_stable4_hybrid/validate/"$mode"/"$suite" \
   --device cuda \
   --dtype bfloat16 \
   --smooth-position-delta 0.06 \
@@ -203,7 +220,7 @@ done
 ```
 
 After all validation shards exist, run the gate/final audit against
-`outputs/robotics_spec_120_proof/pi0fast_adaptive_object_ck152_hybrid`.
+`outputs/robotics_spec_120_proof/pi0fast_adaptive_object_ck152_stable4_hybrid`.
 
 For a fresh canonical `pi0fast-adaptive` run, use a new root or remove stale
 stable-checks `1` adaptive speed shards before combining `--skip-existing` with
