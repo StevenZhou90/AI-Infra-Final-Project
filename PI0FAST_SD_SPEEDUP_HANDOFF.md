@@ -60,6 +60,7 @@ Recent 2026-07-09 probes on the matched task-id/seed subset:
 | `outputs/pi0fast_adaptive_prefix_cross_suite_task3_ck32_224_stable1` | adaptive prefix checkpoints `32..224`, stable checks 1, object task 3 heldout | `1` | `max_action_diff=0.0` vs target-EOS | `213.5` | `1.86x` vs target-EOS smoke | action-stability cutoff recovers object speed without static vocab |
 | `outputs/pi0fast_adaptive_prefix_cross_suite_task3_ck32_224_stable1` | same adaptive setting, spatial task 3 heldout | `1` | `max_action_diff=0.0` vs target-EOS | `294.9` | `1.14x` vs target-EOS smoke | exact but only modest gain because target-EOS already emitted shorter chunks |
 | `outputs/pi0fast_adaptive_prefix_cross_suite_task3_ck32_224_stable1` | same adaptive setting, goal task 3 heldout | `1` | `max_action_diff=0.0` vs target-EOS | `298.8` | `1.54x` vs target-EOS smoke | fixes the no-stop-token 256-token goal chunk; best candidate to scale |
+| `outputs/robotics_spec_120_proof_mini_adaptive_rq/pi0fast_adaptive/gate.json` | adaptive mini matched gate, task 3 across object/spatial/goal | `3` | `0 -> 0`, `max_action_diff=0.0` in validation | `283.3` | `2.19x` vs baseline, `1.42x` vs target-EOS | passes mini gate with exact validation; not final 120 proof because success thresholds were disabled for this tiny slice |
 
 The empirical-vocab path now has two important correctness fixes in
 `serving/pi0fast_token_hooks.py`: the sliced restricted LM head includes
@@ -92,6 +93,17 @@ task-3 heldout sweep above, it reduced average target-EOS latency from
 `max_action_diff=0.0` in validation. Relative to the existing strict fixed
 baseline average (`607.9 ms/control`), that heldout mean would be `2.26x`, but
 this is not a final claim until the strict 120 matched gate passes.
+
+A follow-up mini matched gate using the strict proof wrapper and the `.env` HF
+token passed on task 3 across `libero_object`, `libero_spatial`, and
+`libero_goal`. The artifact is
+`outputs/robotics_spec_120_proof_mini_adaptive_rq/pi0fast_adaptive/gate.json`.
+It measured baseline `619.5 ms/control`, target-EOS `401.2 ms/control`, and
+adaptive `283.3 ms/control`, for `2.19x` vs fixed-budget baseline and `1.42x`
+vs target-EOS. Validation covered `3` adaptive rows and `3` target-EOS rows with
+`18` exact verifies total and `max_action_diff=0.0`. This run used
+`--min-baseline-successes 0 --min-suite-baseline-successes 0`, so it is a speed
+and exactness sanity check only; the strict 120 gate below is still required.
 
 The next required evidence step is the strict 120 matched-eval gate for
 `pi0fast-adaptive`:
