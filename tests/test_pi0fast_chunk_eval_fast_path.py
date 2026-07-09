@@ -4,6 +4,7 @@ import torch
 
 from scripts.run_pi0fast_chunk_eval import (
     _adapter_action_end_token_id,
+    _pi05_unsupported_fast_token_modes,
     _predict_prefix_cutoff_chunk,
     _predict_target_eos_chunk,
 )
@@ -117,6 +118,13 @@ def test_prefix_cutoff_chunk_uses_no_logits_path_by_default() -> None:
     assert prediction.token_count == 3
     assert prediction.token_ids.tolist() == [[10, 20, 30]]
     assert prediction.stats["mode"] == "prefix_cutoff_no_logits"
+
+
+def test_pi05_rejects_pi0fast_token_decode_modes() -> None:
+    assert _pi05_unsupported_fast_token_modes(
+        ["baseline", "target_eos", "pattern_sd_direct", "block_sd_validate"]
+    ) == ["target_eos", "pattern_sd_direct", "block_sd_validate"]
+    assert _pi05_unsupported_fast_token_modes(["baseline", "chunk_m3"]) == []
 
 
 def test_prefix_cutoff_chunk_can_force_action_prefix() -> None:

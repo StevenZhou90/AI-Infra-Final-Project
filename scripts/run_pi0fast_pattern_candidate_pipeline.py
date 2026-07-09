@@ -714,6 +714,13 @@ def build_manifest(args: argparse.Namespace) -> dict[str, Any]:
     suites = parse_csv(args.suites)
     if not suites:
         raise ValueError("--suites must contain at least one suite")
+    if args.policy_kind == "pi05":
+        raise ValueError(
+            "PI0.5 is not currently supported by the pattern candidate pipeline: "
+            "trace collection uses PI0-FAST target_eos FAST-token hooks. Add a "
+            "PI0.5-specific stop-token/token-adapter path before collecting PI0.5 "
+            "pattern traces."
+        )
     task_ids = _task_ids_arg(args.task_ids)
     root = args.root
     trace_dir = args.trace_dir or (root / "target_eos_traces")

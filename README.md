@@ -118,15 +118,15 @@ mode over recent verified chunks; the high-level candidate pipeline sweeps
 `--chunk-position-delta-min-counts 1,2` so repeated deltas can be preferred over
 single recent observations. `--action-trend-regression` fits a short regression line over
 the verified tokens for the current action dimension and drafts the projected
-next token; PI0-FAST or PI0.5 still verifies it before emission.
+next token; PI0-FAST still verifies it before emission.
 `--action-prefix-lookup` drafts later dimensions of the current action vector
 from prior verified actions that share the already-emitted intra-action prefix,
 which exploits low-entropy robot action structure without changing exact
 verification.
 `--action-vector-suffix-lookup` is a stricter full-vector variant: once some
 dimensions of the current action are verified, it proposes the remaining suffix
-from prior full action vectors with the same prefix, and PI0-FAST or PI0.5 still
-verifies every token.
+from prior full action vectors with the same prefix, and PI0-FAST still verifies
+every token.
 `--chunk-length-stop` drafts the FAST stop token when recent verified chunks
 ended at the same token length, which targets the final `target_eos` verifier
 step without changing exactness.
@@ -227,9 +227,9 @@ use `scripts/run_pi0fast_pattern_candidate_pipeline.py`. It writes lightweight
 split, and invokes the 120-task wrapper with `--reference-mode target_eos` by
 default in gate dry-run mode. Trace shards record the resolved FAST action-end
 token, and offline sweeps infer it unless `--stop-token-ids` is supplied, so
-stop-aware priors are ranked against the same early-stop token used online. For
-PI0.5, pass `--policy-kind pi05` and any flow-step override after the same
-pipeline flags.
+stop-aware priors are ranked against the same early-stop token used online.
+PI0.5 is not supported by this token-trace pipeline until a PI0.5-specific
+token/stop adapter exists.
 The pipeline also bounds the default offline search with
 `--max-enabled-sources 4` and `--max-sweep-configs 4096`. The sweep prunes
 over-budget source combinations before evaluation and varies source settings
@@ -287,12 +287,12 @@ passed manually, the wrapper auto-adds gate checks that require the selected
 tree width, nonzero tree verification, and zero unverified pattern-token
 shortcuts in candidate `trace_stats`.
 
-For PI0.5 experiments, compare speculative candidates against `target_eos`
-stop-token early-stop, not fixed-budget decode alone.
-When the wrapper is run with `--policy-kind pi05`, the gate JSON records
-`metadata.policy_kind=pi05` and the final audit command requires
-`--expected-policy-kind pi05`, so a PI0.5 result cannot be mistaken for a
-PI0-FAST artifact.
+PI0.5 is currently supported in this repo as a flow-action rollout/serving
+baseline, not through the PI0-FAST FAST-token speculative modes. The
+`target_eos`, `target_cutoff`, and `pattern_sd` paths require PI0-FAST token
+decode hooks and now fail early when launched with `--policy-kind pi05`. A
+PI0.5 speculative result should only be compared against a PI0.5 stop-token
+reference after a PI0.5-specific token/stop adapter has been added.
 
 ### Multi-GPU Serving Validation
 

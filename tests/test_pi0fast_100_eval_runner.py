@@ -183,30 +183,23 @@ def test_eval_metadata_extracts_pi05_policy_args() -> None:
     }
 
 
-def test_manifest_records_pi05_metadata_and_audit_expectation(tmp_path: Path) -> None:
-    manifest = build_manifest(
-        _args(
-            root=tmp_path / "run",
-            speed_modes="baseline,target_eos,pattern_sd_direct",
-            candidate_mode="pattern_sd_direct",
-            run_final_audit=True,
-        ),
-        ["--policy-kind", "pi05", "--num-inference-steps", "8"],
-    )
-
-    assert manifest["eval_metadata"]["policy_kind"] == "pi05"
-    assert manifest["eval_metadata"]["num_inference_steps"] == "8"
-    assert manifest["expected_policy_kind"] == "pi05"
-    assert "--metadata" in manifest["gate_command"]
-    assert "policy_kind=pi05" in manifest["gate_command"]
-    assert "num_inference_steps=8" in manifest["gate_command"]
-    assert "--pi0fast-manifest" in manifest["audit_command"]
-    assert str(tmp_path / "run" / "run_manifest.json") in manifest["audit_command"]
-    assert "--expected-policy-kind" in manifest["audit_command"]
-    assert "pi05" in manifest["audit_command"]
-    assert "--require-pattern-source-coverage" not in manifest["audit_command"]
-    assert "--reference-mode" in manifest["gate_command"]
-    assert "target_eos" in manifest["gate_command"]
+def test_manifest_rejects_pi05_fast_token_modes(tmp_path: Path) -> None:
+    try:
+        build_manifest(
+            _args(
+                root=tmp_path / "run",
+                speed_modes="baseline,target_eos,pattern_sd_direct",
+                candidate_mode="pattern_sd_direct",
+                run_final_audit=True,
+            ),
+            ["--policy-kind", "pi05", "--num-inference-steps", "8"],
+        )
+    except ValueError as exc:
+        assert "PI0.5" in str(exc)
+        assert "FAST-token decode hooks" in str(exc)
+        assert "target_eos" in str(exc)
+    else:
+        raise AssertionError("expected PI0.5 FAST-token modes to fail before manifest construction")
 
 
 def test_pi0fast_gate_parser_defaults_to_120_eval_thresholds() -> None:

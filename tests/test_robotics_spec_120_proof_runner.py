@@ -317,35 +317,23 @@ def test_pattern_proof_rejects_missing_heldout_suite_coverage(tmp_path: Path) ->
         raise AssertionError("expected under-covered heldout suites to fail")
 
 
-def test_pi05_pattern_proof_compares_against_target_eos_and_records_policy(tmp_path: Path) -> None:
+def test_pi05_pattern_proof_requires_pi05_token_adapter(tmp_path: Path) -> None:
     sweep = tmp_path / "sweep.json"
-    manifest = build_manifest(
-        _args(
-            tmp_path,
-            path="pi05-pattern",
-            pattern_sweep_json=sweep,
-            pi05_policy="local/pi05",
-            pi05_num_inference_steps=8,
+    try:
+        build_manifest(
+            _args(
+                tmp_path,
+                path="pi05-pattern",
+                pattern_sweep_json=sweep,
+                pi05_policy="local/pi05",
+                pi05_num_inference_steps=8,
+            )
         )
-    )
-    command = manifest["command"]
-
-    assert manifest["early_stop_reference"] == "target_eos"
-    assert manifest["expected_policy_kind"] == "pi05"
-    assert manifest["pattern_sweep_precheck"]["status"] == "not_inspected_missing_dry_run"
-    assert command[command.index("--speed-modes") + 1] == "baseline,target_eos,pattern_sd_direct"
-    assert command[command.index("--candidate-mode") + 1] == "pattern_sd_direct"
-    assert command[command.index("--reference-mode") + 1] == "target_eos"
-    assert "--min-reference-speedup" in command
-    assert command[command.index("--min-reference-speedup") + 1] == "2.0"
-    assert "--pattern-sweep-json" in command
-    assert command[command.index("--pattern-sweep-rank") + 1] == "0"
-    assert command[command.index("--pattern-min-task-count") + 1] == "30"
-    assert command[command.index("--pattern-min-heldout-task-count") + 1] == "6"
-    assert "--pattern-auto-source-min-metrics" in command
-    assert "--" in command
-    extra = command[command.index("--") + 1 :]
-    assert extra[:6] == ["--policy-kind", "pi05", "--policy", "local/pi05", "--num-inference-steps", "8"]
+    except ValueError as exc:
+        assert "pi05-pattern is not currently runnable" in str(exc)
+        assert "FAST-token hooks" in str(exc)
+    else:
+        raise AssertionError("expected pi05-pattern proof to require a PI0.5 token adapter")
 
 
 def test_openvla_proof_keeps_strict_spec_stats_thresholds(tmp_path: Path) -> None:

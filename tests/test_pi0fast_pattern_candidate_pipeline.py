@@ -31,9 +31,9 @@ def _args(tmp_path: Path, **overrides) -> Namespace:
         "seed": 42,
         "device": "cuda",
         "dtype": "bfloat16",
-        "policy_kind": "pi05",
+        "policy_kind": "pi0fast",
         "policy": None,
-        "num_inference_steps": 8,
+        "num_inference_steps": None,
         "smooth_position_delta": 0.06,
         "smooth_rotation_delta": 0.22,
         "trace_max_rows_per_shard": 128,
@@ -141,6 +141,7 @@ def _args(tmp_path: Path, **overrides) -> Namespace:
         "source_acceptance_bias_min_observations": "1",
         "reuse_full_blocks": "true",
         "emit_bonus_token": "both",
+        "defer_correction_token": False,
         "dynamic_lookahead": "both",
         "min_lookaheads": "1,2",
         "lookahead_growths": "1",
@@ -205,7 +206,7 @@ def test_pattern_candidate_pipeline_manifest_uses_target_eos_reference(tmp_path:
     assert "--token-trace-modes" in trace_command
     assert "target_eos" in trace_command
     assert "--policy-kind" in trace_command
-    assert "pi05" in trace_command
+    assert trace_command[trace_command.index("--policy-kind") + 1] == "pi0fast"
 
     sweep_command = manifest["sweep_command"]
     assert sweep_command is not None
@@ -354,7 +355,17 @@ def test_pattern_candidate_pipeline_manifest_uses_target_eos_reference(tmp_path:
     assert manifest["thresholds"]["pattern_min_heldout_modeled_speedup"] == 1.10
     assert manifest["thresholds"]["pattern_min_heldout_task_forward_reduction"] == 1.10
     assert manifest["thresholds"]["pattern_min_heldout_task_count"] == 2
-    assert gate_command[-5:] == ["--", "--policy-kind", "pi05", "--num-inference-steps", "8"]
+    assert "--policy-kind" not in gate_command
+
+
+def test_pattern_candidate_pipeline_rejects_pi05_until_token_adapter_exists(tmp_path: Path) -> None:
+    try:
+        build_manifest(_args(tmp_path, policy_kind="pi05", num_inference_steps=8))
+    except ValueError as exc:
+        assert "PI0.5 is not currently supported" in str(exc)
+        assert "target_eos FAST-token hooks" in str(exc)
+    else:
+        raise AssertionError("expected PI0.5 pattern pipeline to require a token adapter")
 
 
 def test_pattern_candidate_pipeline_defaults_include_compact_tree_screen() -> None:

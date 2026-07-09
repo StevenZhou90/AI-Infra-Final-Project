@@ -52,6 +52,32 @@ if "MUJOCO_GL" not in os.environ and not os.environ.get("DISPLAY"):
 
 logger = logging.getLogger("run_pi0fast_chunk_eval")
 
+PI0FAST_TOKEN_MODE_PREFIXES = (
+    "target_eos",
+    "target_cutoff",
+    "ngram_sd",
+    "ngram_extend",
+    "ngram_traj_tail",
+    "pattern_sd",
+    "medusa_sd",
+    "block_sd",
+    "exact_fast_sd",
+)
+
+
+def _pi05_unsupported_fast_token_modes(modes: list[str]) -> list[str]:
+    return [
+        mode
+        for mode in modes
+        if any(mode.startswith(prefix) for prefix in PI0FAST_TOKEN_MODE_PREFIXES)
+    ]
+
+
+def _identity_torch_compile(model=None, *args, **kwargs):
+    if model is None:
+        return lambda fn: fn
+    return model
+
 
 def _ensure_libero_config(config_path: str | None) -> None:
     """Avoid LIBERO's interactive first-run dataset-path prompt."""
@@ -2753,6 +2779,11 @@ def parse_args() -> argparse.Namespace:
         help="Flow inference steps for PI0.5 policies.",
     )
     parser.add_argument(
+        "--pi05-disable-compile",
+        action="store_true",
+        help="Load PI0.5 with config.compile_model disabled for eager rollout/debug runs.",
+    )
+    parser.add_argument(
         "--enable-fast-token-hooks",
         action="store_true",
         help="Use LeRobot π0-FAST internals to return generated FAST token IDs and logits.",
@@ -3300,6 +3331,16 @@ def main() -> None:
     make_env, make_env_pre_post_processors, preprocess_observation, LiberoEnv, make_pre_post_processors, PI0FastPolicy = _import_lerobot()
     if args.policy is None:
         args.policy = "lerobot/pi05_libero_finetuned_v044" if args.policy_kind == "pi05" else "lerobot/pi0fast-libero"
+    modes = [m.strip() for m in args.modes.split(",") if m.strip()]
+    if args.policy_kind == "pi05":
+        unsupported_modes = _pi05_unsupported_fast_token_modes(modes)
+        if unsupported_modes:
+            raise ValueError(
+                "PI0.5 LeRobot policies use flow-action sampling and do not expose the "
+                "PI0-FAST FAST-token decode hooks required by modes "
+                f"{unsupported_modes}. Use PI0.5 baseline flow modes, or add a "
+                "PI0.5-specific stop-token/token-adapter path before running these modes."
+            )
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -3337,6 +3378,9 @@ def main() -> None:
         from lerobot.policies.pi05.modeling_pi05 import PI05Policy
 
         PolicyClass = PI05Policy
+        if args.pi05_disable_compile:
+            os.environ["TORCH_COMPILE_DISABLE"] = "1"
+            torch.compile = _identity_torch_compile
     else:
         PolicyClass = PI0FastPolicy
     policy = PolicyClass.from_pretrained(args.policy).to(device=device, dtype=dtype).eval()
@@ -3355,7 +3399,6 @@ def main() -> None:
     env_map = make_env(env_cfg, n_envs=1, use_async_envs=False)
     task_ids = selected_task_ids if selected_task_ids is not None else sorted(env_map[args.task])
 
-    modes = [m.strip() for m in args.modes.split(",") if m.strip()]
     adaptive_prefix_checkpoints = [int(part.strip()) for part in args.adaptive_prefix_checkpoints.split(",") if part.strip()]
     ngram_drafter = None
     block_drafter = None

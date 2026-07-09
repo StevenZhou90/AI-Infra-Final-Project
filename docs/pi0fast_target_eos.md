@@ -215,7 +215,7 @@ its checkpoint arguments after `--` and keep `--reference-mode target_eos`.
 Before launching a full 120-eval candidate run, score candidate pattern settings
 on saved PI0-FAST token traces:
 
-For new PI0-FAST or PI0.5 pattern candidates, prefer collecting those traces
+For new PI0-FAST pattern candidates, prefer collecting those traces
 from the `target_eos` early-stop path so the offline comparison models the same
 stop-token baseline used by the final gate. The trace shards carry the resolved
 FAST action-end token, and offline sweeps infer `--stop-token-ids` from that
@@ -226,8 +226,6 @@ metadata unless an override is supplied. This wrapper collects per-suite
 ```bash
 python scripts/run_pi0fast_pattern_candidate_pipeline.py \
   --root outputs/pi0fast_pattern_candidate \
-  --policy-kind pi05 \
-  --num-inference-steps 8 \
   --gate-dry-run
 ```
 
@@ -328,7 +326,7 @@ default, matching the real runner's per-episode reset and avoiding cross-reset
 trace leakage. The optional position-mode histogram prior proposes the most
 common next FAST token at the same chunk position among recent verified chunks
 that share the current prefix. It is a conservative repetition prior for PI0-FAST
-and PI0.5 traces, and the online verifier still rejects any token that does not
+traces, and the online verifier still rejects any token that does not
 match the target model. The optional global-position prior removes the prefix
 match and proposes modal non-stop tokens at the same absolute FAST position from
 bounded recent history, which is useful when robot actions are low entropy across
@@ -348,7 +346,7 @@ histogram. It learns short verified histories for the current action dimension,
 backs off from deeper to shallower contexts, and supplies top-k candidates to
 the exact chain or tree verifier. This is the robotics analogue of retrieval
 and tree-candidate speculative decoding: exploit the smaller action-token
-distribution, but still let PI0-FAST or PI0.5 verify every emitted token. The
+distribution, but still let PI0-FAST verify every emitted token. The
 120-eval wrapper requires `action_context_tree_*` trace stats when the prior
 is enabled.
 
@@ -362,7 +360,7 @@ Use `--source-cooldown both` to screen an acceptance-aware source scheduler.
 When a source proposes the first rejected verified token, the drafter skips that
 source for the next few speculative blocks and falls back to the next configured
 source. This adapts dynamic drafter scheduling ideas to robotics without
-changing exactness: the target PI0-FAST or PI0.5 model still verifies every
+changing exactness: the target PI0-FAST model still verifies every
 emitted token. The runtime reports `source_cooldown_events` and
 `source_cooldown_skipped_sources`; the 120-eval wrapper requires those
 trace-stat fields when `--pattern-source-cooldown` is enabled.
@@ -406,8 +404,8 @@ before a capped sweep row can be selected.
 
 Use `--action-trend-regression both` to test a bounded same-action-dimension
 trend prior. It fits a short regression line over verified prefix tokens for the
-current action dimension and proposes the projected next token; PI0-FAST or
-PI0.5 still verifies every emitted token. The 120-eval wrapper requires
+current action dimension and proposes the projected next token; PI0-FAST still
+verifies every emitted token. The 120-eval wrapper requires
 `action_trend_regression_*` trace stats when the prior is enabled.
 
 Use `--action-prefix-lookup both` to test an intra-action-vector lookup prior.
@@ -415,7 +413,7 @@ Once the target model has emitted the first dimensions of the current action,
 the drafter looks for prior verified actions with the same prefix and proposes
 the next dimension token. This adapts prompt-lookup/tree-candidate speculative
 decoding to the smaller robotics action-token distribution while keeping exact
-PI0-FAST or PI0.5 verification. The 120-eval wrapper requires
+PI0-FAST verification. The 120-eval wrapper requires
 `action_prefix_lookup_*` trace stats when the prior is enabled.
 
 Use `--action-vector-suffix-lookup both` to test a stricter full-action-vector
@@ -424,7 +422,7 @@ action vector, the drafter proposes the next remaining dimension from prior full
 action vectors whose prefix matches within
 `--action-vector-suffix-max-prefix-delta-values`. This adapts prompt-lookup
 speculation to low-entropy robot action vectors while preserving exact PI0-FAST
-or PI0.5 verification. The 120-eval wrapper requires
+PI0-FAST verification. The 120-eval wrapper requires
 `action_vector_suffix_lookup_*` trace stats when the prior is enabled.
 
 Use `--action-vector-transition both` to test a full-action-vector transition
@@ -432,7 +430,7 @@ prior. The drafter matches the previous verified action vector against prior
 verified vector transitions, then requires the current partial vector prefix to
 match the candidate next vector before proposing the next dimension token. This
 targets repeated low-entropy robot action transitions while preserving exact
-PI0-FAST or PI0.5 verification. The 120-eval wrapper requires
+PI0-FAST verification. The 120-eval wrapper requires
 `action_vector_transition_*` trace stats when the prior is enabled.
 
 Use `--action-repeat-vector both` to test a repeated-action-vector prior. After
@@ -456,14 +454,14 @@ neighborhood around smooth action-token extrapolation, recent verified chunk
 positions, and other enabled robot-prior centers. For a predicted token `x`,
 the drafter can propose nearby quantized candidates such as `x`, `x-1`, and
 `x+1`; the exact tree verifier batches those candidates and commits only tokens
-selected by PI0-FAST or PI0.5. The 120-eval wrapper requires
+selected by PI0-FAST. The 120-eval wrapper requires
 `action_token_neighborhood_*` trace stats when the prior is enabled.
 
 Use `--action-dimension-mode both` to test a same-action-dimension modal-token
 prior. It proposes the most common verified FAST token for the next action
 dimension from the current prefix and recent verified chunks, targeting held
 joints and gripper states in the smaller robotics token distribution. It remains
-exact because PI0-FAST or PI0.5 verifies the token before emission, and the
+exact because PI0-FAST verifies the token before emission, and the
 120-eval wrapper requires `action_dimension_mode_*` trace stats when the prior
 is enabled.
 
@@ -619,11 +617,12 @@ is enabled, it passes `run_manifest.json` to the audit and adds
 `pattern_sweep_selection.required_source_coverage` to have a positive
 `required_source_counts` entry.
 
-If this protocol is adapted to PI0.5, use the PI0.5 `target_eos` stop-token
-early-stop mode as the reference baseline for any speculative candidate.
-Runs launched through the wrapper with `--policy-kind pi05` attach
-`metadata.policy_kind=pi05` to the gate JSON and pass
-`--expected-policy-kind pi05` to the final audit.
+This protocol is PI0-FAST-specific today. LeRobot PI0.5 uses flow-action
+sampling in this runner and does not expose the PI0-FAST FAST-token decode
+hooks used by `target_eos`, `target_cutoff`, or `pattern_sd`; those modes now
+fail early when launched with `--policy-kind pi05`. If the protocol is adapted
+to PI0.5 later, compare speculative candidates against a PI0.5-specific
+stop-token reference baseline, not against a fixed-budget decode alone.
 
 The offline sweep is only a tuning proxy. Verify the final 0-drop / 2x claim
 only with the real `run_pi0fast_100_eval_gate.py` gate above.

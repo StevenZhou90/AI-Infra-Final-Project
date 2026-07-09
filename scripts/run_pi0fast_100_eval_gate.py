@@ -29,6 +29,27 @@ def parse_csv(value: str) -> list[str]:
     return [part.strip() for part in value.split(",") if part.strip()]
 
 
+PI0FAST_TOKEN_MODE_PREFIXES = (
+    "target_eos",
+    "target_cutoff",
+    "ngram_sd",
+    "ngram_extend",
+    "ngram_traj_tail",
+    "pattern_sd",
+    "medusa_sd",
+    "block_sd",
+    "exact_fast_sd",
+)
+
+
+def pi05_unsupported_fast_token_modes(modes: list[str]) -> list[str]:
+    return [
+        mode
+        for mode in modes
+        if any(mode.startswith(prefix) for prefix in PI0FAST_TOKEN_MODE_PREFIXES)
+    ]
+
+
 def _arg_value(args: list[str], flag: str, default: str | None = None) -> str | None:
     for index, value in enumerate(args):
         if value == flag and index + 1 < len(args):
@@ -980,6 +1001,15 @@ def build_manifest(args: argparse.Namespace, extra_args: list[str]) -> dict[str,
             require_heldout_suite_coverage=getattr(args, "pattern_require_heldout_suite_coverage", True),
         )
     run_metadata = eval_metadata(eval_extra_args)
+    if run_metadata.get("policy_kind") == "pi05":
+        unsupported_modes = pi05_unsupported_fast_token_modes(speed_modes)
+        if unsupported_modes:
+            raise ValueError(
+                "PI0.5 LeRobot policies use flow-action sampling and do not expose "
+                "the PI0-FAST FAST-token decode hooks required by speed modes "
+                f"{unsupported_modes}. PI0.5 speculative runs need a PI0.5-specific "
+                "stop-token/token-adapter path before they can be compared against target_eos."
+            )
     expected_policy_kind = run_metadata["policy_kind"] if run_metadata.get("policy_kind") != "pi0fast" else None
 
     reference_mode = args.reference_mode

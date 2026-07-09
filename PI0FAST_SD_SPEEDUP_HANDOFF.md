@@ -75,7 +75,7 @@ must also clear the speedup, success-drop, and regression checks versus
 To screen pattern settings before the expensive simulator run, sweep saved
 PI0-FAST FAST-token traces:
 
-For fresh PI0-FAST or PI0.5 evidence, collect the traces from `target_eos`
+For fresh PI0-FAST evidence, collect the traces from `target_eos`
 early-stop decode, not from a fixed token budget. The new pipeline collects
 per-suite `target_eos` shard files, runs the heldout pattern sweep, and stages
 the 120-task gate with `--reference-mode target_eos`:
@@ -83,8 +83,6 @@ the 120-task gate with `--reference-mode target_eos`:
 ```bash
 python scripts/run_pi0fast_pattern_candidate_pipeline.py \
   --root outputs/pi0fast_pattern_candidate \
-  --policy-kind pi05 \
-  --num-inference-steps 8 \
   --gate-dry-run
 ```
 
@@ -330,11 +328,20 @@ The older strongest prefix-cutoff / learned-gate result remains useful for
 more aggressive early execution, but it is no longer the primary 2x / 0-drop
 path.
 
-If the work pivots to PI0.5, compare any speculative candidate against the
-PI0.5 stop-token early-stop baseline, not against a fixed-budget decode alone.
-The 120-eval wrapper now records `metadata.policy_kind=pi05` in the gate JSON
-and makes the final audit require `--expected-policy-kind pi05` whenever the
-run is launched with `--policy-kind pi05`.
+If the work pivots to PI0.5, do not reuse the PI0-FAST FAST-token modes as-is.
+LeRobot PI0.5 uses flow-action sampling in this runner, and a smoke on
+`libero_object` task 0 showed:
+
+- `... --policy-kind pi05 --pi05-disable-compile --num-inference-steps 4 --modes baseline --steps 2`
+  reached rollout and produced a baseline row.
+- Adding `target_eos` failed because `PI05Config` has no PI0-FAST token decode
+  fields such as `temperature`.
+
+The runner and 120-eval wrappers now fail early for PI0.5 plus PI0-FAST
+FAST-token modes (`target_eos`, `target_cutoff`, `pattern_sd`, etc.). A PI0.5
+speculative result should still be compared against a PI0.5 stop-token
+early-stop reference, but that needs a PI0.5-specific stop-token/token adapter
+first.
 
 For an OpenVLA/SpecVLA pivot, use `scripts/run_openvla_120_eval_gate.py` and
 keep its default matched-step and strict `spec_stats` checks enabled. The

@@ -280,6 +280,12 @@ def build_pi0_command(args: argparse.Namespace) -> tuple[list[str], dict[str, An
     min_unique_tasks = args.min_unique_tasks
     if min_unique_tasks is None:
         min_unique_tasks = planned_unique_tasks(suites=args.suites, task_ids=args.task_ids)
+    if args.path == "pi05-pattern":
+        raise ValueError(
+            "pi05-pattern is not currently runnable: LeRobot PI0.5 uses flow-action sampling "
+            "and does not expose the PI0-FAST FAST-token hooks required for target_eos/pattern_sd. "
+            "Add a PI0.5-specific stop-token/token-adapter path before using this proof path."
+        )
     root = args.root / proof_subdir(args.path)
     cmd = [
         args.python,
