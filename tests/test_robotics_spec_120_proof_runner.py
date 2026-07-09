@@ -112,7 +112,7 @@ def test_adaptive_proof_runs_against_target_eos_reference(tmp_path: Path) -> Non
     assert "--adaptive-prefix-checkpoints" in command
     assert command[command.index("--adaptive-prefix-checkpoints") + 1] == "32,64,96,128,160,192,224"
     assert "--adaptive-stable-checks" in command
-    assert command[command.index("--adaptive-stable-checks") + 1] == "1"
+    assert command[command.index("--adaptive-stable-checks") + 1] == "3"
 
 
 def test_pattern_proof_requires_sweep_json_by_default(tmp_path: Path) -> None:

@@ -371,7 +371,7 @@ def build_pi0_command(args: argparse.Namespace) -> tuple[list[str], dict[str, An
                 "--adaptive-prefix-checkpoints",
                 "32,64,96,128,160,192,224",
                 "--adaptive-stable-checks",
-                "1",
+                "3",
                 "--adaptive-stable-tolerance",
                 "0.0",
             ]

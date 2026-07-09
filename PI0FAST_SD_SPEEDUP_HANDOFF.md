@@ -10,9 +10,13 @@ The current experiments use `lerobot/pi0fast-libero` in LIBERO object tasks with
 
 ## Current Best Result
 
-Update: there is not yet a passing strict 120-row result. The strict best
-artifact remains exact target-EOS early stop, documented in
-`docs/pi0fast_target_eos.md`, but it is short of the required `2.0x` speedup.
+Update: there is not yet a final passing strict 120-row proof because full
+exact validation for adaptive prefix cutoff is still outstanding. The strongest
+strict speed evidence is adaptive prefix cutoff with stable checks `3`, which
+passes the strict 120-row speed-only gate at `301.0 ms/control` (`2.02x`) with
+matched steps and zero success drop. The strict best fully validated artifact
+remains exact target-EOS early stop, documented in `docs/pi0fast_target_eos.md`,
+but it is short of the required `2.0x` speedup.
 PI0-FAST's fixed-budget decoder keeps generating after the FAST action-end
 marker (`|`), while LeRobot detokenization ignores the tail. Stopping when the
 target model emits action-end preserves the continuous action chunk while
@@ -61,6 +65,9 @@ Recent 2026-07-09 probes on the matched task-id/seed subset:
 | `outputs/pi0fast_adaptive_prefix_cross_suite_task3_ck32_224_stable1` | same adaptive setting, spatial task 3 heldout | `1` | `max_action_diff=0.0` vs target-EOS | `294.9` | `1.14x` vs target-EOS smoke | exact but only modest gain because target-EOS already emitted shorter chunks |
 | `outputs/pi0fast_adaptive_prefix_cross_suite_task3_ck32_224_stable1` | same adaptive setting, goal task 3 heldout | `1` | `max_action_diff=0.0` vs target-EOS | `298.8` | `1.54x` vs target-EOS smoke | fixes the no-stop-token 256-token goal chunk; best candidate to scale |
 | `outputs/robotics_spec_120_proof_mini_adaptive_rq/pi0fast_adaptive/gate.json` | adaptive mini matched gate, task 3 across object/spatial/goal | `3` | `0 -> 0`, `max_action_diff=0.0` in validation | `283.3` | `2.19x` vs baseline, `1.42x` vs target-EOS | passes mini gate with exact validation; not final 120 proof because success thresholds were disabled for this tiny slice |
+| `outputs/robotics_spec_120_proof/pi0fast_adaptive/gate.json` | strict 120 adaptive speed-only, stable checks `1` | `120` | `7 -> 8` | `276.8` | `2.20x` vs baseline, `1.23x` vs target-EOS | fast but rejected: one matched-step mismatch on `libero_object` task `7`, episode `1` |
+| `outputs/pi0fast_adaptive_mismatch_object7_ep1_stable3_rq` | focused bad-row validation, stable checks `3` | `1` | `0 -> 0`, `max_action_diff=0.0` | `246.3` speed / `897.7` validate | diagnostic only | fixes the stable-checks `1`/`2` action diffs on the bad row |
+| `outputs/robotics_spec_120_proof/pi0fast_adaptive_stable3/gate.json` | strict 120 adaptive speed-only, stable checks `3` | `120` | `7 -> 7` | `301.0` | `2.02x` vs baseline, `1.13x` vs target-EOS | passes strict speed-only gate; full exact validation still required |
 
 The empirical-vocab path now has two important correctness fixes in
 `serving/pi0fast_token_hooks.py`: the sliced restricted LM head includes
@@ -105,8 +112,67 @@ vs target-EOS. Validation covered `3` adaptive rows and `3` target-EOS rows with
 `--min-baseline-successes 0 --min-suite-baseline-successes 0`, so it is a speed
 and exactness sanity check only; the strict 120 gate below is still required.
 
-The next required evidence step is the strict 120 matched-eval gate for
-`pi0fast-adaptive`:
+The first strict 120 adaptive speed-only run used stable checks `1` and was not
+acceptable even though it was fast: it measured baseline `607.9 ms/control` and
+adaptive `276.8 ms/control` (`2.20x`), but one row stopped at `227` steps while
+the baseline and target-EOS rows ran `300` steps. Focused validation on
+`libero_object` task `7`, episode `1`, seed `43` showed the issue was a real
+action difference (`max_action_diff=0.5489519238471985`). Stable checks `2`
+restored the `300` steps but still had `max_action_diff=0.2679973542690277`.
+Stable checks `3` restored `300` steps and `max_action_diff=0.0` on that bad
+row, with the speed row at `246.3 ms/control`.
+
+The strict 120 adaptive speed-only rerun with stable checks `3` passed:
+`outputs/robotics_spec_120_proof/pi0fast_adaptive_stable3/gate.json` has
+`120` matched rows, `7 -> 7` successes, zero regressions, zero matched-step
+mismatches, and `301.0 ms/control` (`2.02x`) versus the same `607.9 ms/control`
+baseline. This is still not the final claim because it was run with exact
+validation skipped.
+
+The next required evidence step is full exact validation plus final audit for
+the stable-checks `3` root. Continue from the existing speed-only artifact:
+
+```bash
+python scripts/run_pi0fast_100_eval_gate.py \
+  --root outputs/robotics_spec_120_proof/pi0fast_adaptive_stable3 \
+  --speed-modes baseline,target_eos,target_eos_adaptive \
+  --candidate-mode target_eos_adaptive \
+  --reference-mode target_eos \
+  --suites libero_object,libero_spatial,libero_goal \
+  --task-ids 0,1,2,3,4,5,6,7,8,9 \
+  --episodes 4 \
+  --steps 300 \
+  --seed 42 \
+  --device cuda \
+  --dtype bfloat16 \
+  --min-pairs 120 \
+  --min-unique-tasks 30 \
+  --min-speedup 2.0 \
+  --min-baseline-successes 1 \
+  --min-suite-matched-pairs 1 \
+  --min-suite-baseline-successes 1 \
+  --min-suite-speedup 1.0 \
+  --max-success-drop 0.0 \
+  --max-baseline-success-regressions 0 \
+  --min-validation-episodes 120 \
+  --min-exact-verifies 1 \
+  --max-action-diff 0.0 \
+  --skip-speed \
+  --skip-existing \
+  --run-preflight \
+  --require-hf-token \
+  --run-synthetic \
+  --run-final-audit \
+  --render-result-card \
+  -- \
+  --adaptive-prefix-checkpoints 32,64,96,128,160,192,224 \
+  --adaptive-stable-checks 3 \
+  --adaptive-stable-tolerance 0.0
+```
+
+For a fresh canonical `pi0fast-adaptive` run, use a new root or remove stale
+stable-checks `1` adaptive speed shards before combining `--skip-existing` with
+the wrapper:
 
 ```bash
 python scripts/run_robotics_spec_120_proof.py \
@@ -127,7 +193,7 @@ settings are:
 
 ```bash
 --adaptive-prefix-checkpoints 32,64,96,128,160,192,224 \
---adaptive-stable-checks 1 \
+--adaptive-stable-checks 3 \
 --adaptive-stable-tolerance 0.0
 ```
 
