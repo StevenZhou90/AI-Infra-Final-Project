@@ -697,6 +697,32 @@ def test_pi0fast_constrained_action_char_plateau_can_stop_after_decoded_chars_st
     assert adapter._last_constrained_restricted_head_calls == 3
 
 
+def test_pi0fast_constrained_extra_tokens_extend_candidate_set() -> None:
+    policy = _CharStopPolicy()
+    policy.action_tokenizer.vocab_size = 16
+    policy.model._targets = [150, 99]
+    _install_identity_linear_head(policy)
+    adapter = PI0FastTokenLogitAdapter(policy)
+    adapter._match_model_precision = lambda tensor: tensor
+
+    token_ids = adapter.sample_actions_fast_kv_cache_action_end_constrained(
+        images=torch.empty(1),
+        img_masks=torch.empty(1),
+        tokens=torch.zeros((1, 2), dtype=torch.long),
+        masks=torch.ones((1, 2), dtype=torch.bool),
+        max_decoding_steps=4,
+        force_action_prefix=False,
+        action_vocab_size=16,
+        text_vocab_size=128,
+        structural_token_radius=0,
+        extra_token_ids=[150, 150, 300],
+    )
+
+    assert token_ids.tolist() == [[150, 99]]
+    assert adapter._last_constrained_extra_token_count == 1
+    assert adapter._last_constrained_candidate_size == 145
+
+
 def test_pi0fast_constrained_action_char_restart_continue_blocks_target_stop() -> None:
     policy = _CharStopPolicy()
     policy.config.n_action_steps = 3

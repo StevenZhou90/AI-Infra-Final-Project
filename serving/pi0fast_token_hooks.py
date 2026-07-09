@@ -192,6 +192,7 @@ class PI0FastTokenLogitAdapter:
         constrained_force_action_prefix: bool = True,
         constrained_structural_token_radius: int = 512,
         constrained_full_head_prefix_tokens: int = 0,
+        constrained_extra_token_ids: torch.Tensor | list[int] | None = None,
         force_action_prefix: bool = False,
         stop_on_action_chars: bool = False,
         action_char_min_chars: int | None = None,
@@ -238,6 +239,7 @@ class PI0FastTokenLogitAdapter:
                 force_action_prefix=constrained_force_action_prefix,
                 structural_token_radius=constrained_structural_token_radius,
                 full_head_prefix_tokens=constrained_full_head_prefix_tokens,
+                extra_token_ids=constrained_extra_token_ids,
                 stop_on_action_chars=stop_on_action_chars,
                 action_char_min_chars=action_char_min_chars,
                 action_char_plateau_tokens=action_char_plateau_tokens,
@@ -315,6 +317,7 @@ class PI0FastTokenLogitAdapter:
                 "constrained_full_head_prefix_tokens": int(
                     getattr(self, "_last_constrained_full_head_prefix_tokens", 0)
                 ),
+                "constrained_extra_token_count": int(getattr(self, "_last_constrained_extra_token_count", 0)),
                 "constrained_full_head_prefix_calls": int(
                     getattr(self, "_last_constrained_full_head_prefix_calls", 0)
                 ),
@@ -1845,6 +1848,7 @@ class PI0FastTokenLogitAdapter:
         force_action_prefix: bool = True,
         structural_token_radius: int = 512,
         full_head_prefix_tokens: int = 0,
+        extra_token_ids: torch.Tensor | list[int] | None = None,
         stop_on_action_chars: bool = False,
         action_char_min_chars: int | None = None,
         action_char_plateau_tokens: int = 0,
@@ -1964,10 +1968,26 @@ class PI0FastTokenLogitAdapter:
         text_vocab_size = min(paligemma_vocab_size, max(0, int(text_vocab_size)))
         structural_token_radius = max(0, int(structural_token_radius))
         full_head_prefix_tokens = max(0, int(full_head_prefix_tokens))
+        if extra_token_ids is None:
+            extra_candidate_ids = torch.empty((0,), dtype=torch.long, device=device)
+        elif torch.is_tensor(extra_token_ids):
+            extra_candidate_ids = extra_token_ids.to(device=device, dtype=torch.long).flatten()
+        else:
+            extra_candidate_ids = torch.as_tensor(
+                [int(token_id) for token_id in extra_token_ids],
+                dtype=torch.long,
+                device=device,
+            ).flatten()
+        extra_candidate_ids = extra_candidate_ids[
+            (extra_candidate_ids >= 0) & (extra_candidate_ids < paligemma_vocab_size)
+        ]
+        extra_candidate_ids = torch.unique(extra_candidate_ids)
+        extra_token_key = tuple(int(token_id) for token_id in extra_candidate_ids.detach().cpu().tolist())
         candidate_cache_key = (
             int(action_vocab_size),
             int(text_vocab_size),
             int(structural_token_radius),
+            extra_token_key,
             str(device),
             str(lm_head.weight.dtype),
             int(lm_head.weight.data_ptr()),
@@ -1990,11 +2010,13 @@ class PI0FastTokenLogitAdapter:
                     text_token_ids,
                     structural_token_ids,
                     action_token_ids,
+                    extra_candidate_ids,
                     prefix_tokens,
                     torch.tensor([action_end_token_id], dtype=torch.long, device=device),
                 ],
                 dim=0,
             )
+            candidate_ids = torch.unique(candidate_ids)
             candidate_weight = lm_head.weight.index_select(0, candidate_ids).contiguous()
             cached = {
                 "key": candidate_cache_key,
@@ -2004,6 +2026,7 @@ class PI0FastTokenLogitAdapter:
                 "action_vocab_size": int(action_vocab_size),
                 "text_vocab_size": int(text_vocab_size),
                 "structural_token_radius": int(structural_token_radius),
+                "extra_token_count": int(extra_candidate_ids.numel()),
             }
             self._constrained_lm_head_cache = cached
         candidate_ids = cached["candidate_ids"]
@@ -2012,6 +2035,7 @@ class PI0FastTokenLogitAdapter:
         self._last_constrained_action_vocab_size = int(cached["action_vocab_size"])
         self._last_constrained_text_vocab_size = int(cached["text_vocab_size"])
         self._last_constrained_structural_token_radius = int(cached["structural_token_radius"])
+        self._last_constrained_extra_token_count = int(cached["extra_token_count"])
         self._last_constrained_force_action_prefix = int(bool(force_action_prefix))
         self._last_forced_action_prefix_token_count = int(prefix_tokens.numel()) if force_action_prefix else 0
         self._last_constrained_full_head_margin = float(full_head_margin) if full_head_margin is not None else -1.0

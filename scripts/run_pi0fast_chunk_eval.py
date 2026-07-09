@@ -65,6 +65,24 @@ PI0FAST_TOKEN_MODE_PREFIXES = (
 )
 
 
+def _load_token_id_file(path: Path | str | None) -> list[int]:
+    if path is None:
+        return []
+    token_path = Path(path)
+    data = json.loads(token_path.read_text())
+    if isinstance(data, dict):
+        raw_ids = None
+        for key in ("token_ids", "tokens", "candidate_token_ids", "extra_token_ids"):
+            if key in data:
+                raw_ids = data[key]
+                break
+    else:
+        raw_ids = data
+    if raw_ids is None:
+        raise ValueError(f"{token_path} must contain token_ids or a JSON list")
+    return sorted({int(token_id) for token_id in raw_ids})
+
+
 def _pi05_unsupported_fast_token_modes(modes: list[str]) -> list[str]:
     return [
         mode
@@ -383,6 +401,7 @@ def _predict_target_eos_chunk(
     constrained_force_action_prefix: bool = True,
     constrained_structural_token_radius: int = 512,
     constrained_full_head_prefix_tokens: int = 0,
+    constrained_extra_token_ids: list[int] | None = None,
     force_action_prefix: bool = False,
     stop_on_action_chars: bool = False,
     action_char_min_chars: int | None = None,
@@ -414,6 +433,7 @@ def _predict_target_eos_chunk(
             constrained_force_action_prefix=constrained_force_action_prefix,
             constrained_structural_token_radius=constrained_structural_token_radius,
             constrained_full_head_prefix_tokens=constrained_full_head_prefix_tokens,
+            constrained_extra_token_ids=constrained_extra_token_ids,
             force_action_prefix=force_action_prefix,
             stop_on_action_chars=stop_on_action_chars,
             action_char_min_chars=action_char_min_chars,
@@ -1161,6 +1181,7 @@ def run_episode(
     target_eos_constrained_no_force_prefix: bool,
     target_eos_constrained_structural_token_radius: int,
     target_eos_constrained_full_head_prefix_tokens: int,
+    target_eos_constrained_extra_token_ids: list[int] | None,
     target_eos_action_char_min_chars: int | None,
     target_eos_action_char_plateau_tokens: int,
     target_eos_action_char_stable_checks: int,
@@ -2189,6 +2210,7 @@ def run_episode(
                                 ),
                                 constrained_structural_token_radius=target_eos_constrained_structural_token_radius,
                                 constrained_full_head_prefix_tokens=target_eos_constrained_full_head_prefix_tokens,
+                                constrained_extra_token_ids=target_eos_constrained_extra_token_ids,
                                 force_action_prefix="_prefix" in mode,
                                 stop_on_action_chars="_charstop" in mode,
                                 action_char_min_chars=target_eos_action_char_min_chars,
@@ -2234,6 +2256,7 @@ def run_episode(
                                     constrained_full_head_prefix_tokens=(
                                         target_eos_constrained_full_head_prefix_tokens
                                     ),
+                                    constrained_extra_token_ids=target_eos_constrained_extra_token_ids,
                                     force_action_prefix="_prefix" in mode,
                                     stop_on_action_chars=False,
                                 )
@@ -2661,6 +2684,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Use the exact full lm_head for this many initial generated tokens in constrained modes, "
             "then switch to the restricted head."
+        ),
+    )
+    parser.add_argument(
+        "--target-eos-constrained-extra-token-id-file",
+        type=Path,
+        default=None,
+        help=(
+            "JSON list or object with token_ids to add to the restricted candidate set for "
+            "target_eos_constrained modes."
         ),
     )
     parser.add_argument(
@@ -3694,6 +3726,15 @@ def main() -> None:
         smooth_position_delta=args.smooth_position_delta,
         smooth_rotation_delta=args.smooth_rotation_delta,
     )
+    target_eos_constrained_extra_token_ids = _load_token_id_file(
+        args.target_eos_constrained_extra_token_id_file
+    )
+    if target_eos_constrained_extra_token_ids:
+        logger.info(
+            "Loaded %d extra constrained target_eos token ids from %s",
+            len(target_eos_constrained_extra_token_ids),
+            args.target_eos_constrained_extra_token_id_file,
+        )
 
     all_results: list[EpisodeResult] = []
     for task_id in task_ids:
@@ -3836,6 +3877,7 @@ def main() -> None:
                     target_eos_constrained_no_force_prefix=args.target_eos_constrained_no_force_prefix,
                     target_eos_constrained_structural_token_radius=args.target_eos_constrained_structural_token_radius,
                     target_eos_constrained_full_head_prefix_tokens=args.target_eos_constrained_full_head_prefix_tokens,
+                    target_eos_constrained_extra_token_ids=target_eos_constrained_extra_token_ids,
                     target_eos_action_char_min_chars=(
                         None if args.target_eos_action_char_min_chars < 0 else args.target_eos_action_char_min_chars
                     ),
@@ -3897,6 +3939,10 @@ def main() -> None:
         "target_eos_constrained_no_force_prefix": args.target_eos_constrained_no_force_prefix,
         "target_eos_constrained_structural_token_radius": args.target_eos_constrained_structural_token_radius,
         "target_eos_constrained_full_head_prefix_tokens": args.target_eos_constrained_full_head_prefix_tokens,
+        "target_eos_constrained_extra_token_id_file": None
+        if args.target_eos_constrained_extra_token_id_file is None
+        else str(args.target_eos_constrained_extra_token_id_file),
+        "target_eos_constrained_extra_token_count": len(target_eos_constrained_extra_token_ids),
         "target_eos_action_char_min_chars": args.target_eos_action_char_min_chars,
         "target_eos_action_char_plateau_tokens": args.target_eos_action_char_plateau_tokens,
         "target_eos_action_char_stable_checks": args.target_eos_action_char_stable_checks,

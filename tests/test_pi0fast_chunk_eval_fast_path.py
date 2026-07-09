@@ -4,6 +4,7 @@ import torch
 
 from scripts.run_pi0fast_chunk_eval import (
     _adapter_action_end_token_id,
+    _load_token_id_file,
     _pi05_unsupported_fast_token_modes,
     _predict_prefix_cutoff_chunk,
     _predict_target_eos_chunk,
@@ -101,6 +102,34 @@ def test_target_eos_chunk_can_request_action_char_stop() -> None:
     assert adapter.action_end_kwargs["action_char_strict_target_stop"] is True
     assert adapter.action_end_kwargs["action_char_reset_requires_action_end"] is True
     assert adapter.action_end_kwargs["action_char_target_confirm_tokens"] == 4
+
+
+def test_target_eos_chunk_passes_constrained_extra_token_ids() -> None:
+    adapter = _FakeTokenAdapter()
+
+    _predict_target_eos_chunk(
+        adapter,
+        batch={},
+        postprocessor=lambda action: action,
+        device="cpu",
+        constrained_action_vocab=True,
+        constrained_extra_token_ids=[11, 22],
+    )
+
+    assert adapter.action_end_calls == 1
+    assert adapter.action_end_kwargs["constrained_action_vocab"] is True
+    assert adapter.action_end_kwargs["constrained_extra_token_ids"] == [11, 22]
+
+
+def test_load_token_id_file_accepts_payload_dict(tmp_path) -> None:
+    path = tmp_path / "tokens.json"
+    path.write_text('{"token_ids": [7, "3", 7]}')
+
+    assert _load_token_id_file(path) == [3, 7]
+
+    empty_path = tmp_path / "empty_tokens.json"
+    empty_path.write_text('{"token_ids": []}')
+    assert _load_token_id_file(empty_path) == []
 
 
 def test_prefix_cutoff_chunk_uses_no_logits_path_by_default() -> None:
