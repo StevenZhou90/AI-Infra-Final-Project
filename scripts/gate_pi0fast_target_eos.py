@@ -303,6 +303,7 @@ def summarize_exact_validation(
         extra_validation = set(validation_by_key) - expected_keys
 
     exact_verifies = 0
+    static_exact_verifies = 0
     max_action_diff = 0.0
     mean_action_diffs: list[float] = []
     successes = 0
@@ -311,8 +312,11 @@ def summarize_exact_validation(
     for key in sorted(selected_keys):
         row = validation_by_key[key]
         stats = row.get("chunk_stats") or {}
-        row_exact_verifies = int(stats.get("exact_verifies", 0))
+        row_runtime_exact_verifies = int(stats.get("exact_verifies", 0))
+        row_static_exact_verifies = int(stats.get("static_exact_verifies", 0))
+        row_exact_verifies = row_runtime_exact_verifies + row_static_exact_verifies
         exact_verifies += row_exact_verifies
+        static_exact_verifies += row_static_exact_verifies
         if row_exact_verifies > 0:
             rows_with_exact_verifies += 1
         else:
@@ -332,6 +336,8 @@ def summarize_exact_validation(
         "successes": successes,
         "success_rate": successes / max(len(selected_keys), 1),
         "exact_verifies": exact_verifies,
+        "runtime_exact_verifies": exact_verifies - static_exact_verifies,
+        "static_exact_verifies": static_exact_verifies,
         "max_action_diff": max_action_diff,
         "mean_action_diff": _mean(mean_action_diffs),
         "missing_validation_examples": [key.__dict__ for key in sorted(missing_validation)[:10]],

@@ -12,6 +12,7 @@ def _row(
     success: bool = True,
     ms: float = 100.0,
     exact_verifies: int = 0,
+    static_exact_verifies: int = 0,
     max_action_diff: float = 0.0,
     trace_stats: dict | None = None,
     task: str = "libero_object",
@@ -29,6 +30,7 @@ def _row(
             "avg_model_call_ms": ms,
             "avg_fast_token_count": 128.0 if mode == "baseline" else 48.0,
             "exact_verifies": exact_verifies,
+            "static_exact_verifies": static_exact_verifies,
             "max_action_diff": max_action_diff,
             "mean_action_diff": max_action_diff,
             "trace_stats": trace_stats or {},
@@ -329,6 +331,36 @@ def test_gate_fails_validation_row_without_exact_verify() -> None:
     assert summary["gate_passed"] is False
     assert summary["exact_validation"]["rows_missing_exact_verifies"] == 1
     assert summary["checks"]["per_row_exact_verify"] is False
+
+
+def test_gate_accepts_static_exact_proof_rows() -> None:
+    speed_rows = []
+    validation_rows = []
+    for idx in range(100):
+        speed_rows.append(_row("baseline", idx, ms=240.0))
+        speed_rows.append(_row("target_eos", idx, ms=100.0))
+        validation_rows.append(
+            _row("target_eos_validate", idx, exact_verifies=0, static_exact_verifies=3, max_action_diff=0.0)
+        )
+
+    summary = build_gate_summary(
+        speed_rows=speed_rows,
+        baseline_mode="baseline",
+        candidate_mode="target_eos",
+        min_pairs=100,
+        min_speedup=2.0,
+        max_success_drop=0.0,
+        max_baseline_success_regressions=0,
+        validation_rows=validation_rows,
+        min_validation_episodes=100,
+        min_exact_verifies=1,
+        max_action_diff=0.0,
+    )
+
+    assert summary["gate_passed"] is True
+    assert summary["exact_validation"]["exact_verifies"] == 300
+    assert summary["exact_validation"]["runtime_exact_verifies"] == 0
+    assert summary["exact_validation"]["static_exact_verifies"] == 300
 
 
 def test_gate_can_require_candidate_to_match_early_stop_reference() -> None:
