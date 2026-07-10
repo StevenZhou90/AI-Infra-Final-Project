@@ -38,6 +38,15 @@ def _as_int(row: dict[str, Any] | None, key: str, default: int = 0) -> int:
         return default
 
 
+def _optional_float(row: dict[str, Any] | None, key: str) -> float | None:
+    if row is None or key not in row or row.get(key) is None:
+        return None
+    try:
+        return float(row[key])
+    except (TypeError, ValueError):
+        return float("inf")
+
+
 CHECK_DESCRIPTIONS = {
     "pi0fast_gate_present": "missing PI0-FAST gate JSON artifact",
     "pi0fast_gate_passed": "PI0-FAST gate did not pass",
@@ -287,6 +296,7 @@ def audit_pi0fast_gate(
     expected_validation_mode = expected_candidate_validation_mode(candidate_mode, early_stop_mode)
     early_stop_validation_mode = f"{early_stop_mode}_validate"
     early_stop_exact = extra_exact.get(early_stop_validation_mode)
+    min_reference_speedup = _optional_float(thresholds, "min_reference_speedup")
 
     checks = {
         "pi0fast_gate_present": gate is not None,
@@ -389,7 +399,8 @@ def audit_pi0fast_gate(
         ),
         "pi0fast_reference_speedup": (
             not needs_reference
-            or bool(reference and _as_float(reference, "speedup") >= min_speedup)
+            or min_reference_speedup is None
+            or bool(reference and _as_float(reference, "speedup") >= min_reference_speedup)
         ),
         "pi0fast_reference_success_drop": (
             not needs_reference

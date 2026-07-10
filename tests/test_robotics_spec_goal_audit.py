@@ -52,6 +52,8 @@ def _pi0fast_gate(
         validation_mode = "pattern_sd_validate"
     elif candidate_mode.startswith("ngram_sd"):
         validation_mode = "ngram_sd_validate"
+    elif candidate_mode.startswith("target_eos_adaptive"):
+        validation_mode = "target_eos_adaptive_validate"
     exact_validation = {
         "validation_mode": validation_mode,
         "episodes": 120,
@@ -528,7 +530,11 @@ def test_objective_audit_rejects_slow_target_eos_reference_speedup(tmp_path: Pat
     args = _args(
         pi0fast_gate=_write_json(
             tmp_path / "pi0fast_gate.json",
-            _pi0fast_gate(candidate_mode="block_sd_direct", reference=reference),
+            _pi0fast_gate(
+                candidate_mode="block_sd_direct",
+                reference=reference,
+                thresholds={"require_matched_steps": True, "min_reference_speedup": 2.0},
+            ),
         ),
         synthetic_gate=_write_json(tmp_path / "synthetic_gate.json", _synthetic_gate()),
     )
@@ -538,6 +544,33 @@ def test_objective_audit_rejects_slow_target_eos_reference_speedup(tmp_path: Pat
     assert audit["objective_audit_passed"] is False
     assert audit["pi0fast"]["checks"]["pi0fast_reference_speedup"] is False
     assert "candidate speedup versus target_eos is below threshold" in audit["missing_evidence"]
+
+
+def test_objective_audit_allows_optional_target_eos_reference_speedup(tmp_path: Path) -> None:
+    reference = {
+        "baseline_mode": "target_eos",
+        "candidate_mode": "target_eos_adaptive",
+        "matched_pairs": 120,
+        "speedup": 1.05,
+        "success_drop_abs": 0.0,
+        "baseline_success_regressions": 0,
+    }
+    args = _args(
+        pi0fast_gate=_write_json(
+            tmp_path / "pi0fast_gate.json",
+            _pi0fast_gate(
+                candidate_mode="target_eos_adaptive",
+                reference=reference,
+                thresholds={"require_matched_steps": True, "min_reference_speedup": None},
+            ),
+        ),
+        synthetic_gate=_write_json(tmp_path / "synthetic_gate.json", _synthetic_gate()),
+    )
+
+    audit = build_audit(args)
+
+    assert audit["objective_audit_passed"] is True
+    assert audit["pi0fast"]["checks"]["pi0fast_reference_speedup"] is True
 
 
 def test_objective_audit_preserves_pi0fast_candidate_trace_stats(tmp_path: Path) -> None:

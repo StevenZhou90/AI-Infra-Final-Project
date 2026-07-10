@@ -10,17 +10,34 @@ The current experiments use `lerobot/pi0fast-libero` in LIBERO object tasks with
 
 ## Current Best Result
 
-Update: the object-split candidate is now speed-good and exact under the final
-multi-clause risk-target-fallback rule. It is not yet a final passing strict
-120-row proof because the suite-conditional 120-row speed rerun and final audit
-are still outstanding. The final object artifact is:
+Update: the final mixed PI0-FAST adaptive candidate now passes the strict
+120-row speed/success gate, but it is not yet a final passing exact-validation
+audit. The object split is exact under the final multi-clause
+risk-target-fallback rule; spatial/goal reuse the stable-checks-`3` speed
+shards from the prior strict hybrid. The final mixed proof root is:
 
-- Speed:
+- Mixed 120 speed-only gate:
+  `outputs/robotics_spec_120_proof/pi0fast_adaptive_object_ck152_stable4_riskgate_after140_motion_lowdelta_targetfallback_hybrid/gate_speed_only.json`
+- Exact-required gate status:
+  `outputs/robotics_spec_120_proof/pi0fast_adaptive_object_ck152_stable4_riskgate_after140_motion_lowdelta_targetfallback_hybrid/gate.json`
+- Final objective audit status:
+  `outputs/robotics_spec_120_proof/pi0fast_adaptive_object_ck152_stable4_riskgate_after140_motion_lowdelta_targetfallback_hybrid/objective_audit.json`
+- Final object speed:
   `outputs/robotics_spec_120_proof/pi0fast_adaptive_object_ck152_stable4_riskgate_after140_motion_lowdelta_targetfallback_hybrid/speed/target_eos_adaptive/libero_object/metrics.jsonl`
-- Exact validation shards:
+- Final object exact validation shards:
   `outputs/pi0fast_adaptive_object2_all_ck152_stable4_riskgate_after140_motion_lowdelta_targetfallback_validate_rq/metrics.jsonl`,
   `outputs/pi0fast_adaptive_object_remaining_34689_ck152_stable4_riskgate_after140_motion_lowdelta_targetfallback_validate_rq/metrics.jsonl`,
   `outputs/pi0fast_adaptive_object_remaining_0157_ck152_stable4_riskgate_after140_motion_lowdelta_targetfallback_validate_rq/metrics.jsonl`
+
+The final mixed speed-only gate passes with `120` matched rows, baseline
+`607.9 ms/control`, candidate `302.6 ms/control`, `2.009x` speedup,
+success `7 -> 7`, no baseline-success regressions, and zero step mismatches.
+Suite speeds are object `251.9 ms/control` (`2.244x`), spatial
+`341.2 ms/control` (`1.873x`), and goal `314.8 ms/control` (`1.968x`).
+The exact-required gate still fails because candidate exact-validation coverage
+is `41/120` rows (`40/40` object plus one interrupted spatial row) and
+`target_eos_validate` coverage is `0/120`; the existing exact rows all have
+`max_action_diff=0.0`.
 
 Object speed is `251.9 ms/control` versus the matched object baseline
 `565.1 ms/control`, a `2.244x` speedup. Success stays `1 -> 1`, steps stay
@@ -96,6 +113,7 @@ Recent 2026-07-09 probes on the matched task-id/seed subset:
 | `outputs/pi0fast_adaptive_object0_ep2_ck152_stable4_riskgate_ck192_motion_targetfallback_validate_rq/metrics.jsonl` | ck192 plus high-motion risk clause and risk target-EOS fallback on task `0`, episode `2` | `1` | `0 -> 0`, `max_action_diff=0.0` | `862.7` validate | diagnostic | one risk rejection, one target-EOS fallback; fixes the new high-motion failure |
 | `outputs/pi0fast_adaptive_object0_ep2_ck152_stable4_riskgate_ck192_motion_targetfallback_speed_rq/metrics.jsonl` | same target-fallback candidate, speed mode on task `0`, episode `2` | `1` | `0 -> 0` | `270.9` | `2.05x` vs row baseline | diagnostic only; canonical full-object speed must be rerun because focused row order is not a strict matched shard |
 | `outputs/robotics_spec_120_proof/pi0fast_adaptive_object_ck152_stable4_riskgate_after140_motion_lowdelta_targetfallback_hybrid/speed/target_eos_adaptive/libero_object/metrics.jsonl` | final object rule: ck192 zero-motion clause, high-motion clause, low-delta motion clause, risk target-EOS fallback, gate enabled after step `140` | `40` | `1 -> 1` | `251.9` | `2.244x` vs object baseline | current object candidate; matched steps, no success regression, exact validation split covers all `40/40` object rows with `max_action_diff=0.0` |
+| `outputs/robotics_spec_120_proof/pi0fast_adaptive_object_ck152_stable4_riskgate_after140_motion_lowdelta_targetfallback_hybrid/gate_speed_only.json` | final mixed strict speed gate: object final risk rule plus spatial/goal stable checks `3` | `120` | `7 -> 7` | `302.6` | `2.009x` vs fixed baseline, `1.123x` vs target-EOS | speed/success gate passes with zero step mismatches; exact-required gate still fails with `41/120` candidate validation rows and `0/120` `target_eos_validate` rows |
 
 The empirical-vocab path now has two important correctness fixes in
 `serving/pi0fast_token_hooks.py`: the sliced restricted LM head includes
