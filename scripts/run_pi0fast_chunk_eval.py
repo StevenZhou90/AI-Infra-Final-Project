@@ -52,6 +52,21 @@ if "MUJOCO_GL" not in os.environ and not os.environ.get("DISPLAY"):
 
 logger = logging.getLogger("run_pi0fast_chunk_eval")
 
+RISK_GATE_CLAUSE_KEYS = {
+    "min_checkpoint",
+    "max_checkpoint",
+    "max_token_count",
+    "max_logprob_mean",
+    "min_entropy_mean",
+    "min_action_abs_max",
+    "min_position_span",
+    "max_position_span",
+    "min_rotation_span",
+    "max_rotation_span",
+    "min_max_step_delta",
+    "max_max_step_delta",
+}
+
 PI0FAST_TOKEN_MODE_PREFIXES = (
     "target_eos",
     "target_cutoff",
@@ -109,6 +124,51 @@ def parse_checkpoint_stable_checks(value: str) -> dict[int, int]:
             raise argparse.ArgumentTypeError(f"stable checks must be positive, got {checks}")
         overrides[checkpoint] = checks
     return overrides
+
+
+def _parse_risk_gate_clause_spec(value: str) -> dict[str, float]:
+    """Parse a risk-gate OR clause as KEY=VALUE pairs or a JSON object."""
+
+    raw_value = value.strip()
+    if not raw_value:
+        raise argparse.ArgumentTypeError("risk gate clause must not be empty")
+
+    if raw_value.startswith("{"):
+        try:
+            raw_clause = json.loads(raw_value)
+        except json.JSONDecodeError as exc:
+            raise argparse.ArgumentTypeError(f"invalid risk gate JSON clause: {exc}") from exc
+        if not isinstance(raw_clause, dict):
+            raise argparse.ArgumentTypeError("risk gate JSON clause must be an object")
+        raw_items = raw_clause.items()
+    else:
+        raw_items = []
+        for part in raw_value.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "=" not in part:
+                raise argparse.ArgumentTypeError(
+                    f"risk gate clause entries must use KEY=VALUE syntax, got {part!r}"
+                )
+            key, raw = part.split("=", 1)
+            raw_items.append((key.strip(), raw.strip()))
+
+    clause: dict[str, float] = {}
+    for key, raw in raw_items:
+        if key not in RISK_GATE_CLAUSE_KEYS:
+            allowed = ", ".join(sorted(RISK_GATE_CLAUSE_KEYS))
+            raise argparse.ArgumentTypeError(f"unknown risk gate clause key {key!r}; allowed keys: {allowed}")
+        try:
+            clause[key] = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise argparse.ArgumentTypeError(
+                f"risk gate clause value for {key!r} must be numeric, got {raw!r}"
+            ) from exc
+
+    if not clause:
+        raise argparse.ArgumentTypeError("risk gate clause must include at least one threshold")
+    return clause
 
 
 def _pi05_unsupported_fast_token_modes(modes: list[str]) -> list[str]:
@@ -3552,6 +3612,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adaptive-stability-motion-risk-rotation-span-min", type=float, default=None)
     parser.add_argument("--adaptive-stability-motion-risk-max-step-delta-min", type=float, default=None)
     parser.add_argument(
+        "--adaptive-stability-risk-extra-clause",
+        type=_parse_risk_gate_clause_spec,
+        action="append",
+        default=[],
+        help=(
+            "Append an additional risk-gate OR clause as KEY=VALUE pairs or a JSON object. "
+            "Supported keys match the adaptive stability risk gate feature thresholds."
+        ),
+    )
+    parser.add_argument(
         "--adaptive-stability-risk-target-eos-fallback",
         action="store_true",
         help="Use target-EOS output for a refresh whenever the stability risk gate rejects a candidate.",
@@ -3667,7 +3737,8 @@ def _adaptive_stability_risk_gate_from_args(args: argparse.Namespace) -> dict[st
             "min_max_step_delta": getattr(args, "adaptive_stability_motion_risk_max_step_delta_min", None),
         },
     )
-    clauses = [gate for gate in (base_gate, motion_gate) if gate]
+    extra_clauses = [dict(clause) for clause in (getattr(args, "adaptive_stability_risk_extra_clause", []) or [])]
+    clauses = [gate for gate in (base_gate, motion_gate, *extra_clauses) if gate]
     if len(clauses) == 1:
         return clauses[0]
     if clauses:

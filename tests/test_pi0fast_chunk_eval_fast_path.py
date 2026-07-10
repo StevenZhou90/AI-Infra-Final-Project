@@ -9,6 +9,7 @@ from scripts.run_pi0fast_chunk_eval import (
     _adaptive_stability_risk_gate_from_args,
     _adapter_action_end_token_id,
     _load_token_id_file,
+    _parse_risk_gate_clause_spec,
     _pi05_unsupported_fast_token_modes,
     _predict_prefix_cutoff_chunk,
     _predict_target_eos_chunk,
@@ -151,6 +152,27 @@ def test_parse_checkpoint_stable_checks_rejects_invalid_values() -> None:
         parse_checkpoint_stable_checks("152=0")
 
 
+def test_parse_risk_gate_clause_spec_accepts_csv_and_json() -> None:
+    assert _parse_risk_gate_clause_spec(
+        "max_checkpoint=160,max_token_count=161,max_logprob_mean=-1.04"
+    ) == {
+        "max_checkpoint": 160.0,
+        "max_token_count": 161.0,
+        "max_logprob_mean": -1.04,
+    }
+    assert _parse_risk_gate_clause_spec('{"min_entropy_mean": 2.7, "max_max_step_delta": 0.3}') == {
+        "min_entropy_mean": 2.7,
+        "max_max_step_delta": 0.3,
+    }
+
+
+def test_parse_risk_gate_clause_spec_rejects_invalid_entries() -> None:
+    with pytest.raises(argparse.ArgumentTypeError):
+        _parse_risk_gate_clause_spec("unknown=1")
+    with pytest.raises(argparse.ArgumentTypeError):
+        _parse_risk_gate_clause_spec("max_checkpoint=late")
+
+
 def test_adaptive_stability_risk_gate_from_args_omits_disabled_thresholds() -> None:
     args = argparse.Namespace(
         adaptive_stability_risk_min_checkpoint=-1,
@@ -191,6 +213,17 @@ def test_adaptive_stability_risk_gate_from_args_adds_motion_clause() -> None:
         adaptive_stability_motion_risk_position_span_min=1.5,
         adaptive_stability_motion_risk_rotation_span_min=2.0,
         adaptive_stability_motion_risk_max_step_delta_min=1.5,
+        adaptive_stability_risk_extra_clause=[
+            {
+                "max_checkpoint": 160.0,
+                "max_token_count": 161.0,
+                "max_logprob_mean": -1.04,
+                "min_entropy_mean": 2.7,
+                "min_position_span": 0.8,
+                "min_rotation_span": 0.7,
+                "max_max_step_delta": 0.3,
+            }
+        ],
     )
 
     assert _adaptive_stability_risk_gate_from_args(args) == {
@@ -210,6 +243,15 @@ def test_adaptive_stability_risk_gate_from_args_adds_motion_clause() -> None:
                 "min_position_span": 1.5,
                 "min_rotation_span": 2.0,
                 "min_max_step_delta": 1.5,
+            },
+            {
+                "max_checkpoint": 160.0,
+                "max_token_count": 161.0,
+                "max_logprob_mean": -1.04,
+                "min_entropy_mean": 2.7,
+                "min_position_span": 0.8,
+                "min_rotation_span": 0.7,
+                "max_max_step_delta": 0.3,
             },
         ]
     }
