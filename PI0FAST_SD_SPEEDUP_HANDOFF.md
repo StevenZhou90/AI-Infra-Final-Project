@@ -18,11 +18,13 @@ adaptive prefix hybrid at
 passes the strict 120-row speed gate at `302.5 ms/control` (`2.01x`) with
 matched steps and zero success drop. It is not a final candidate as-is because
 focused exact validation found object failures. The current object candidate is
-the same checkpoint-`152`, stable-checks-`4` object policy plus a narrower
-late-stability risk gate through checkpoint `192`. That ck192 gate fixes the
-known task-`5` and task-`7` risk-fired exactness rows and keeps the full object
-speed shard at `252.4 ms/control` (`2.24x` versus object baseline), under the
-object budget needed for a `2.0x` 120-row hybrid. It still needs the remaining
+the same checkpoint-`152`, stable-checks-`4` object policy plus a multi-clause
+late-stability risk gate. The earlier ck192 gate fixed the known task-`5` and
+task-`7` risk-fired exactness rows and kept the full object speed shard at
+`252.4 ms/control` (`2.24x` versus object baseline), but a new validation shard
+found task `0`, episode `2` failing with `max_action_diff=161.08004760742188`.
+A second high-motion risk clause plus risk-target-EOS fallback fixes that row
+exactly. It still needs a canonical full-object speed rerun, the remaining
 object exact-validation shard, the suite-conditional 120-row speed rerun, and
 the final audit before it can be claimed. The strict best fully validated
 artifact remains exact target-EOS early stop, documented in
@@ -90,7 +92,10 @@ Recent 2026-07-09 probes on the matched task-id/seed subset:
 | `outputs/pi0fast_adaptive_mismatch_object0_ep1_ck152_stable4_continue200_once_rq` | one late stability continuation to action-end using existing KV cache | `1` | `0 -> 0`, `max_action_diff=0.0` | `264.7` speed / `807.7` validate | diagnostic only | exact and cheaper than target-EOS fallback, but still too slow unless a narrower trigger is found |
 | `outputs/pi0fast_adaptive_mismatch_object0_ep1_ck152_stable4_confirm192_rq` | disallow stops at checkpoints `152` and `160`, first stability stop at `192` | `1` | `0 -> 0`, `max_action_diff=0.0` | `279.3` speed / `801.2` validate | diagnostic only | exact but slower than action-end continuation; not speed-viable globally |
 | `outputs/robotics_spec_120_proof/pi0fast_adaptive_object_ck152_stable4_riskgate_hybrid/speed/target_eos_adaptive/libero_object/metrics.jsonl` | first scalar risk gate on full object speed shard | `40` | `1 -> 1` | `251.4` | `2.25x` vs object baseline | speed-good but exact validation still failed on task `5`, episode `1` with `max_action_diff=0.019725091755390167` |
-| `outputs/robotics_spec_120_proof/pi0fast_adaptive_object_ck152_stable4_riskgate_ck192_hybrid/speed/target_eos_adaptive/libero_object/metrics.jsonl` | ck192 scalar risk gate on full object speed shard | `40` | `1 -> 1` | `252.4` | `2.24x` vs object baseline | current object candidate; risk-fired task `5` and task `7` focused validations are exact, remaining object/full-120 validation still required |
+| `outputs/robotics_spec_120_proof/pi0fast_adaptive_object_ck152_stable4_riskgate_ck192_hybrid/speed/target_eos_adaptive/libero_object/metrics.jsonl` | ck192 scalar risk gate on full object speed shard | `40` | `1 -> 1` | `252.4` | `2.24x` vs object baseline | speed-good and fixed task `5`/`7`, but superseded after task `0`, episode `2` exact validation failed |
+| `outputs/pi0fast_adaptive_object057_ep23_ck152_stable4_riskgate_ck192_validate_rq/metrics.jsonl` | ck192 exact-validation shard for object tasks `0,5,7`, episodes `2,3` | `6` | `1` simulator success | `864.2` validate | diagnostic | five rows exact, but task `0`, episode `2` failed with `max_action_diff=161.08004760742188` |
+| `outputs/pi0fast_adaptive_object0_ep2_ck152_stable4_riskgate_ck192_motion_targetfallback_validate_rq/metrics.jsonl` | ck192 plus high-motion risk clause and risk target-EOS fallback on task `0`, episode `2` | `1` | `0 -> 0`, `max_action_diff=0.0` | `862.7` validate | diagnostic | one risk rejection, one target-EOS fallback; fixes the new high-motion failure |
+| `outputs/pi0fast_adaptive_object0_ep2_ck152_stable4_riskgate_ck192_motion_targetfallback_speed_rq/metrics.jsonl` | same target-fallback candidate, speed mode on task `0`, episode `2` | `1` | `0 -> 0` | `270.9` | `2.05x` vs row baseline | diagnostic only; canonical full-object speed must be rerun because focused row order is not a strict matched shard |
 
 The empirical-vocab path now has two important correctness fixes in
 `serving/pi0fast_token_hooks.py`: the sliced restricted LM head includes
@@ -212,6 +217,13 @@ target-EOS fallback had `197` tokens. This motivated the new runner knobs in
   rejected and generation continues to later checkpoints/action-end using the
   same KV cache. This is the robotics analogue of confidence/risk-conditioned
   dynamic speculation: spend extra decode only on uncertain candidates.
+- `--adaptive-stability-motion-risk-*` thresholds for an optional second
+  high-motion risk clause. The implementation now supports ORed risk clauses,
+  while preserving the original flat risk-gate dictionary for existing runs.
+- `--adaptive-stability-risk-target-eos-fallback` to replace the adaptive chunk
+  with target-EOS output whenever a risk clause rejects. This is more expensive
+  than KV-cache continuation but is still rare and fixes high-motion failures
+  where continuing after the rejected stability stop remains wrong.
 
 Stability-stop feature export now exists in
 `serving/pi0fast_token_hooks.py`. Stop candidates record scalar
@@ -233,8 +245,9 @@ Current labeled stability-stop table:
 | `outputs/pi0fast_adaptive_object0_1_ep023_ck152_stable4_feature_trace_stoponly_labeled_rq/stability_gate_rows.jsonl` | object tasks `0-1`, episodes `0,2,3` | `27` | `27 / 0` | corrected stop-only collection averaged `320.1 ms/control` |
 | `outputs/pi0fast_adaptive_object5_ep01_ck152_stable4_riskgate_stoplabels_rq/stability_gate_rows.jsonl` | object task `5`, episodes `0,1` | `14` | `13 / 1` | under the first risk rule, the remaining bad task-`5` refresh is step `260`, checkpoint `160`, `161` stability-stop tokens, `fallback_action_max_diff=0.019725091755390167` |
 | `outputs/pi0fast_adaptive_object5_ep01_ck152_stable4_riskgate_tok161_stoplabels_rq/stability_gate_rows.jsonl` | object task `5`, episodes `0,1` | `14` | `13 / 1` | after rejecting through `161` tokens, the same bad refresh moves to checkpoint `192`, `193` stability-stop tokens, still `fallback_action_max_diff=0.019725091755390167` |
+| `outputs/pi0fast_adaptive_object0_ep2_ck152_stable4_riskgate_ck192_stoplabels_rq/stability_gate_rows.jsonl` | object task `0`, episode `2`, seed `44` | `3` | `2 / 1` | new bad step `160` row: checkpoint `224`, `225` stability-stop tokens, high motion spans, `fallback_action_max_diff=161.08004760742188` |
 
-The combined labeled set is now `115` rows: `112` safe and `3` unsafe. The
+The combined labeled set is now `118` rows: `114` safe and `4` unsafe. The
 candidate-length field to use for these decisions is
 `stability_stop_token_count`; the unprefixed row `token_count` may reflect the
 post-fallback trace length. The unsafe rows are:
@@ -245,6 +258,11 @@ post-fallback trace length. The unsafe rows are:
   tokens, `fallback_action_max_diff=0.019725091755390167`.
 - task `5`, episode `1`, step `260`, checkpoint `192`, `193` stability-stop
   tokens, `fallback_action_max_diff=0.019725091755390167`.
+- task `0`, episode `2`, step `160`, checkpoint `224`, `225` stability-stop
+  tokens, `position_span=1.6396145820617676`,
+  `rotation_span=2.438109874725342`,
+  `max_step_delta=1.888296127319336`, and
+  `fallback_action_max_diff=161.08004760742188`.
 
 A first risk-gate probe used the rule:
 
@@ -306,8 +324,7 @@ Task `7`, episode `2`, seed `44` was exact (`max_action_diff=0.0`), but task
 with `adaptive_action_diff_fallback=1`. This first risk rule is therefore a
 good speed probe but not a final exactness gate.
 
-The current object candidate widens the same scalar rule through checkpoint
-`192`:
+The next risk-gate probe widened the same scalar rule through checkpoint `192`:
 
 ```bash
 --adaptive-stability-risk-after-step 200 \
@@ -321,8 +338,8 @@ The current object candidate widens the same scalar rule through checkpoint
 --adaptive-stability-risk-max-step-delta-max 0.0
 ```
 
-On the `115` labeled stop rows, this ck192 rule rejects `3/3` unsafe rows and
-`0/112` safe rows. The full object speed shard is:
+On the earlier `115` labeled stop rows, this ck192 rule rejected `3/3` unsafe
+rows and `0/112` safe rows. The full object speed shard is:
 `outputs/robotics_spec_120_proof/pi0fast_adaptive_object_ck152_stable4_riskgate_ck192_hybrid/speed/target_eos_adaptive/libero_object/metrics.jsonl`.
 It has `40` matched rows, success `1 -> 1`, zero baseline-success regressions,
 zero step mismatches, and `252.4 ms/control`. That is `2.24x` versus the object
@@ -341,26 +358,71 @@ Focused exact validations under the same ck192 rule:
   `max_action_diff=0.0`, and the risk-fired episode `2` records `3` risk
   rejections.
 
+That ck192 rule is no longer sufficient. A six-row validation shard at
+`outputs/pi0fast_adaptive_object057_ep23_ck152_stable4_riskgate_ck192_validate_rq/metrics.jsonl`
+found task `0`, episode `2`, seed `44` failing with
+`max_action_diff=161.08004760742188`. Stop-only labels show a different
+failure family: step `160`, checkpoint `224`, `225` stability-stop tokens, and
+large motion features (`position_span=1.6396`, `rotation_span=2.4381`,
+`max_step_delta=1.8883`). This is not caught by the zero-span ck192 clause.
+
+The current object candidate keeps the ck192 zero-span/high-entropy clause and
+adds a second high-motion clause, then uses target-EOS output when any risk
+clause rejects a candidate:
+
+```bash
+--adaptive-stability-risk-after-step 150 \
+--adaptive-stability-risk-max-rejections 4 \
+--adaptive-stability-risk-target-eos-fallback \
+--adaptive-stability-risk-max-checkpoint 192 \
+--adaptive-stability-risk-max-token-count 193 \
+--adaptive-stability-risk-logprob-mean-max -1.04 \
+--adaptive-stability-risk-entropy-mean-min 2.9 \
+--adaptive-stability-risk-position-span-max 0.0 \
+--adaptive-stability-risk-rotation-span-max 0.0 \
+--adaptive-stability-risk-max-step-delta-max 0.0 \
+--adaptive-stability-motion-risk-min-checkpoint 224 \
+--adaptive-stability-motion-risk-logprob-mean-max -1.0 \
+--adaptive-stability-motion-risk-position-span-min 1.5 \
+--adaptive-stability-motion-risk-rotation-span-min 2.0 \
+--adaptive-stability-motion-risk-max-step-delta-min 1.5
+```
+
+On the `118` labeled stop rows, the ORed ck192 plus high-motion rule rejects
+`4/4` unsafe rows and `0/114` safe rows. Focused validation at
+`outputs/pi0fast_adaptive_object0_ep2_ck152_stable4_riskgate_ck192_motion_targetfallback_validate_rq/metrics.jsonl`
+fixes task `0`, episode `2` with `60` exact verifies and
+`max_action_diff=0.0`; it records one risk rejection and one target-EOS fallback.
+The focused speed row at
+`outputs/pi0fast_adaptive_object0_ep2_ck152_stable4_riskgate_ck192_motion_targetfallback_speed_rq/metrics.jsonl`
+is `270.9 ms/control` versus the row baseline `556.5 ms/control` (`2.05x`).
+Treat that speed number as diagnostic only: focused shards can change early
+success/step outcomes, so the canonical full-object speed shard must be rerun.
+
 The checkpoint-level threshold probe (`152=5`) did not fix task `0`; it delayed
 the false positive to checkpoint `160`. The once-capped late target-EOS fallback
 and the KV-cache continuation probe both fixed task `0`, but they were too slow
 if applied broadly (`268.6 ms/control` partial object shard for target-EOS
-fallback, `264.7 ms/control` on the focused continuation row). The ck192 scalar
-risk gate is currently the best object-speed/exactness tradeoff, but it is still
-not a final proof.
+fallback, `264.7 ms/control` on the focused continuation row). The multi-clause
+risk gate plus target fallback is now the best object-speed/exactness tradeoff,
+but it is still not a final proof.
 
 Recommended next moves:
 
+- Rerun the full object speed shard in canonical full-order settings under the
+  multi-clause risk-target-fallback rule. The old ck192 speed shard is no longer
+  sufficient because task `0`, episode `2` needs the motion clause.
 - Run the remaining object exact-validation shard in full-order settings under
-  the ck192 rule. The already-covered rows are task `0` episodes `0,1`, task `5`
-  episodes `0,1`, and task `7` episodes `0,1,2`.
+  the multi-clause rule. The already-covered exact rows are task `0` episodes
+  `0,1,2,3`, task `5` episodes `0,1,2,3`, and task `7` episodes `0,1,2,3`;
+  task `0`, episode `2` is covered by the new target-fallback artifact.
 - If object exactness holds, assemble the suite-conditional candidate: object
-  uses checkpoint `152`, stable checks `4`, and ck192 risk gate; spatial and goal
-  keep stable checks `3`.
+  uses checkpoint `152`, stable checks `4`, and the multi-clause risk-target
+  fallback; spatial and goal keep stable checks `3`.
 - Rerun the 120-row speed gate and final audit against a fresh root for that
   suite-conditional candidate.
-- Continue collecting stop-only labels only if the ck192 gate fires on a safe row
-  or another object validation failure appears.
+- Continue collecting stop-only labels only if the multi-clause gate fires on a
+  safe row or another object validation failure appears.
 
 Object validation should use the same suite-conditional settings as the speed
 artifact. A template for the remaining object exact-validation shard is:
@@ -373,7 +435,7 @@ python scripts/run_pi0fast_chunk_eval.py \
   --steps 300 \
   --modes target_eos_adaptive_validate \
   --seed 42 \
-  --output-dir outputs/robotics_spec_120_proof/pi0fast_adaptive_object_ck152_stable4_riskgate_ck192_hybrid/validate/target_eos_adaptive_validate/libero_object \
+  --output-dir outputs/robotics_spec_120_proof/pi0fast_adaptive_object_ck152_stable4_riskgate_motion_targetfallback_hybrid/validate/target_eos_adaptive_validate/libero_object \
   --device cuda \
   --dtype bfloat16 \
   --smooth-position-delta 0.06 \
@@ -382,15 +444,21 @@ python scripts/run_pi0fast_chunk_eval.py \
   --adaptive-prefix-checkpoints 32,64,96,128,152,160,192,224 \
   --adaptive-stable-checks 4 \
   --adaptive-stable-tolerance 0.0 \
-  --adaptive-stability-risk-after-step 200 \
-  --adaptive-stability-risk-max-rejections 3 \
+  --adaptive-stability-risk-after-step 150 \
+  --adaptive-stability-risk-max-rejections 4 \
+  --adaptive-stability-risk-target-eos-fallback \
   --adaptive-stability-risk-max-checkpoint 192 \
   --adaptive-stability-risk-max-token-count 193 \
   --adaptive-stability-risk-logprob-mean-max -1.04 \
   --adaptive-stability-risk-entropy-mean-min 2.9 \
   --adaptive-stability-risk-position-span-max 0.0 \
   --adaptive-stability-risk-rotation-span-max 0.0 \
-  --adaptive-stability-risk-max-step-delta-max 0.0
+  --adaptive-stability-risk-max-step-delta-max 0.0 \
+  --adaptive-stability-motion-risk-min-checkpoint 224 \
+  --adaptive-stability-motion-risk-logprob-mean-max -1.0 \
+  --adaptive-stability-motion-risk-position-span-min 1.5 \
+  --adaptive-stability-motion-risk-rotation-span-min 2.0 \
+  --adaptive-stability-motion-risk-max-step-delta-min 1.5
 ```
 
 Spatial/goal validation should use the stable-checks `3` setting:
@@ -405,7 +473,7 @@ python scripts/run_pi0fast_chunk_eval.py \
   --steps 300 \
   --modes "$mode" \
   --seed 42 \
-  --output-dir outputs/robotics_spec_120_proof/pi0fast_adaptive_object_ck152_stable4_riskgate_ck192_hybrid/validate/"$mode"/"$suite" \
+  --output-dir outputs/robotics_spec_120_proof/pi0fast_adaptive_object_ck152_stable4_riskgate_motion_targetfallback_hybrid/validate/"$mode"/"$suite" \
   --device cuda \
   --dtype bfloat16 \
   --smooth-position-delta 0.06 \
@@ -419,7 +487,7 @@ done
 ```
 
 After all validation shards exist, run the gate/final audit against
-`outputs/robotics_spec_120_proof/pi0fast_adaptive_object_ck152_stable4_riskgate_ck192_hybrid`.
+`outputs/robotics_spec_120_proof/pi0fast_adaptive_object_ck152_stable4_riskgate_motion_targetfallback_hybrid`.
 
 For a fresh canonical `pi0fast-adaptive` run, use a new root or remove stale
 stable-checks `1` adaptive speed shards before combining `--skip-existing` with

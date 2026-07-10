@@ -175,6 +175,46 @@ def test_adaptive_stability_risk_gate_from_args_omits_disabled_thresholds() -> N
     }
 
 
+def test_adaptive_stability_risk_gate_from_args_adds_motion_clause() -> None:
+    args = argparse.Namespace(
+        adaptive_stability_risk_min_checkpoint=-1,
+        adaptive_stability_risk_max_checkpoint=192,
+        adaptive_stability_risk_max_token_count=193,
+        adaptive_stability_risk_logprob_mean_max=-1.04,
+        adaptive_stability_risk_entropy_mean_min=2.9,
+        adaptive_stability_risk_action_abs_min=None,
+        adaptive_stability_risk_position_span_max=0.0,
+        adaptive_stability_risk_rotation_span_max=0.0,
+        adaptive_stability_risk_max_step_delta_max=0.0,
+        adaptive_stability_motion_risk_min_checkpoint=224,
+        adaptive_stability_motion_risk_logprob_mean_max=-1.0,
+        adaptive_stability_motion_risk_position_span_min=1.5,
+        adaptive_stability_motion_risk_rotation_span_min=2.0,
+        adaptive_stability_motion_risk_max_step_delta_min=1.5,
+    )
+
+    assert _adaptive_stability_risk_gate_from_args(args) == {
+        "clauses": [
+            {
+                "max_checkpoint": 192.0,
+                "max_token_count": 193.0,
+                "max_logprob_mean": -1.04,
+                "min_entropy_mean": 2.9,
+                "max_position_span": 0.0,
+                "max_rotation_span": 0.0,
+                "max_max_step_delta": 0.0,
+            },
+            {
+                "min_checkpoint": 224.0,
+                "max_logprob_mean": -1.0,
+                "min_position_span": 1.5,
+                "min_rotation_span": 2.0,
+                "min_max_step_delta": 1.5,
+            },
+        ]
+    }
+
+
 def test_prefix_cutoff_chunk_uses_no_logits_path_by_default() -> None:
     adapter = _FakeTokenAdapter()
 

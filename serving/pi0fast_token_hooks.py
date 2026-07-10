@@ -869,7 +869,7 @@ class PI0FastTokenLogitAdapter:
         skip_unproductive_after_checkpoint: int = 0,
         continue_to_action_end_on_unstable: bool = False,
         stability_continue_to_action_end: bool = False,
-        stability_risk_gate: dict[str, float] | None = None,
+        stability_risk_gate: dict[str, Any] | None = None,
         prefix_gate: Any | None = None,
         prefix_gate_threshold: float = 0.98,
         early_stop_action_end: bool = True,
@@ -993,9 +993,15 @@ class PI0FastTokenLogitAdapter:
             with torch.no_grad():
                 return float(prefix_gate.probability(features).item())
 
-        def risk_gate_rejects(row: dict[str, float]) -> bool:
+        def risk_gate_clauses() -> list[dict[str, float]]:
             if not stability_risk_gate:
-                return False
+                return []
+            clauses = stability_risk_gate.get("clauses")
+            if isinstance(clauses, list):
+                return [clause for clause in clauses if isinstance(clause, dict)]
+            return [stability_risk_gate]
+
+        def risk_gate_rejects_clause(row: dict[str, float], clause: dict[str, float]) -> bool:
             checks = {
                 "min_checkpoint": ("checkpoint", ">="),
                 "max_checkpoint": ("checkpoint", "<="),
@@ -1003,22 +1009,28 @@ class PI0FastTokenLogitAdapter:
                 "max_logprob_mean": ("logprob_mean", "<="),
                 "min_entropy_mean": ("entropy_mean", ">="),
                 "min_action_abs_max": ("action_abs_max", ">="),
+                "min_position_span": ("position_span", ">="),
                 "max_position_span": ("position_span", "<="),
+                "min_rotation_span": ("rotation_span", ">="),
                 "max_rotation_span": ("rotation_span", "<="),
+                "min_max_step_delta": ("max_step_delta", ">="),
                 "max_max_step_delta": ("max_step_delta", "<="),
             }
             matched = False
             for threshold_name, (feature_name, op) in checks.items():
-                if threshold_name not in stability_risk_gate:
+                if threshold_name not in clause:
                     continue
                 matched = True
                 value = float(row.get(feature_name, 0.0))
-                threshold = float(stability_risk_gate[threshold_name])
+                threshold = float(clause[threshold_name])
                 if op == ">=" and value < threshold:
                     return False
                 if op == "<=" and value > threshold:
                     return False
             return matched
+
+        def risk_gate_rejects(row: dict[str, float]) -> bool:
+            return any(risk_gate_rejects_clause(row, clause) for clause in risk_gate_clauses())
 
         def risk_gate_stats() -> dict[str, float]:
             if stability_risk_gate_rejections <= 0:
