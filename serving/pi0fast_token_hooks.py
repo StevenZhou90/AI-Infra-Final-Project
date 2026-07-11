@@ -1005,10 +1005,12 @@ class PI0FastTokenLogitAdapter:
             checks = {
                 "min_checkpoint": ("checkpoint", ">="),
                 "max_checkpoint": ("checkpoint", "<="),
+                "min_token_count": ("token_count", ">="),
                 "max_token_count": ("token_count", "<="),
                 "max_logprob_mean": ("logprob_mean", "<="),
                 "min_entropy_mean": ("entropy_mean", ">="),
                 "min_action_abs_max": ("action_abs_max", ">="),
+                "max_action_abs_max": ("action_abs_max", "<="),
                 "min_position_span": ("position_span", ">="),
                 "max_position_span": ("position_span", "<="),
                 "min_rotation_span": ("rotation_span", ">="),

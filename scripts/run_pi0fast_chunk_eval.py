@@ -55,10 +55,12 @@ logger = logging.getLogger("run_pi0fast_chunk_eval")
 RISK_GATE_CLAUSE_KEYS = {
     "min_checkpoint",
     "max_checkpoint",
+    "min_token_count",
     "max_token_count",
     "max_logprob_mean",
     "min_entropy_mean",
     "min_action_abs_max",
+    "max_action_abs_max",
     "min_position_span",
     "max_position_span",
     "min_rotation_span",

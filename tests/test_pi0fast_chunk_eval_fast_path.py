@@ -154,11 +154,14 @@ def test_parse_checkpoint_stable_checks_rejects_invalid_values() -> None:
 
 def test_parse_risk_gate_clause_spec_accepts_csv_and_json() -> None:
     assert _parse_risk_gate_clause_spec(
-        "max_checkpoint=160,max_token_count=161,max_logprob_mean=-1.04"
+        "max_checkpoint=160,min_token_count=224,max_token_count=256,"
+        "max_logprob_mean=-1.04,max_action_abs_max=1.0"
     ) == {
         "max_checkpoint": 160.0,
-        "max_token_count": 161.0,
+        "min_token_count": 224.0,
+        "max_token_count": 256.0,
         "max_logprob_mean": -1.04,
+        "max_action_abs_max": 1.0,
     }
     assert _parse_risk_gate_clause_spec('{"min_entropy_mean": 2.7, "max_max_step_delta": 0.3}') == {
         "min_entropy_mean": 2.7,
