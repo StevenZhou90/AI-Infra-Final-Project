@@ -87,8 +87,10 @@ Current HF-carded v044 sanity checks:
 | Custom runner `target_eos` | `libero_goal`, tasks 0-9, episode 0 | `7/10` | `282.6` | One-init-state smoke |
 | Custom runner `target_eos` | object + spatial + goal, tasks 0-9, episode 0 | `24/30` | `272.9` | `80.0%` cross-suite smoke |
 | Custom runner `target_eos` | object + spatial + goal, tasks 0-9, episodes 0-3 | `93/120` | `269.2` | `77.5%` v044 extended smoke |
+| Custom runner `target_eos` | `libero_10`, tasks 0-9, episode 0 | `1/10` | `182.5` | Negative check; not the missing high-SR suite |
 | Custom runner `target_eos_validate` | `libero_object`, task 1, episode 0 | `1/1` | `674.5` | 14 exact verifies, max action diff `0.0` |
 | Custom runner `target_eos_validate` | weak `libero_goal` rows, task ids 0/6/9, episode 0 | `0/3` | `674.2` | 90 exact verifies, max action diff `0.0` |
+| Custom runner `target_eos`, absolute control | `libero_goal`, task 0, episode 0 | `0/1` | `222.0` | Negative protocol check |
 
 The HF model card for `lerobot/pi0fast-libero-v044` reports `82.5%` LIBERO SR.
 The local 30-row v044 smoke is within that regime, and the extended 120-row
@@ -96,6 +98,9 @@ custom run lands at `93/120 = 77.5%`: object `38/40`, spatial `31/40`, goal
 `24/40`. The gap is concentrated in the goal suite and is not explained by
 action-end early stopping: validation on representative failed goal rows
 matched the fixed 256-token decode exactly (`max_action_diff=0.0`).
+Adding `libero_10` did not close the gap in this local protocol (`1/10` on
+episode 0), and switching the known weak `libero_goal` row to absolute control
+also did not recover it.
 
 LeRobot's PI0-FAST action path does not call Hugging Face `generate()` for
 actions. It uses a hand-written loop in `sample_actions_fast` /

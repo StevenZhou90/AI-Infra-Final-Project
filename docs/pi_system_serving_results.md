@@ -73,8 +73,10 @@ PI0-FAST v044 accuracy sanity checks:
 | Custom `action_end` runner | `libero_goal`, tasks 0-9, episode 0 | 7/10 success, 282.6 ms/control |
 | Custom `action_end` runner | object + spatial + goal, tasks 0-9, episode 0 | 24/30 success, 272.9 ms/control |
 | Custom `action_end` runner | object + spatial + goal, tasks 0-9, episodes 0-3 | 93/120 success, 269.2 ms/control |
+| Custom `action_end` runner | `libero_10`, tasks 0-9, episode 0 | 1/10 success, 182.5 ms/control |
 | Custom `action_end` exact validator | `libero_object`, task 1, episode 0 | 1/1 success, 14 exact verifies, max action diff 0.0 |
 | Custom `action_end` exact validator | weak `libero_goal` rows, task ids 0/6/9, episode 0 | 0/3 success, 90 exact verifies, max action diff 0.0 |
+| Custom `action_end`, absolute control | `libero_goal`, task 0, episode 0 | 0/1 success, 222.0 ms/control |
 
 The older 7/120 strict PI0-FAST rows used `lerobot/pi0fast-libero`, which is
 not the HF-carded `lerobot/pi0fast-libero-v044` checkpoint that reports 82.5%
@@ -83,7 +85,11 @@ The current v044 30-row smoke is in that accuracy regime, and the v044 120-row
 custom run is `93/120 = 77.5%` with object `38/40`, spatial `31/40`, and goal
 `24/40`. The misses are concentrated in `libero_goal`; exact validation on
 representative failed goal rows matched the fixed 256-token decode exactly, so
-the accuracy gap is not caused by action-end early stopping.
+the accuracy gap is not caused by action-end early stopping.  A `libero_10`
+episode-0 check was only `1/10`, so the local gap is not explained by omitting a
+high-SR fourth suite.  The known weak `libero_goal` task 0 episode 0 also failed
+under absolute control, so the default relative-control setting is not the
+obvious cause.
 
 PI0-FAST v044 model-serving component benchmark, bf16, action-end decode,
 `outputs/pi0fast_system_components/v044_action_end_replicated_task1_steps5.json`:
