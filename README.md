@@ -83,6 +83,14 @@ Current HF-carded v044 sanity checks:
 | Custom runner fixed-budget baseline | `libero_object`, task 1, episode 0 | `1/1` | `602.6` | Same v044 checkpoint |
 | Custom runner `target_eos` | `libero_object`, task 1, episode 0 | `1/1` | `224.1` | `2.69x` vs fixed budget on this episode |
 | Custom runner `target_eos` | `libero_object`, tasks 0-9, episode 0 | `8/10` | `206.1` | One-init-state smoke, not full gate |
+| Custom runner `target_eos` | `libero_spatial`, tasks 0-9, episode 0 | `9/10` | `330.0` | One-init-state smoke |
+| Custom runner `target_eos` | `libero_goal`, tasks 0-9, episode 0 | `7/10` | `282.6` | One-init-state smoke |
+| Custom runner `target_eos` | object + spatial + goal, tasks 0-9, episode 0 | `24/30` | `272.9` | `80.0%` cross-suite smoke |
+| Custom runner `target_eos_validate` | `libero_object`, task 1, episode 0 | `1/1` | `674.5` | 14 exact verifies, max action diff `0.0` |
+
+The HF model card for `lerobot/pi0fast-libero-v044` reports `82.5%` LIBERO SR.
+The local 30-row v044 smoke is within the same regime, while still being a
+small one-init-state-per-task sample rather than the full official evaluation.
 
 Current v044 non-quantized serving-component result:
 

@@ -69,10 +69,17 @@ PI0-FAST v044 accuracy sanity checks:
 | Custom fixed-budget runner | `libero_object`, task 1, episode 0 | 1/1 success, 602.6 ms/control |
 | Custom `action_end` runner | `libero_object`, task 1, episode 0 | 1/1 success, 224.1 ms/control |
 | Custom `action_end` runner | `libero_object`, tasks 0-9, episode 0 | 8/10 success, 206.1 ms/control |
+| Custom `action_end` runner | `libero_spatial`, tasks 0-9, episode 0 | 9/10 success, 330.0 ms/control |
+| Custom `action_end` runner | `libero_goal`, tasks 0-9, episode 0 | 7/10 success, 282.6 ms/control |
+| Custom `action_end` runner | object + spatial + goal, tasks 0-9, episode 0 | 24/30 success, 272.9 ms/control |
+| Custom `action_end` exact validator | `libero_object`, task 1, episode 0 | 1/1 success, 14 exact verifies, max action diff 0.0 |
 
 The older 7/120 strict PI0-FAST rows used `lerobot/pi0fast-libero`, which is
 not the HF-carded `lerobot/pi0fast-libero-v044` checkpoint that reports 82.5%
 LIBERO SR. Treat those rows as historical latency/equivalence artifacts only.
+The current v044 30-row smoke is in the same accuracy regime as the model card,
+but it is still a small one-init-state-per-task sample rather than the full
+official evaluation.
 
 PI0-FAST v044 model-serving component benchmark, bf16, action-end decode,
 `outputs/pi0fast_system_components/v044_action_end_replicated_task1_steps5.json`:
