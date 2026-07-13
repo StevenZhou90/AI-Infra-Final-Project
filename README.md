@@ -84,6 +84,17 @@ Current HF-carded v044 sanity checks:
 | Custom runner `target_eos` | `libero_object`, task 1, episode 0 | `1/1` | `224.1` | `2.69x` vs fixed budget on this episode |
 | Custom runner `target_eos` | `libero_object`, tasks 0-9, episode 0 | `8/10` | `206.1` | One-init-state smoke, not full gate |
 
+Current v044 non-quantized serving-component result:
+
+| Path | Chunk mean | Per request | Per action | Notes |
+| --- | ---: | ---: | ---: | --- |
+| Single `target_eos` request | `605.1 ms` | `605.1 ms` | `60.5 ms` | 10 actions/request |
+| Replicated batch 8 `target_eos` | `788.6 ms` | `98.6 ms` | `9.9 ms` | 6.14x throughput speedup |
+
+This is model-serving time, not full LIBERO rollout wall time. Full simulator
+rollout rows still include OSMesa/LIBERO stepping and image observation
+formatting overhead.
+
 Historical strict 120-row artifact from the uncarded `lerobot/pi0fast-libero`
 checkpoint. The 120 rows are `libero_object`, `libero_spatial`, and
 `libero_goal`, 10 task ids each, 4 episode/init-state ids each:

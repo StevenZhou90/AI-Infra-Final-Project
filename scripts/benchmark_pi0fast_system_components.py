@@ -248,6 +248,51 @@ def pi05_recommendation(rows: list[dict[str, Any]], target_latency_ms: float) ->
     }
 
 
+def policy_action_horizon(policy: Any) -> int:
+    """Return the number of control actions emitted by one policy request."""
+
+    for attr in ("n_action_steps", "chunk_size"):
+        value = getattr(policy.config, attr, None)
+        if value:
+            return int(value)
+    return 1
+
+
+def pi0fast_recommendation(rows: list[dict[str, Any]], target_latency_ms: float) -> dict[str, Any] | None:
+    candidates: list[dict[str, Any]] = []
+    for row in rows:
+        if row.get("decode_path") != "action_end" or row.get("errors"):
+            continue
+        single = row.get("single_inference", {})
+        if single.get("per_action_mean_ms", float("inf")) <= target_latency_ms:
+            candidates.append(
+                {
+                    "path": "single_amortized",
+                    "batch_size": 1,
+                    "chunk_mean_ms": single.get("mean_ms", 0.0),
+                    "per_request_mean_ms": single.get("mean_ms", 0.0),
+                    "per_action_mean_ms": single.get("per_action_mean_ms", 0.0),
+                    "actions_per_request": row.get("actions_per_request", 1),
+                }
+            )
+        for raw_batch_size, stats in row.get("batch_inference", {}).items():
+            if stats.get("per_action_mean_ms", float("inf")) <= target_latency_ms:
+                candidates.append(
+                    {
+                        "path": "batched_amortized",
+                        "batch_size": int(raw_batch_size),
+                        "chunk_mean_ms": stats.get("mean_ms", 0.0),
+                        "per_request_mean_ms": stats.get("per_request_mean_ms", 0.0),
+                        "per_action_mean_ms": stats.get("per_action_mean_ms", 0.0),
+                        "actions_per_request": row.get("actions_per_request", 1),
+                    }
+                )
+    if not candidates:
+        return None
+    best = min(candidates, key=lambda item: (item["per_action_mean_ms"], item["per_request_mean_ms"]))
+    return {**best, "target_latency_ms": float(target_latency_ms), "meets_target": True}
+
+
 def predict_chunk(
     *,
     policy,
@@ -295,6 +340,7 @@ def main() -> None:
     load_start = time.perf_counter()
     policy = PolicyClass.from_pretrained(args.policy).to(device=device, dtype=dtype).eval()
     token_adapter = PI0FastTokenLogitAdapter(policy) if args.decode_path == "action_end" else None
+    actions_per_request = policy_action_horizon(policy)
     sync_if_cuda(device)
     load_ms = (time.perf_counter() - load_start) * 1000.0
     inference_autocast_dtype = dtype if args.policy_kind == "pi05" and dtype in (torch.bfloat16, torch.float16) else None
@@ -318,6 +364,7 @@ def main() -> None:
         "policy_use_kv_cache_initial": getattr(policy.config, "use_kv_cache", None),
         "policy_max_decoding_steps_initial": getattr(policy.config, "max_decoding_steps", None),
         "policy_num_inference_steps_initial": getattr(policy.config, "num_inference_steps", None),
+        "actions_per_request": actions_per_request,
         "recommendation": None,
         "rows": rows,
     }
@@ -446,6 +493,7 @@ def main() -> None:
                         "decode_path": args.decode_path,
                         "kv_mode": mode,
                         "active_use_kv_cache": active_kv,
+                        "actions_per_request": actions_per_request,
                         "preprocess": summarize(preprocess_ms),
                         "single_inference": summarize(single_ms),
                         "single_token_count_mean": float(np.mean(single_token_counts)) if single_token_counts else None,
@@ -458,10 +506,28 @@ def main() -> None:
                         "batch_source": args.batch_source,
                         "errors": errors,
                     }
+                    row["single_inference"]["per_action_mean_ms"] = (
+                        row["single_inference"]["mean_ms"] / actions_per_request
+                        if actions_per_request
+                        else row["single_inference"]["mean_ms"]
+                    )
+                    row["single_inference"]["meets_target_per_request"] = (
+                        row["single_inference"]["mean_ms"] <= args.target_latency_ms
+                    )
+                    row["single_inference"]["meets_target_per_action"] = (
+                        row["single_inference"]["per_action_mean_ms"] <= args.target_latency_ms
+                    )
                     for batch_size, values in batch_ms.items():
                         stats = summarize(values)
                         single_mean = row["single_inference"]["mean_ms"]
                         stats["per_request_mean_ms"] = stats["mean_ms"] / batch_size if batch_size else 0.0
+                        stats["meets_target_per_request"] = stats["per_request_mean_ms"] <= args.target_latency_ms
+                        stats["per_action_mean_ms"] = (
+                            stats["per_request_mean_ms"] / actions_per_request
+                            if actions_per_request
+                            else stats["per_request_mean_ms"]
+                        )
+                        stats["meets_target_per_action"] = stats["per_action_mean_ms"] <= args.target_latency_ms
                         stats["throughput_speedup_vs_serial"] = (
                             (single_mean * batch_size) / stats["mean_ms"] if stats["mean_ms"] > 0 else 0.0
                         )
@@ -476,6 +542,8 @@ def main() -> None:
                     rows.append(row)
                     if args.policy_kind == "pi05":
                         summary["recommendation"] = pi05_recommendation(rows, args.target_latency_ms)
+                    elif args.policy_kind == "pi0fast":
+                        summary["recommendation"] = pi0fast_recommendation(rows, args.target_latency_ms)
     finally:
         try:
             env.close()

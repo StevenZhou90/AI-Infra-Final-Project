@@ -74,6 +74,22 @@ The older 7/120 strict PI0-FAST rows used `lerobot/pi0fast-libero`, which is
 not the HF-carded `lerobot/pi0fast-libero-v044` checkpoint that reports 82.5%
 LIBERO SR. Treat those rows as historical latency/equivalence artifacts only.
 
+PI0-FAST v044 model-serving component benchmark, bf16, action-end decode,
+`outputs/pi0fast_system_components/v044_action_end_replicated_task1_steps5.json`:
+
+| Mode | Chunk mean | Per request | Per action |
+| --- | ---: | ---: | ---: |
+| Single request | 605.1 ms | 605.1 ms | 60.5 ms |
+| Replicated batch 2 | 636.2 ms | 318.1 ms | 31.8 ms |
+| Replicated batch 4 | 676.1 ms | 169.0 ms | 16.9 ms |
+| Replicated batch 8 | 788.6 ms | 98.6 ms | 9.9 ms |
+
+The benchmark recommendation marks batch 8 as meeting a 100 ms/request target,
+and the single-request path already meets a 100 ms/action target by amortizing
+one policy call over the 10-action PI0-FAST chunk. These rows exclude simulator
+render/step overhead; rollout wall-clock rows above include LIBERO/OSMesa
+observation cost.
+
 PI0.5 synthetic serving capacity, calibrated from 4-step bf16 latency and
 staggered robot chunk requests:
 
