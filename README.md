@@ -91,6 +91,8 @@ Current HF-carded v044 sanity checks:
 | Custom runner `target_eos_validate` | `libero_object`, task 1, episode 0 | `1/1` | `674.5` | 14 exact verifies, max action diff `0.0` |
 | Custom runner `target_eos_validate` | weak `libero_goal` rows, task ids 0/6/9, episode 0 | `0/3` | `674.2` | 90 exact verifies, max action diff `0.0` |
 | Custom runner `target_eos`, absolute control | `libero_goal`, task 0, episode 0 | `0/1` | `222.0` | Negative protocol check |
+| Official `lerobot-eval`, `env.init_states=false`, seed 1000 | `libero_goal`, task 0, episode 0 | `1/1` | `95.7 s/episode` | HF-style random-state eval recovers this weak row |
+| Custom runner `target_eos`, `--no-init-states --seed 1000` | `libero_goal`, task 0, episode 0 | `1/1` | `271.2` | Same row succeeds with action-end stopping |
 
 The HF model card for `lerobot/pi0fast-libero-v044` reports `82.5%` LIBERO SR.
 The local 30-row v044 smoke is within that regime, and the extended 120-row
@@ -100,7 +102,11 @@ action-end early stopping: validation on representative failed goal rows
 matched the fixed 256-token decode exactly (`max_action_diff=0.0`).
 Adding `libero_10` did not close the gap in this local protocol (`1/10` on
 episode 0), and switching the known weak `libero_goal` row to absolute control
-also did not recover it.
+also did not recover it. The first protocol setting that did recover a known
+weak row was LeRobot's HF-style random-state eval: `env.init_states=false` with
+seed 1000 succeeds in both the official fixed-budget eval and the custom
+`target_eos` runner. The lower `93/120` row should therefore be read as a fixed
+LIBERO-init-state stress test, not as a reproduction of the HF card protocol.
 
 LeRobot's PI0-FAST action path does not call Hugging Face `generate()` for
 actions. It uses a hand-written loop in `sample_actions_fast` /
@@ -152,6 +158,9 @@ MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa .venv-pi/bin/lerobot-eval \
 On this LeRobot v0.4.4 install, omitting the `rename_map` fails before rollout
 because the v044 checkpoint expects `base_0_rgb` and `left_wrist_0_rgb`, while
 the default LIBERO env exposes `image` and `image2`.
+
+For the HF-style random-state protocol, use `--env.init_states=false` in
+`lerobot-eval`, or `--no-init-states` in `scripts/run_pi0fast_chunk_eval.py`.
 
 For the stricter 120 matched-eval gate, use
 `scripts/run_robotics_spec_120_proof.py` to launch the canonical proof wrapper,

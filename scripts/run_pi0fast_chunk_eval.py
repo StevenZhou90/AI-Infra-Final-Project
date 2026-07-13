@@ -3098,6 +3098,12 @@ def parse_args() -> argparse.Namespace:
         help="Use LeRobot π0-FAST internals to return generated FAST token IDs and logits.",
     )
     parser.add_argument("--control-mode", choices=["relative", "absolute"], default="relative")
+    parser.add_argument(
+        "--init-states",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use LIBERO's packaged init states; pass --no-init-states to match LeRobot's env.init_states=false eval.",
+    )
     parser.add_argument("--default-window", type=int, default=3)
     parser.add_argument("--smooth-window", type=int, default=5)
     parser.add_argument("--max-window", type=int, default=6)
@@ -3816,7 +3822,7 @@ def main() -> None:
     if any(ep < 0 or ep >= args.episodes for ep in selected_episode_ids):
         raise ValueError("--episode-ids entries must be in [0, --episodes)")
 
-    env_kwargs = {"task": args.task, "control_mode": args.control_mode}
+    env_kwargs = {"task": args.task, "control_mode": args.control_mode, "init_states": args.init_states}
     if selected_task_ids is not None:
         env_kwargs["task_ids"] = selected_task_ids
     env_cfg = LiberoEnv(**env_kwargs)
@@ -4413,6 +4419,8 @@ def main() -> None:
         "task": args.task,
         "task_id": args.task_id,
         "task_ids": task_ids,
+        "init_states": args.init_states,
+        "control_mode": args.control_mode,
         "episode_ids": selected_episode_ids,
         "summary_baseline_mode": args.summary_baseline_mode,
         "token_trace_output_dir": None

@@ -77,6 +77,8 @@ PI0-FAST v044 accuracy sanity checks:
 | Custom `action_end` exact validator | `libero_object`, task 1, episode 0 | 1/1 success, 14 exact verifies, max action diff 0.0 |
 | Custom `action_end` exact validator | weak `libero_goal` rows, task ids 0/6/9, episode 0 | 0/3 success, 90 exact verifies, max action diff 0.0 |
 | Custom `action_end`, absolute control | `libero_goal`, task 0, episode 0 | 0/1 success, 222.0 ms/control |
+| Official LeRobot eval, `env.init_states=false`, seed 1000 | `libero_goal`, task 0, episode 0 | 1/1 success, 95.7 s/episode |
+| Custom `action_end`, `--no-init-states --seed 1000` | `libero_goal`, task 0, episode 0 | 1/1 success, 271.2 ms/control |
 
 The older 7/120 strict PI0-FAST rows used `lerobot/pi0fast-libero`, which is
 not the HF-carded `lerobot/pi0fast-libero-v044` checkpoint that reports 82.5%
@@ -89,7 +91,11 @@ the accuracy gap is not caused by action-end early stopping.  A `libero_10`
 episode-0 check was only `1/10`, so the local gap is not explained by omitting a
 high-SR fourth suite.  The known weak `libero_goal` task 0 episode 0 also failed
 under absolute control, so the default relative-control setting is not the
-obvious cause.
+obvious cause.  The first setting that recovers that row is the HF-style
+random-state protocol: `env.init_states=false` with seed 1000 succeeds in both
+official LeRobot fixed-budget eval and the custom `action_end` runner.  Read the
+`93/120` row as a fixed LIBERO-init-state stress test, not as an exact HF-card
+protocol reproduction.
 
 PI0-FAST v044 model-serving component benchmark, bf16, action-end decode,
 `outputs/pi0fast_system_components/v044_action_end_replicated_task1_steps5.json`:
