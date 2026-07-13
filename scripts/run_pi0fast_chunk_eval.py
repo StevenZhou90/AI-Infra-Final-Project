@@ -52,6 +52,9 @@ if "MUJOCO_GL" not in os.environ and not os.environ.get("DISPLAY"):
 
 logger = logging.getLogger("run_pi0fast_chunk_eval")
 
+PI0FAST_DEFAULT_POLICY = "lerobot/pi0fast-libero-v044"
+PI05_DEFAULT_POLICY = "lerobot/pi05_libero_finetuned_v044"
+
 RISK_GATE_CLAUSE_KEYS = {
     "min_checkpoint",
     "max_checkpoint",
@@ -289,6 +292,26 @@ def _call_task(env) -> list[str]:
             return list(env.call("task"))
         except (AttributeError, NotImplementedError):
             return [""] * env.num_envs
+
+
+def _set_env_episode_index(env, episode: int) -> None:
+    """Keep LIBERO init-state ids aligned with requested episode labels.
+
+    LeRobot's LIBERO env advances ``init_state_id`` on every reset.  That is fine
+    for a single official eval stream, but this runner may evaluate several
+    modes against the same vector env.  Resetting the index before each rollout
+    makes ``task_id``/``episode`` pairs comparable across modes and shards.
+    """
+
+    envs = getattr(env, "envs", None)
+    if envs is None:
+        envs = [env]
+    for offset, inner_env in enumerate(envs):
+        init_state_id = int(episode) + offset
+        if hasattr(inner_env, "init_state_id"):
+            inner_env.init_state_id = init_state_id
+        if hasattr(inner_env, "episode_index"):
+            inner_env.episode_index = init_state_id
 
 
 def _prepare_observation(
@@ -1311,6 +1334,7 @@ def run_episode(
     controller.reset()
     if pattern_drafter is not None and hasattr(pattern_drafter, "reset_history"):
         pattern_drafter.reset_history()
+    _set_env_episode_index(env, episode)
     observation, _info = env.reset(seed=[seed])
     done = False
     steps = 0
@@ -3754,7 +3778,7 @@ def main() -> None:
     _ensure_libero_config(args.libero_config_path)
     make_env, make_env_pre_post_processors, preprocess_observation, LiberoEnv, make_pre_post_processors, PI0FastPolicy = _import_lerobot()
     if args.policy is None:
-        args.policy = "lerobot/pi05_libero_finetuned_v044" if args.policy_kind == "pi05" else "lerobot/pi0fast-libero"
+        args.policy = PI05_DEFAULT_POLICY if args.policy_kind == "pi05" else PI0FAST_DEFAULT_POLICY
     modes = [m.strip() for m in args.modes.split(",") if m.strip()]
     if args.policy_kind == "pi05":
         unsupported_modes = _pi05_unsupported_fast_token_modes(modes)

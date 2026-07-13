@@ -65,22 +65,58 @@ the generated action text reaches `|`; validation showed the decoded continuous
 action chunk is unchanged. It is not yet a passing final result on the strict
 120-row proof gate.
 
-Legacy 90-episode LIBERO result:
+Legacy 90-episode LIBERO target-eos equivalence result:
 
 | Decoder | Success | Avg ms/step | Speedup | Drop |
 | --- | ---: | ---: | ---: | ---: |
 | Fixed-budget PI0-FAST | `81/90` | `634.3` | `1.00x` | - |
 | Target-EOS early stop | `81/90` | `259.5` | `2.44x` | `0.0%` |
 
-Current strict artifact:
+Those rows are useful for the zero-drop early-stop claim, but the current HF
+accuracy reproduction should be anchored on the carded v044 checkpoint below.
+
+Current HF-carded v044 sanity checks:
+
+| Path | Task slice | Success | Avg ms/step | Notes |
+| --- | --- | ---: | ---: | --- |
+| Official `lerobot-eval` + camera `rename_map` | `libero_object`, task 1, 2 episodes | `2/2` | `88.9 s/episode` | Fixed 256-token decode |
+| Custom runner fixed-budget baseline | `libero_object`, task 1, episode 0 | `1/1` | `602.6` | Same v044 checkpoint |
+| Custom runner `target_eos` | `libero_object`, task 1, episode 0 | `1/1` | `224.1` | `2.69x` vs fixed budget on this episode |
+| Custom runner `target_eos` | `libero_object`, tasks 0-9, episode 0 | `8/10` | `206.1` | One-init-state smoke, not full gate |
+
+Historical strict 120-row artifact from the uncarded `lerobot/pi0fast-libero`
+checkpoint. The 120 rows are `libero_object`, `libero_spatial`, and
+`libero_goal`, 10 task ids each, 4 episode/init-state ids each:
 
 | Decoder | Success | Avg ms/step | Speedup | Drop |
 | --- | ---: | ---: | ---: | ---: |
 | Fixed-budget PI0-FAST | `7/120` | `607.9` | `1.00x` | - |
 | Target-EOS early stop | `7/120` | `339.8` | `1.789x` | `0.0%` |
 
-The strict row has zero regressions, but it fails the required `2.0x` speedup;
-the candidate must get below `303.9 ms/control` against that baseline.
+That strict row should not be read as an HF v044 accuracy baseline. It used a
+different checkpoint and is only useful as a historical latency/equivalence
+artifact. For v044 accuracy reproduction, use `lerobot/pi0fast-libero-v044` and
+map the default LIBERO camera keys to the v044 policy keys when running the
+official LeRobot CLI:
+
+```bash
+MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa .venv-pi/bin/lerobot-eval \
+  --policy.path=lerobot/pi0fast-libero-v044 \
+  --env.type=libero \
+  --env.task=libero_object \
+  --env.task_ids='[1]' \
+  --env.init_states=true \
+  --eval.batch_size=1 \
+  --eval.n_episodes=2 \
+  --policy.device=cuda \
+  --policy.dtype=bfloat16 \
+  --policy.gradient_checkpointing=false \
+  --rename_map='{"observation.images.image":"observation.images.base_0_rgb","observation.images.image2":"observation.images.left_wrist_0_rgb"}'
+```
+
+On this LeRobot v0.4.4 install, omitting the `rename_map` fails before rollout
+because the v044 checkpoint expects `base_0_rgb` and `left_wrist_0_rgb`, while
+the default LIBERO env exposes `image` and `image2`.
 
 For the stricter 120 matched-eval gate, use
 `scripts/run_robotics_spec_120_proof.py` to launch the canonical proof wrapper,
@@ -570,7 +606,7 @@ sudo apt-get install -y libosmesa6 libegl1 libgl1-mesa-dri libglx-mesa0
 
 CUDA_VISIBLE_DEVICES=0 HF_HOME=.hf_cache MPLCONFIGDIR=/tmp/matplotlib-cache MUJOCO_GL=osmesa \
 .venv-pi/bin/python scripts/run_pi0fast_chunk_eval.py \
-  --policy lerobot/pi0fast-libero \
+  --policy lerobot/pi0fast-libero-v044 \
   --task libero_object \
   --task-id 0 \
   --episodes 3 \

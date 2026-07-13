@@ -61,6 +61,19 @@ The one 4-step failure was `libero_object` task 7, seed 43.  The same episode
 also failed at 6 and 10 flow steps, so this result does not appear to be caused
 by the 4-step latency setting.
 
+PI0-FAST v044 accuracy sanity checks:
+
+| Path | Slice | Result |
+| --- | --- | ---: |
+| Official LeRobot eval with camera `rename_map` | `libero_object`, task 1, 2 episodes | 2/2 success, 88.9 s/episode |
+| Custom fixed-budget runner | `libero_object`, task 1, episode 0 | 1/1 success, 602.6 ms/control |
+| Custom `action_end` runner | `libero_object`, task 1, episode 0 | 1/1 success, 224.1 ms/control |
+| Custom `action_end` runner | `libero_object`, tasks 0-9, episode 0 | 8/10 success, 206.1 ms/control |
+
+The older 7/120 strict PI0-FAST rows used `lerobot/pi0fast-libero`, which is
+not the HF-carded `lerobot/pi0fast-libero-v044` checkpoint that reports 82.5%
+LIBERO SR. Treat those rows as historical latency/equivalence artifacts only.
+
 PI0.5 synthetic serving capacity, calibrated from 4-step bf16 latency and
 staggered robot chunk requests:
 
@@ -123,7 +136,9 @@ or projected utilization from `--max-admission-utilization`.  The gRPC server
 also has a dedicated GPU worker queue so request handler threads only decode and
 enqueue work, and it can run startup warmup from a saved prepared observation.
 
-PI0-FAST, bf16, `lerobot/pi0fast-libero`, action-end decode:
+PI0-FAST, bf16, `lerobot/pi0fast-libero`, action-end decode
+(historical uncarded-checkpoint measurement; use `lerobot/pi0fast-libero-v044`
+for HF-carded accuracy reproduction):
 
 | Mode | Mean latency |
 | --- | ---: |
@@ -344,7 +359,7 @@ HF_HOME=/home/ubuntu/AI-Infra-Final-Project/.hf_cache \
 LIBERO_CONFIG_PATH=/home/ubuntu/AI-Infra-Final-Project/.libero_config \
 MPLCONFIGDIR=/tmp/matplotlib-cache MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa \
 .venv-pi/bin/python scripts/benchmark_pi0fast_system_components.py \
-  --policy-kind pi0fast --policy lerobot/pi0fast-libero \
+  --policy-kind pi0fast --policy lerobot/pi0fast-libero-v044 \
   --task libero_object --task-id 0 --warmup 1 --steps 2 \
   --batch-sizes 1,2,4,8 --decode-path action_end \
   --max-decoding-steps default --kv-modes default \
@@ -359,7 +374,7 @@ HF_HOME=/home/ubuntu/AI-Infra-Final-Project/.hf_cache \
 LIBERO_CONFIG_PATH=/home/ubuntu/AI-Infra-Final-Project/.libero_config \
 MPLCONFIGDIR=/tmp/matplotlib-cache MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa \
 .venv-pi/bin/python scripts/benchmark_pi0fast_system_components.py \
-  --policy-kind pi0fast --policy lerobot/pi0fast-libero \
+  --policy-kind pi0fast --policy lerobot/pi0fast-libero-v044 \
   --task libero_object --task-id 0 --warmup 1 --steps 1 \
   --batch-sizes 1,2,4,8 --decode-path action_end \
   --max-decoding-steps default --kv-modes default \

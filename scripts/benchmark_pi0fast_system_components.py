@@ -88,7 +88,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=Path("outputs/pi0fast_system_components/summary.json"))
     args = parser.parse_args()
     if args.policy is None:
-        args.policy = "lerobot/pi05_libero_finetuned_v044" if args.policy_kind == "pi05" else "lerobot/pi0fast-libero"
+        args.policy = (
+            "lerobot/pi05_libero_finetuned_v044"
+            if args.policy_kind == "pi05"
+            else "lerobot/pi0fast-libero-v044"
+        )
     return args
 
 
