@@ -41,6 +41,12 @@ from scripts.run_pi0fast_chunk_eval import (  # noqa: E402
 from serving.pi0fast_serving_runtime import merge_prepared_pi0fast_batches  # noqa: E402
 from serving.pi0fast_token_hooks import PI0FastTokenLogitAdapter  # noqa: E402
 
+OBS_IMAGES = "observation.images"
+OBS_IMAGE = "observation.image"
+OBS_STATE = "observation.state"
+OBS_STR = "observation"
+OBS_ENV_STATE = "observation.environment_state"
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark real PI0-FAST system components.")
@@ -151,6 +157,11 @@ def parse_args() -> argparse.Namespace:
         "--disable-gradient-checkpointing",
         action="store_true",
         help="Disable gradient checkpointing in the policy config and loaded model for serving-style latency.",
+    )
+    parser.add_argument(
+        "--fast-libero-preprocess",
+        action="store_true",
+        help="For LIBERO observations, convert uint8 images to float CHW tensors on the target device.",
     )
     parser.add_argument(
         "--attn-implementation",
@@ -270,6 +281,87 @@ def clone_batch_for_replicas(batch: Any, replicas: int) -> Any:
     return copy.deepcopy(batch)
 
 
+def nested_numpy_to_torch(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: nested_numpy_to_torch(item) for key, item in value.items()}
+    if isinstance(value, np.ndarray):
+        return torch.from_numpy(value)
+    return value
+
+
+def fast_libero_preprocess_observation(observations: dict[str, Any], *, device: torch.device) -> dict[str, Any]:
+    """LeRobot-compatible LIBERO observation conversion with GPU image casting.
+
+    LeRobot's generic env utility first expands uint8 images to CPU float32
+    tensors and later copies them to the policy device.  For serving latency,
+    copying uint8 and doing the CHW/float conversion on the target device avoids
+    a larger CPU allocation/copy while preserving the policy input contract.
+    """
+
+    out: dict[str, Any] = {}
+    pixels = observations.get("pixels")
+    if pixels is not None:
+        imgs = (
+            {f"{OBS_IMAGES}.{key}": img for key, img in pixels.items()}
+            if isinstance(pixels, dict)
+            else {OBS_IMAGE: pixels}
+        )
+        for key, img in imgs.items():
+            img_tensor = torch.as_tensor(img, device=device)
+            if img_tensor.ndim == 3:
+                img_tensor = img_tensor.unsqueeze(0)
+            if img_tensor.ndim != 4:
+                raise ValueError(f"Expected LIBERO image tensor with 4 dims, got {tuple(img_tensor.shape)}")
+            _, h, w, c = img_tensor.shape
+            if not (c < h and c < w):
+                raise ValueError(f"Expected channel-last image tensor, got {tuple(img_tensor.shape)}")
+            if img_tensor.dtype != torch.uint8:
+                raise ValueError(f"Expected uint8 LIBERO image tensor, got {img_tensor.dtype}")
+            img_tensor = img_tensor.permute(0, 3, 1, 2).contiguous()
+            out[key] = img_tensor.to(dtype=torch.float32).div_(255.0)
+
+    if "environment_state" in observations:
+        env_state = torch.from_numpy(observations["environment_state"]).float()
+        if env_state.dim() == 1:
+            env_state = env_state.unsqueeze(0)
+        out[OBS_ENV_STATE] = env_state
+
+    if "agent_pos" in observations:
+        agent_pos = torch.from_numpy(observations["agent_pos"]).float()
+        if agent_pos.dim() == 1:
+            agent_pos = agent_pos.unsqueeze(0)
+        out[OBS_STATE] = agent_pos
+
+    if "robot_state" in observations:
+        out[f"{OBS_STR}.robot_state"] = nested_numpy_to_torch(observations["robot_state"])
+
+    if "policy" in observations:
+        out[f"{OBS_STR}.policy"] = observations["policy"]
+
+    if "camera_obs" in observations:
+        out[f"{OBS_STR}.camera_obs"] = observations["camera_obs"]
+
+    handled = {"pixels", "environment_state", "agent_pos", "robot_state", "policy", "camera_obs"}
+    for key, value in observations.items():
+        if key in handled:
+            continue
+        target = f"{OBS_STR}.{key}"
+        if target in out:
+            continue
+        if isinstance(value, np.ndarray):
+            tensor = torch.from_numpy(value).float()
+            if tensor.dim() == 1:
+                tensor = tensor.unsqueeze(0)
+            out[target] = tensor
+        elif torch.is_tensor(value):
+            tensor = value.float()
+            if tensor.dim() == 1:
+                tensor = tensor.unsqueeze(0)
+            out[target] = tensor
+
+    return out
+
+
 def collect_distinct_reset_batch(
     *,
     env,
@@ -368,17 +460,25 @@ def pi05_recommendation(rows: list[dict[str, Any]], target_latency_ms: float) ->
         for row in rows
         if row.get("decode_path") == "public"
         and not row.get("errors")
-        and row.get("single_inference", {}).get("mean_ms", float("inf")) <= target_latency_ms
+        and request_latency_ms(row) <= target_latency_ms
     ]
     if not candidates:
         return None
-    best = min(candidates, key=lambda row: row["single_inference"]["mean_ms"])
+    best = min(candidates, key=request_latency_ms)
     return {
         "num_inference_steps": best.get("num_inference_steps"),
         "single_mean_ms": best["single_inference"]["mean_ms"],
+        "full_request_mean_ms": best.get("full_request", {}).get("mean_ms"),
         "target_latency_ms": float(target_latency_ms),
         "meets_target": True,
     }
+
+
+def request_latency_ms(row: dict[str, Any]) -> float:
+    full_request = row.get("full_request")
+    if isinstance(full_request, dict) and "mean_ms" in full_request:
+        return float(full_request["mean_ms"])
+    return float(row.get("single_inference", {}).get("mean_ms", float("inf")))
 
 
 def policy_action_horizon(policy: Any) -> int:
@@ -397,13 +497,14 @@ def pi0fast_recommendation(rows: list[dict[str, Any]], target_latency_ms: float)
         if row.get("decode_path") != "action_end" or row.get("errors"):
             continue
         single = row.get("single_inference", {})
-        if single.get("mean_ms", float("inf")) <= target_latency_ms:
+        if request_latency_ms(row) <= target_latency_ms:
             candidates.append(
                 {
                     "path": "single_request",
                     "batch_size": 1,
-                    "chunk_mean_ms": single.get("mean_ms", 0.0),
-                    "per_request_mean_ms": single.get("mean_ms", 0.0),
+                    "chunk_mean_ms": request_latency_ms(row),
+                    "per_request_mean_ms": request_latency_ms(row),
+                    "single_inference_mean_ms": single.get("mean_ms", 0.0),
                     "per_action_mean_ms": single.get("per_action_mean_ms", 0.0),
                     "actions_per_request": row.get("actions_per_request", 1),
                 }
@@ -524,6 +625,11 @@ def main() -> None:
     )
     env_cfg = LiberoEnv(task=args.task, task_ids=[args.task_id], control_mode=args.control_mode)
     env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=env_cfg, policy_cfg=policy.config)
+    preprocess_observation_fn = (
+        (lambda observation: fast_libero_preprocess_observation(observation, device=device))
+        if args.fast_libero_preprocess
+        else preprocess_observation
+    )
     env_map = make_env(env_cfg, n_envs=1, use_async_envs=False)
     env = env_map[args.task][args.task_id]
 
@@ -552,7 +658,13 @@ def main() -> None:
         observation, _info = env.reset(seed=[args.seed])
 
         for _ in range(args.warmup):
-            batch = _prepare_observation(observation, env, env_preprocessor, policy_preprocessor, preprocess_observation)
+            batch = _prepare_observation(
+                observation,
+                env,
+                env_preprocessor,
+                policy_preprocessor,
+                preprocess_observation_fn,
+            )
             with torch.inference_mode():
                 raw_action, _token_count = predict_chunk(
                     policy=policy,
@@ -592,6 +704,7 @@ def main() -> None:
                     single_token_counts: list[float] = []
                     action_end_stats: list[dict[str, Any]] = []
                     postprocess_ms: list[float] = []
+                    full_request_ms: list[float] = []
                     batch_ms: dict[int, list[float]] = {size: [] for size in batch_sizes if size > 1}
                     batch_token_counts: dict[int, list[float]] = {size: [] for size in batch_sizes if size > 1}
                     errors: list[str] = []
@@ -604,7 +717,7 @@ def main() -> None:
                                 env,
                                 env_preprocessor,
                                 policy_preprocessor,
-                                preprocess_observation,
+                                preprocess_observation_fn,
                             ),
                         )
                         preprocess_ms.append(prep_ms)
@@ -629,6 +742,7 @@ def main() -> None:
 
                         processed, post_ms = timed_ms(device, lambda: policy_postprocessor(raw_action))
                         postprocess_ms.append(post_ms)
+                        full_request_ms.append(float(prep_ms) + float(infer_ms) + float(post_ms))
                         action = _to_numpy_action(processed)[0]
 
                         for batch_size in batch_sizes:
@@ -639,7 +753,7 @@ def main() -> None:
                                     env=env,
                                     env_preprocessor=env_preprocessor,
                                     policy_preprocessor=policy_preprocessor,
-                                    preprocess_observation=preprocess_observation,
+                                    preprocess_observation=preprocess_observation_fn,
                                     batch_size=batch_size,
                                     seed_base=args.seed + 10_000 + step * 100 + batch_size * 10,
                                 )
@@ -688,6 +802,7 @@ def main() -> None:
                         ),
                         "action_end_stats": action_end_stats,
                         "postprocess": summarize(postprocess_ms),
+                        "full_request": summarize(full_request_ms),
                         "batch_inference": {},
                         "batch_source": args.batch_source,
                         "errors": errors,
@@ -702,6 +817,14 @@ def main() -> None:
                     )
                     row["single_inference"]["meets_target_per_action"] = (
                         row["single_inference"]["per_action_mean_ms"] <= args.target_latency_ms
+                    )
+                    row["full_request"]["meets_target_per_request"] = (
+                        row["full_request"]["mean_ms"] <= args.target_latency_ms
+                    )
+                    row["full_request"]["per_action_mean_ms"] = (
+                        row["full_request"]["mean_ms"] / actions_per_request
+                        if actions_per_request
+                        else row["full_request"]["mean_ms"]
                     )
                     for batch_size, values in batch_ms.items():
                         stats = summarize(values)

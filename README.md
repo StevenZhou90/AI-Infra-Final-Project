@@ -179,6 +179,7 @@ Follow-up exact single-request probes on the current v0.6 stack:
 | Approx FAST-char early stop + prefixed action-token prefill, same real observations | best `119.7 ms` | Target 4 decoded FAST chars emits mean `7` tokens but has large action error, mean max diff `1.08`; full-target prefill is still not exact, mean max diff `0.278`; artifact `outputs/pi0fast_system_components/pi06_pi0fast_libero_early_stop_prefill_prefix_target_chars_task1_osmesa_steps3.json` |
 | Profiled OSMesa real LIBERO constrained `action_end`, 3 measured steps | `518.4 ms` | Decode LM forwards dominate: `352-479 ms` across `22-30` decode forwards, about `16 ms/token`; prefix embed+prefill is about `62 ms`; constrained head is only `2-3 ms`; artifact `outputs/pi0fast_system_components/pi06_pi0fast_libero_profile_exact_task1_osmesa_steps3.json` |
 | Stock Pi0.5 public path, `10` flow steps, same A100, warmed compiler cache | `84.6 ms` inference | Meets a model-only `100 ms` single-request target; preprocessing adds `25.9 ms`, so preprocess+inference+postprocess is about `110.6 ms`; artifact `outputs/pi0fast_system_components/pi05_libero_public_steps10_1_task1_osmesa_steps5_warm3.json` |
+| Stock Pi0.5 public path + fast LIBERO image preprocessing, `10` flow steps | `86.4 ms` full request | Preprocess `1.9 ms`, inference `84.3 ms`, postprocess `0.2 ms`; full-request p95 `86.7 ms`; artifact `outputs/pi0fast_system_components/pi05_libero_public_steps10_fastpreprocess_fullrequest_task1_osmesa_steps10_warm8.json` |
 
 The current non-quantized exact single-request path therefore does not meet a
 100 ms isolated-request target. Public and local evidence point to model/runtime
@@ -192,8 +193,9 @@ FlashRT's public Pi0-FAST docs report the same shape of bottleneck:
 autoregressive latency is `prefill + N * per_token_decode`, with about
 `480 ms` for 50 tokens by default and about `447 ms` with decode CUDA Graph.
 That is faster than this stock PyTorch path but still not a 100 ms exact
-Pi0-FAST route. The local sub-100 model-only result is the stock Pi0.5
-flow path above, not the autoregressive FAST-token path.
+Pi0-FAST route. The local sub-100 full-request result is the stock Pi0.5
+flow path with GPU-side LIBERO image preprocessing above, not the
+autoregressive FAST-token path.
 
 Historical strict 120-row artifact from an older custom
 `lerobot/pi0fast-libero` stack/protocol. The 120 rows are `libero_object`,
