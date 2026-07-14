@@ -65,6 +65,7 @@ PI0-FAST v044 accuracy sanity checks:
 
 | Path | Slice | Result |
 | --- | --- | ---: |
+| Official LeRobot eval with camera `rename_map` | HF task list, object/spatial/goal/10, 1 episode each | 30/40 success, 75.0%, 139.8 s/episode |
 | Official LeRobot eval with camera `rename_map` | `libero_object`, task 1, 2 episodes | 2/2 success, 88.9 s/episode |
 | Custom fixed-budget runner | `libero_object`, task 1, episode 0 | 1/1 success, 602.6 ms/control |
 | Custom `action_end` runner | `libero_object`, task 1, episode 0 | 1/1 success, 224.1 ms/control |
@@ -85,25 +86,27 @@ PI0-FAST v044 accuracy sanity checks:
 The older 7/120 strict PI0-FAST rows used `lerobot/pi0fast-libero`, which is
 not the HF-carded `lerobot/pi0fast-libero-v044` checkpoint that reports 82.5%
 LIBERO SR. Treat those rows as historical latency/equivalence artifacts only.
-The current v044 30-row smoke is in that accuracy regime, and the v044 120-row
-custom run is `93/120 = 77.5%` with object `38/40`, spatial `31/40`, and goal
-`24/40`. The misses are concentrated in `libero_goal`; exact validation on
-representative failed goal rows matched the fixed 256-token decode exactly, so
-the accuracy gap is not caused by action-end early stopping.  A `libero_10`
-episode-0 check was only `1/10`, so the local gap is not explained by omitting a
-high-SR fourth suite.  The known weak `libero_goal` task 0 episode 0 also failed
-under absolute control, so the default relative-control setting is not the
-obvious cause.  The first setting that recovers that row is the HF-style
-random-state protocol: `env.init_states=false` with seed 1000 succeeds in both
-official LeRobot fixed-budget eval and the custom `action_end` runner.  Read the
-`93/120` row as a fixed LIBERO-init-state stress test, not as an exact HF-card
-protocol reproduction.  A second sentinel row exposed a remaining custom-runner
-gap: official LeRobot eval succeeds on `libero_object` task 0 seed 1000, while
-the custom baseline loop still fails after adding the official camera
-`rename_map`, global seeding, and config-first policy load.  For HF-card
-accuracy claims, use official `lerobot-eval`; use the custom runner for
-token-level latency/equivalence diagnostics until the rollout mismatch is fully
-reconciled.
+The official LeRobot command on this v0.4.4 install, using the carded v044
+checkpoint, the HF task list, `eval.n_episodes=1`, and the camera `rename_map`,
+is `30/40 = 75.0%`: object `9/10`, spatial `8/10`, goal `8/10`, and
+`libero_10` `5/10`. Failed task ids are `libero_object_0`,
+`libero_spatial_1`, `libero_spatial_9`, `libero_goal_3`, `libero_goal_9`, and
+`libero_10_{0,2,4,6,9}`. This is below the HF card's `82.5%` table, but it is
+not the old `7/120` baseline, and it used fixed 256-token decode, so the gap is
+not caused by action-end early stopping. Artifact:
+`outputs/eval/2026-07-14/00-35-17_libero_pi0_fast/eval_info.json`.
+
+The current v044 30-row smoke is in the same broad accuracy regime, and the
+v044 120-row custom run is `93/120 = 77.5%` with object `38/40`, spatial
+`31/40`, and goal `24/40`. Exact validation on representative failed goal rows
+matched the fixed 256-token decode exactly. Read the `93/120` row as a fixed
+LIBERO-init-state stress test, not as an exact HF-card protocol reproduction. A
+sentinel row exposed a remaining custom-runner gap: official LeRobot eval
+succeeds on `libero_object` task 0 seed 1000, while the custom baseline loop
+still fails after adding the official camera `rename_map`, global seeding, and
+config-first policy load. For HF-card accuracy claims, use official
+`lerobot-eval`; use the custom runner for token-level latency/equivalence
+diagnostics until the rollout mismatch is fully reconciled.
 
 PI0-FAST v044 model-serving component benchmark, bf16, action-end decode,
 `outputs/pi0fast_system_components/v044_action_end_replicated_task1_steps5.json`:

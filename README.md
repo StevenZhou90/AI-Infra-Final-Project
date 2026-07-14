@@ -79,6 +79,7 @@ Current HF-carded v044 sanity checks:
 
 | Path | Task slice | Success | Avg ms/step | Notes |
 | --- | --- | ---: | ---: | --- |
+| Official `lerobot-eval` + camera `rename_map` | HF task list: object/spatial/goal/10, 1 episode each | `30/40` | `139.8 s/episode` | Fixed 256-token decode, `75.0%` |
 | Official `lerobot-eval` + camera `rename_map` | `libero_object`, task 1, 2 episodes | `2/2` | `88.9 s/episode` | Fixed 256-token decode |
 | Custom runner fixed-budget baseline | `libero_object`, task 1, episode 0 | `1/1` | `602.6` | Same v044 checkpoint |
 | Custom runner `target_eos` | `libero_object`, task 1, episode 0 | `1/1` | `224.1` | `2.69x` vs fixed budget on this episode |
@@ -91,30 +92,34 @@ Current HF-carded v044 sanity checks:
 | Custom runner `target_eos_validate` | `libero_object`, task 1, episode 0 | `1/1` | `674.5` | 14 exact verifies, max action diff `0.0` |
 | Custom runner `target_eos_validate` | weak `libero_goal` rows, task ids 0/6/9, episode 0 | `0/3` | `674.2` | 90 exact verifies, max action diff `0.0` |
 | Custom runner `target_eos`, absolute control | `libero_goal`, task 0, episode 0 | `0/1` | `222.0` | Negative protocol check |
-| Official `lerobot-eval`, `env.init_states=false`, seed 1000 | `libero_goal`, task 0, episode 0 | `1/1` | `95.7 s/episode` | HF-style random-state eval recovers this weak row |
+| Official `lerobot-eval`, `env.init_states=false`, seed 1000 | `libero_goal`, task 0, episode 0 | `1/1` | `95.7 s/episode` | Random-state diagnostic recovers this weak row |
 | Custom runner `target_eos`, `--no-init-states --seed 1000` | `libero_goal`, task 0, episode 0 | `1/1` | `271.2` | Same row succeeds with action-end stopping |
 | Official `lerobot-eval`, `env.init_states=false`, seed 1000 | `libero_object`, task 0, episode 0 | `1/1` | `91.1 s/episode` | Official fixed-budget row succeeds |
 | Custom runner baseline, `--no-init-states --seed 1000` | `libero_object`, task 0, episode 0 | `0/1` | `559.2` | Sentinel mismatch; custom rollout SR is not the HF-card authority |
 
 The HF model card for `lerobot/pi0fast-libero-v044` reports `82.5%` LIBERO SR.
-The local 30-row v044 smoke is within that regime, and the extended 120-row
-custom run lands at `93/120 = 77.5%`: object `38/40`, spatial `31/40`, goal
-`24/40`. The gap is concentrated in the goal suite and is not explained by
-action-end early stopping: validation on representative failed goal rows
-matched the fixed 256-token decode exactly (`max_action_diff=0.0`).
-Adding `libero_10` did not close the gap in this local protocol (`1/10` on
-episode 0), and switching the known weak `libero_goal` row to absolute control
-also did not recover it. The first protocol setting that did recover a known
-weak row was LeRobot's HF-style random-state eval: `env.init_states=false` with
-seed 1000 succeeds in both the official fixed-budget eval and the custom
-`target_eos` runner. The lower `93/120` row should therefore be read as a fixed
-LIBERO-init-state stress test, not as a reproduction of the HF card protocol.
-After adding the official camera `rename_map`, global seeding, and config-first
-policy load to the custom runner, one sentinel row still diverges: official
-`lerobot-eval` succeeds on `libero_object` task 0 seed 1000 while the custom
-baseline loop does not. Treat official `lerobot-eval` as the accuracy authority;
-use the custom runner for token-level latency/equivalence experiments until that
-rollout mismatch is fully reconciled.
+The official LeRobot command on this v0.4.4 install, using the carded v044
+checkpoint, the HF task list, `eval.n_episodes=1`, and the camera `rename_map`,
+lands at `30/40 = 75.0%`: object `9/10`, spatial `8/10`, goal `8/10`, and
+`libero_10` `5/10`. The failed task ids are `libero_object_0`,
+`libero_spatial_1`, `libero_spatial_9`, `libero_goal_3`, `libero_goal_9`, and
+`libero_10_{0,2,4,6,9}`. This is below the HF card's `82.5%` table, but it is
+not the old `7/120` failure mode. It was a fixed 256-token decode run, so the
+remaining accuracy gap is not caused by action-end early stopping. Artifact:
+`outputs/eval/2026-07-14/00-35-17_libero_pi0_fast/eval_info.json`.
+
+The local 30-row v044 smoke is still within the same broad regime, and the
+extended 120-row custom run lands at `93/120 = 77.5%`: object `38/40`, spatial
+`31/40`, goal `24/40`. Exact validation on representative failed goal rows
+matched the fixed 256-token decode exactly (`max_action_diff=0.0`). The lower
+custom rows should therefore be read as stricter fixed-init-state and
+custom-rollout stress tests, not as the HF card protocol. After adding the
+official camera `rename_map`, global seeding, and config-first policy load to
+the custom runner, one sentinel row still diverges: official `lerobot-eval`
+succeeds on `libero_object` task 0 seed 1000 while the custom baseline loop does
+not. Treat official `lerobot-eval` as the accuracy authority; use the custom
+runner for token-level latency/equivalence experiments until that rollout
+mismatch is fully reconciled.
 
 LeRobot's PI0-FAST action path does not call Hugging Face `generate()` for
 actions. It uses a hand-written loop in `sample_actions_fast` /
@@ -167,7 +172,7 @@ On this LeRobot v0.4.4 install, omitting the `rename_map` fails before rollout
 because the v044 checkpoint expects `base_0_rgb` and `left_wrist_0_rgb`, while
 the default LIBERO env exposes `image` and `image2`.
 
-For the HF-style random-state protocol, use `--env.init_states=false` in
+For the random-state diagnostic protocol, use `--env.init_states=false` in
 `lerobot-eval`, or `--no-init-states` in `scripts/run_pi0fast_chunk_eval.py`.
 
 For the stricter 120 matched-eval gate, use
