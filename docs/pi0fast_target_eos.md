@@ -5,6 +5,18 @@ to the fixed FAST token budget. `target_eos` stops as soon as the generated FAST
 action text reaches `|`. LeRobot detokenization ignores everything after `|`, so
 this should preserve the continuous action chunk.
 
+Current v0.6 status, 2026-07-14: LeRobot's public `PI0FastPolicy` action path
+still uses a hand-written loop to `max_decoding_steps=256`; it does not call
+Hugging Face `generate()` with a built-in stop token. The local action-end
+adapter now mirrors LeRobot v0.6 generated-token embedding semantics and was
+validated against the public fixed decode with `max_abs_vs_public=0.0` on a
+same-observation probe. Official `lerobot-eval` on `lerobot/pi0fast-libero`
+with LeRobot `0.6.0` reached `39/40 = 97.5%` on object/spatial/goal/10, one
+episode per task. Corrected serving benchmark:
+`outputs/pi0fast_system_components/pi06_pi0fast_libero_action_end_fixed_task1_steps5.json`
+reports single-request `action_end` at `568.3 ms` per 10-action chunk and
+replicated batch 8 at `91.2 ms/request`.
+
 ## setup
 
 Requires Hugging Face auth with access to `google/paligemma-3b-pt-224`.

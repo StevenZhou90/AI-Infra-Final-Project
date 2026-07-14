@@ -1170,8 +1170,7 @@ class PI0FastTokenLogitAdapter:
                         stats=stats,
                     )
 
-            next_token_emb = self.model.paligemma_with_expert.embed_language_tokens(next_token)
-            next_token_emb = next_token_emb * math.sqrt(next_token_emb.shape[-1])
+            next_token_emb = self._embed_decode_language_tokens(next_token)
             next_token_emb = next_token_emb.to(dtype=prefix_embs.dtype)
             current_pad_mask = torch.cat(
                 [current_pad_mask, torch.ones((bsize, 1), dtype=torch.bool, device=device)],
@@ -1221,8 +1220,7 @@ class PI0FastTokenLogitAdapter:
                         stats=stats,
                     )
 
-                next_token_emb = self.model.paligemma_with_expert.embed_language_tokens(next_token)
-                next_token_emb = next_token_emb * math.sqrt(next_token_emb.shape[-1])
+                next_token_emb = self._embed_decode_language_tokens(next_token)
                 next_token_emb = next_token_emb.to(dtype=prefix_embs.dtype)
                 current_pad_mask = torch.cat(
                     [current_pad_mask, torch.ones((bsize, 1), dtype=torch.bool, device=device)],
@@ -1343,8 +1341,7 @@ class PI0FastTokenLogitAdapter:
                 break
 
             if t < max_decoding_steps - 1:
-                next_token_emb = self.model.paligemma_with_expert.embed_language_tokens(next_token)
-                next_token_emb = next_token_emb * math.sqrt(next_token_emb.shape[-1])
+                next_token_emb = self._embed_decode_language_tokens(next_token)
                 next_token_emb = next_token_emb.to(dtype=prefix_embs.dtype)
                 prefix_embs = torch.cat([prefix_embs, next_token_emb], dim=1)
                 prefix_pad_masks = torch.cat(
@@ -1421,8 +1418,7 @@ class PI0FastTokenLogitAdapter:
             return generated[:, :1], torch.cat(logits_by_step, dim=1), hidden
 
         for t in range(1, max_decoding_steps):
-            next_token_emb = self.model.paligemma_with_expert.embed_language_tokens(next_token)
-            next_token_emb = next_token_emb * math.sqrt(next_token_emb.shape[-1])
+            next_token_emb = self._embed_decode_language_tokens(next_token)
             next_token_emb = next_token_emb.to(dtype=prefix_embs.dtype)
             current_pad_mask = torch.cat(
                 [current_pad_mask, torch.ones((bsize, 1), dtype=torch.bool, device=device)],
@@ -1893,8 +1889,7 @@ class PI0FastTokenLogitAdapter:
             active_indices = active_indices[keep]
 
         for t in range(loop_start, max_decoding_steps):
-            next_token_emb = self.model.paligemma_with_expert.embed_language_tokens(next_token)
-            next_token_emb = next_token_emb * math.sqrt(next_token_emb.shape[-1])
+            next_token_emb = self._embed_decode_language_tokens(next_token)
             next_token_emb = next_token_emb.to(dtype=prefix_embs.dtype)
             active_bsize = int(active_indices.numel())
             current_pad_mask = torch.cat(
@@ -2551,8 +2546,7 @@ class PI0FastTokenLogitAdapter:
             active_indices = active_indices[keep]
 
         for t in range(1, max_decoding_steps):
-            next_token_emb = self.model.paligemma_with_expert.embed_language_tokens(next_token)
-            next_token_emb = next_token_emb * math.sqrt(next_token_emb.shape[-1])
+            next_token_emb = self._embed_decode_language_tokens(next_token)
             next_token_emb = next_token_emb.to(dtype=prefix_embs.dtype)
             active_bsize = int(active_indices.numel())
             current_pad_mask = torch.cat(
@@ -2832,8 +2826,7 @@ class PI0FastTokenLogitAdapter:
             nonlocal current_pad_mask, past_key_values, target_forwards, fallback_forwards, replay_forwards
             logits_by_step.append(logits_for_token)
             generated_tokens.append(int(next_token.item()))
-            next_token_emb = self.model.paligemma_with_expert.embed_language_tokens(next_token)
-            next_token_emb = next_token_emb * math.sqrt(next_token_emb.shape[-1])
+            next_token_emb = self._embed_decode_language_tokens(next_token)
             next_token_emb = next_token_emb.to(dtype=prefix_embs.dtype)
             current_pad_mask = torch.cat(
                 [current_pad_mask, torch.ones((bsize, 1), dtype=torch.bool, device=device)],
@@ -2861,8 +2854,7 @@ class PI0FastTokenLogitAdapter:
 
         def replay_one(next_token: torch.Tensor) -> torch.Tensor:
             nonlocal current_pad_mask, past_key_values, target_forwards, replay_forwards
-            next_token_emb = self.model.paligemma_with_expert.embed_language_tokens(next_token)
-            next_token_emb = next_token_emb * math.sqrt(next_token_emb.shape[-1])
+            next_token_emb = self._embed_decode_language_tokens(next_token)
             next_token_emb = next_token_emb.to(dtype=prefix_embs.dtype)
             current_pad_mask = torch.cat(
                 [current_pad_mask, torch.ones((bsize, 1), dtype=torch.bool, device=device)],
@@ -2893,8 +2885,7 @@ class PI0FastTokenLogitAdapter:
             step_logits = [prev_logits.detach()]
             for token in candidate_tokens[: steps - 1]:
                 token_tensor = torch.tensor([[int(token)]], dtype=torch.long, device=device)
-                token_emb = self.model.paligemma_with_expert.embed_language_tokens(token_tensor)
-                token_emb = token_emb * math.sqrt(token_emb.shape[-1])
+                token_emb = self._embed_decode_language_tokens(token_tensor)
                 token_emb = token_emb.to(dtype=prefix_embs.dtype)
                 diag_pad = torch.cat(
                     [diag_pad, torch.ones((bsize, 1), dtype=torch.bool, device=device)],
@@ -2923,8 +2914,7 @@ class PI0FastTokenLogitAdapter:
             if pending_unprocessed_token is None:
                 raise RuntimeError("No pending token to process")
             token = pending_unprocessed_token
-            token_emb = self.model.paligemma_with_expert.embed_language_tokens(token)
-            token_emb = token_emb * math.sqrt(token_emb.shape[-1])
+            token_emb = self._embed_decode_language_tokens(token)
             token_emb = token_emb.to(dtype=prefix_embs.dtype)
             current_pad_mask = torch.cat(
                 [current_pad_mask, torch.ones((bsize, 1), dtype=torch.bool, device=device)],
@@ -2994,8 +2984,7 @@ class PI0FastTokenLogitAdapter:
             candidate_tensor = torch.tensor(padded_rows, dtype=torch.long, device=device)
             old_mask_len = current_pad_mask.shape[1]
             verify_past_key_values = repeat_kv_batch(past_key_values, batch_candidates)
-            candidate_embs = self.model.paligemma_with_expert.embed_language_tokens(candidate_tensor)
-            candidate_embs = candidate_embs * math.sqrt(candidate_embs.shape[-1])
+            candidate_embs = self._embed_decode_language_tokens(candidate_tensor)
             candidate_embs = candidate_embs.to(dtype=prefix_embs.dtype)
             verify_pad_mask = torch.cat(
                 [
@@ -3484,8 +3473,7 @@ class PI0FastTokenLogitAdapter:
                     verify_pad_mask = full_pad_masks
                 else:
                     verify_past_key_values = clone_kv(past_key_values)
-                    candidate_embs = self.model.paligemma_with_expert.embed_language_tokens(candidate_tensor)
-                    candidate_embs = candidate_embs * math.sqrt(candidate_embs.shape[-1])
+                    candidate_embs = self._embed_decode_language_tokens(candidate_tensor)
                     candidate_embs = candidate_embs.to(dtype=prefix_embs.dtype)
                     verify_pad_mask = torch.cat(
                         [current_pad_mask, torch.ones((bsize, len(candidate)), dtype=torch.bool, device=device)],
@@ -4544,8 +4532,7 @@ class PI0FastTokenLogitAdapter:
             else:
                 verify_past_key_values = clone_kv(past_key_values)
 
-                draft_embs = self.model.paligemma_with_expert.embed_language_tokens(draft_tensor)
-                draft_embs = draft_embs * math.sqrt(draft_embs.shape[-1])
+                draft_embs = self._embed_decode_language_tokens(draft_tensor)
                 draft_embs = draft_embs.to(dtype=prefix_embs.dtype)
                 verify_pad_mask = torch.cat(
                     [current_pad_mask, torch.ones((bsize, len(draft)), dtype=torch.bool, device=device)],
@@ -5199,8 +5186,7 @@ class PI0FastTokenLogitAdapter:
             nonlocal current_pad_mask, past_key_values, target_forwards, fallback_forwards
             logits_by_step.append(logits_for_token)
             generated_tokens.append(int(next_token.item()))
-            next_token_emb = self.model.paligemma_with_expert.embed_language_tokens(next_token)
-            next_token_emb = next_token_emb * math.sqrt(next_token_emb.shape[-1])
+            next_token_emb = self._embed_decode_language_tokens(next_token)
             next_token_emb = next_token_emb.to(dtype=prefix_embs.dtype)
             current_pad_mask = torch.cat(
                 [current_pad_mask, torch.ones((bsize, 1), dtype=torch.bool, device=device)],
@@ -5225,8 +5211,7 @@ class PI0FastTokenLogitAdapter:
 
         def replay_one(next_token: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             nonlocal current_pad_mask, past_key_values, target_forwards, replay_forwards
-            next_token_emb = self.model.paligemma_with_expert.embed_language_tokens(next_token)
-            next_token_emb = next_token_emb * math.sqrt(next_token_emb.shape[-1])
+            next_token_emb = self._embed_decode_language_tokens(next_token)
             next_token_emb = next_token_emb.to(dtype=prefix_embs.dtype)
             current_pad_mask = torch.cat(
                 [current_pad_mask, torch.ones((bsize, 1), dtype=torch.bool, device=device)],
@@ -5369,8 +5354,7 @@ class PI0FastTokenLogitAdapter:
                 verify_pad_mask = full_pad_masks
             else:
                 verify_past_key_values = clone_kv(past_key_values)
-                draft_embs = self.model.paligemma_with_expert.embed_language_tokens(draft_tensor)
-                draft_embs = draft_embs * math.sqrt(draft_embs.shape[-1])
+                draft_embs = self._embed_decode_language_tokens(draft_tensor)
                 draft_embs = draft_embs.to(dtype=prefix_embs.dtype)
                 verify_pad_mask = torch.cat(
                     [current_pad_mask, torch.ones((bsize, len(draft)), dtype=torch.bool, device=device)],
@@ -5557,8 +5541,7 @@ class PI0FastTokenLogitAdapter:
             nonlocal current_pad_mask, past_key_values, target_forwards, fallback_forwards
             logits_by_step.append(logits_for_token)
             generated_tokens.append(int(next_token.item()))
-            next_token_emb = self.model.paligemma_with_expert.embed_language_tokens(next_token)
-            next_token_emb = next_token_emb * math.sqrt(next_token_emb.shape[-1])
+            next_token_emb = self._embed_decode_language_tokens(next_token)
             next_token_emb = next_token_emb.to(dtype=prefix_embs.dtype)
             current_pad_mask = torch.cat(
                 [current_pad_mask, torch.ones((bsize, 1), dtype=torch.bool, device=device)],
@@ -5632,8 +5615,7 @@ class PI0FastTokenLogitAdapter:
             drafted_tokens += len(draft)
             old_mask_len = current_pad_mask.shape[1]
             verify_past_key_values = clone_kv(past_key_values)
-            draft_embs = self.model.paligemma_with_expert.embed_language_tokens(draft_tensor)
-            draft_embs = draft_embs * math.sqrt(draft_embs.shape[-1])
+            draft_embs = self._embed_decode_language_tokens(draft_tensor)
             draft_embs = draft_embs.to(dtype=prefix_embs.dtype)
             verify_pad_mask = torch.cat(
                 [current_pad_mask, torch.ones((bsize, len(draft)), dtype=torch.bool, device=device)],
@@ -5868,8 +5850,7 @@ class PI0FastTokenLogitAdapter:
             nonlocal current_pad_mask, past_key_values, target_forwards, fallback_forwards
             logits_by_step.append(logits_for_token)
             generated_tokens.append(int(next_token.item()))
-            next_token_emb = self.model.paligemma_with_expert.embed_language_tokens(next_token)
-            next_token_emb = next_token_emb * math.sqrt(next_token_emb.shape[-1])
+            next_token_emb = self._embed_decode_language_tokens(next_token)
             next_token_emb = next_token_emb.to(dtype=prefix_embs.dtype)
             current_pad_mask = torch.cat(
                 [current_pad_mask, torch.ones((bsize, 1), dtype=torch.bool, device=device)],
@@ -6097,8 +6078,7 @@ class PI0FastTokenLogitAdapter:
                     verify_pad_mask = full_pad_masks
                 else:
                     verify_past_key_values = clone_kv(past_key_values)
-                    draft_embs = self.model.paligemma_with_expert.embed_language_tokens(draft_tensor)
-                    draft_embs = draft_embs * math.sqrt(draft_embs.shape[-1])
+                    draft_embs = self._embed_decode_language_tokens(draft_tensor)
                     draft_embs = draft_embs.to(dtype=prefix_embs.dtype)
                     verify_pad_mask = torch.cat(
                         [current_pad_mask, torch.ones((bsize, len(candidate)), dtype=torch.bool, device=device)],
@@ -6456,8 +6436,7 @@ class PI0FastTokenLogitAdapter:
                 verify_pad_mask = full_pad_masks
             else:
                 verify_past_key_values = clone_kv(past_key_values)
-                draft_embs = self.model.paligemma_with_expert.embed_language_tokens(draft_tensor)
-                draft_embs = draft_embs * math.sqrt(draft_embs.shape[-1])
+                draft_embs = self._embed_decode_language_tokens(draft_tensor)
                 draft_embs = draft_embs.to(dtype=prefix_embs.dtype)
                 verify_pad_mask = torch.cat(
                     [current_pad_mask, torch.ones((bsize, len(candidate)), dtype=torch.bool, device=device)],
@@ -6745,6 +6724,22 @@ class PI0FastTokenLogitAdapter:
             use_cache=use_cache,
             adarms_cond=[None, None],
         )
+
+    def _scale_decode_token_embeddings(self) -> bool:
+        value = getattr(self, "_scale_decode_token_embeddings_cache", None)
+        if value is None:
+            # LeRobot v0.6 PI0-FAST decodes generated tokens without the Gemma
+            # sqrt(hidden_dim) embedding scale. Keep scaling opt-in for older
+            # experimental configs, but default to matching upstream.
+            value = bool(getattr(self.policy.config, "scale_decode_token_embeddings", False))
+            self._scale_decode_token_embeddings_cache = value
+        return bool(value)
+
+    def _embed_decode_language_tokens(self, token_ids: torch.Tensor) -> torch.Tensor:
+        token_embs = self.model.paligemma_with_expert.embed_language_tokens(token_ids)
+        if self._scale_decode_token_embeddings():
+            token_embs = token_embs * math.sqrt(token_embs.shape[-1])
+        return token_embs
 
     @staticmethod
     def _select_next_token(logits: torch.Tensor, temperature: float) -> torch.Tensor:

@@ -7,6 +7,7 @@ from serving.pi0fast_serving_runtime import (
     RealPI0FastActionEndBatchBackend,
     deadline_ns_from_period,
 )
+from serving.pi0fast_token_hooks import PI0FastTokenLogitAdapter
 
 
 def make_request(
@@ -86,3 +87,47 @@ def test_real_pi0fast_action_end_backend_uses_token_adapter() -> None:
     assert results[0].accelerator == "real_pi0fast_action_end_batch"
     assert results[0].extra["decode_path"] == "action_end"
     assert results[0].extra["stopped_on_action_end"] == 1.0
+
+
+def test_pi0fast_decode_embedding_scale_defaults_to_lerobot_v06_behavior() -> None:
+    class FakeEmbedder:
+        def embed_language_tokens(self, token_ids):
+            return torch.ones((*token_ids.shape, 4), dtype=torch.float32)
+
+    class FakeModel:
+        paligemma_with_expert = FakeEmbedder()
+
+    class FakeConfig:
+        pass
+
+    class FakePolicy:
+        config = FakeConfig()
+        model = FakeModel()
+
+    adapter = PI0FastTokenLogitAdapter(FakePolicy())
+    tokens = torch.tensor([[1, 2]], dtype=torch.long)
+
+    assert adapter._scale_decode_token_embeddings() is False
+    assert torch.equal(adapter._embed_decode_language_tokens(tokens), torch.ones((1, 2, 4)))
+
+
+def test_pi0fast_decode_embedding_scale_can_be_enabled_for_legacy_configs() -> None:
+    class FakeEmbedder:
+        def embed_language_tokens(self, token_ids):
+            return torch.ones((*token_ids.shape, 4), dtype=torch.float32)
+
+    class FakeModel:
+        paligemma_with_expert = FakeEmbedder()
+
+    class FakeConfig:
+        scale_decode_token_embeddings = True
+
+    class FakePolicy:
+        config = FakeConfig()
+        model = FakeModel()
+
+    adapter = PI0FastTokenLogitAdapter(FakePolicy())
+    tokens = torch.tensor([[1]], dtype=torch.long)
+
+    assert adapter._scale_decode_token_embeddings() is True
+    assert torch.equal(adapter._embed_decode_language_tokens(tokens), torch.full((1, 1, 4), 2.0))

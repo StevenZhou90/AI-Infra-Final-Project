@@ -72,10 +72,24 @@ Legacy 90-episode LIBERO target-eos equivalence result:
 | Fixed-budget PI0-FAST | `81/90` | `634.3` | `1.00x` | - |
 | Target-EOS early stop | `81/90` | `259.5` | `2.44x` | `0.0%` |
 
-Those rows are useful for the zero-drop early-stop claim, but the current HF
-accuracy reproduction should be anchored on the carded v044 checkpoint below.
+Those rows are useful for the zero-drop early-stop claim, but they are not the
+current Hugging Face reproduction.
 
-Current HF-carded v044 sanity checks:
+Current HF v0.6.0 sanity check:
+
+| Path | Task slice | Success | Avg episode time | Notes |
+| --- | --- | ---: | ---: | --- |
+| Official `lerobot-eval`, `.venv-pi06`, `lerobot/pi0fast-libero` | HF task list: object/spatial/goal/10, 1 episode each | `39/40` | `110.0 s/episode` | Fixed 256-token public decode, `97.5%`, no camera `rename_map` |
+| Official `lerobot-eval`, `.venv-pi06`, `lerobot/pi0fast-libero` | `libero_object`, task 0, 1 episode | `1/1` | - | Probe row before the full run |
+
+The v0.6 run uses the current `lerobot/pi0fast-libero` checkpoint with LeRobot
+`0.6.0`, `policy.max_action_tokens=256`, bf16 on CUDA, and the default LIBERO
+camera keys expected by that checkpoint. Per-suite success was object `10/10`,
+spatial `9/10`, goal `10/10`, and `libero_10` `10/10`; the only failed task was
+`libero_spatial_5`. Artifact:
+`outputs/eval/2026-07-14/03-10-08_pi06_pi0fast_libero_full40/eval_info.json`.
+
+Historical v044/v0.4.4 sanity checks:
 
 | Path | Task slice | Success | Avg ms/step | Notes |
 | --- | --- | ---: | ---: | --- |
@@ -108,18 +122,12 @@ not the old `7/120` failure mode. It was a fixed 256-token decode run, so the
 remaining accuracy gap is not caused by action-end early stopping. Artifact:
 `outputs/eval/2026-07-14/00-35-17_libero_pi0_fast/eval_info.json`.
 
-Follow-up HF/cache check: current HF docs are for LeRobot main/v0.6.0, while
-this environment uses LeRobot v0.4.4. The current `lerobot/pi0fast-libero`
-snapshot is not a drop-in replacement for the v044 card here: its config
-expects `observation.images.image` and `observation.images.image2`, so the docs
-`rename_map` fails with missing image features. Without the rename map, this
-install failed early `libero_object` probes. Re-running the v044 carded
-checkpoint on `libero_object_0` with the required camera `rename_map` failed
-again (`0/1`), artifact
-`outputs/eval/2026-07-14/02-46-06_v044_object0_rerun/eval_info.json`. Treat
-the remaining `75.0%` versus `82.5%` delta as a LeRobot/LIBERO version or
-protocol reproduction gap pending a v0.6.0-stack rerun, not as a token-stopping
-accuracy regression.
+Follow-up HF/cache check: the v0.6 rerun resolved the apparent high-level
+accuracy gap. The old `7/120` row was not an out-of-the-box HF baseline. It was
+a historical custom strict run on a different stack/protocol. The current
+`lerobot/pi0fast-libero` checkpoint is also not a drop-in replacement for the
+v044 runner: it expects default LIBERO camera keys, while v044 expects
+`base_0_rgb` and `left_wrist_0_rgb` via `rename_map`.
 
 The local 30-row v044 smoke is still within the same broad regime, and the
 extended 120-row custom run lands at `93/120 = 77.5%`: object `38/40`, spatial
@@ -140,20 +148,27 @@ actions. It uses a hand-written loop in `sample_actions_fast` /
 then detokenizes. Action-end stopping is therefore a real latency optimization
 for this policy path, not a generic built-in EOS option that was already active.
 
-Current v044 non-quantized serving-component result:
+Current v0.6 non-quantized serving-component result after fixing the adapter to
+match LeRobot v0.6 token embedding semantics:
 
 | Path | Chunk mean | Per request | Per action | Notes |
 | --- | ---: | ---: | ---: | --- |
-| Single `target_eos` request | `605.1 ms` | `605.1 ms` | `60.5 ms` | 10 actions/request |
-| Replicated batch 8 `target_eos` | `788.6 ms` | `98.6 ms` | `9.9 ms` | 6.14x throughput speedup |
+| Public fixed decode probe | `4557.2 ms` | `4557.2 ms` | `455.7 ms` | LeRobot public path, 256 FAST tokens |
+| Single `action_end` request | `568.3 ms` | `568.3 ms` | `56.8 ms` | Mean `29.8` FAST tokens, actions match public decode |
+| Replicated batch 8 `action_end` | `729.7 ms` | `91.2 ms` | `9.1 ms` | 6.23x throughput speedup, meets 100 ms/request by batching |
 
 This is model-serving time, not full LIBERO rollout wall time. Full simulator
 rollout rows still include OSMesa/LIBERO stepping and image observation
-formatting overhead.
+formatting overhead. The fixed public decode probe and corrected action-end
+probe on the same observation matched exactly (`max_abs_vs_public=0.0`) while
+reducing token generation from 256 tokens to 32 tokens on that row; aggregate
+benchmark artifact:
+`outputs/pi0fast_system_components/pi06_pi0fast_libero_action_end_fixed_task1_steps5.json`.
 
-Historical strict 120-row artifact from the uncarded `lerobot/pi0fast-libero`
-checkpoint. The 120 rows are `libero_object`, `libero_spatial`, and
-`libero_goal`, 10 task ids each, 4 episode/init-state ids each:
+Historical strict 120-row artifact from an older custom
+`lerobot/pi0fast-libero` stack/protocol. The 120 rows are `libero_object`,
+`libero_spatial`, and `libero_goal`, 10 task ids each, 4 episode/init-state ids
+each:
 
 | Decoder | Success | Avg ms/step | Speedup | Drop |
 | --- | ---: | ---: | ---: | ---: |
