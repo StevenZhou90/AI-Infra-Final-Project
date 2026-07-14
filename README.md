@@ -108,6 +108,19 @@ not the old `7/120` failure mode. It was a fixed 256-token decode run, so the
 remaining accuracy gap is not caused by action-end early stopping. Artifact:
 `outputs/eval/2026-07-14/00-35-17_libero_pi0_fast/eval_info.json`.
 
+Follow-up HF/cache check: current HF docs are for LeRobot main/v0.6.0, while
+this environment uses LeRobot v0.4.4. The current `lerobot/pi0fast-libero`
+snapshot is not a drop-in replacement for the v044 card here: its config
+expects `observation.images.image` and `observation.images.image2`, so the docs
+`rename_map` fails with missing image features. Without the rename map, this
+install failed early `libero_object` probes. Re-running the v044 carded
+checkpoint on `libero_object_0` with the required camera `rename_map` failed
+again (`0/1`), artifact
+`outputs/eval/2026-07-14/02-46-06_v044_object0_rerun/eval_info.json`. Treat
+the remaining `75.0%` versus `82.5%` delta as a LeRobot/LIBERO version or
+protocol reproduction gap pending a v0.6.0-stack rerun, not as a token-stopping
+accuracy regression.
+
 The local 30-row v044 smoke is still within the same broad regime, and the
 extended 120-row custom run lands at `93/120 = 77.5%`: object `38/40`, spatial
 `31/40`, goal `24/40`. Exact validation on representative failed goal rows
