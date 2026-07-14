@@ -12,6 +12,7 @@ import argparse
 import json
 import logging
 import os
+import random
 import re
 import sys
 import time
@@ -54,6 +55,10 @@ logger = logging.getLogger("run_pi0fast_chunk_eval")
 
 PI0FAST_DEFAULT_POLICY = "lerobot/pi0fast-libero-v044"
 PI05_DEFAULT_POLICY = "lerobot/pi05_libero_finetuned_v044"
+DEFAULT_LIBERO_RENAME_MAP = {
+    "observation.images.image": "observation.images.base_0_rgb",
+    "observation.images.image2": "observation.images.left_wrist_0_rgb",
+}
 
 RISK_GATE_CLAUSE_KEYS = {
     "min_checkpoint",
@@ -282,6 +287,23 @@ def _extract_success(info: dict[str, Any]) -> bool:
         if key in info:
             return bool(np.asarray(info[key]).any())
     return False
+
+
+def _parse_rename_map(raw: str | None) -> dict[str, str]:
+    if raw is None or raw.strip().lower() in {"", "none", "null", "{}"}:
+        return {}
+    value = json.loads(raw)
+    if not isinstance(value, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in value.items()):
+        raise ValueError("--rename-map must be a JSON object mapping source observation keys to target keys")
+    return value
+
+
+def _set_global_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def _call_task(env) -> list[str]:
@@ -3104,6 +3126,14 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Use LIBERO's packaged init states; pass --no-init-states to match LeRobot's env.init_states=false eval.",
     )
+    parser.add_argument(
+        "--rename-map",
+        default=json.dumps(DEFAULT_LIBERO_RENAME_MAP),
+        help=(
+            "JSON observation-key rename map passed to LeRobot's rename_observations_processor. "
+            "Use 'none' to disable. Defaults to the v044 LIBERO camera map used by lerobot-eval."
+        ),
+    )
     parser.add_argument("--default-window", type=int, default=3)
     parser.add_argument("--smooth-window", type=int, default=5)
     parser.add_argument("--max-window", type=int, default=6)
@@ -3783,6 +3813,7 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     _ensure_libero_config(args.libero_config_path)
     make_env, make_env_pre_post_processors, preprocess_observation, LiberoEnv, make_pre_post_processors, PI0FastPolicy = _import_lerobot()
+    from lerobot.configs.policies import PreTrainedConfig
     if args.policy is None:
         args.policy = PI05_DEFAULT_POLICY if args.policy_kind == "pi05" else PI0FAST_DEFAULT_POLICY
     modes = [m.strip() for m in args.modes.split(",") if m.strip()]
@@ -3822,6 +3853,8 @@ def main() -> None:
     if any(ep < 0 or ep >= args.episodes for ep in selected_episode_ids):
         raise ValueError("--episode-ids entries must be in [0, --episodes)")
 
+    _set_global_seed(args.seed)
+
     env_kwargs = {"task": args.task, "control_mode": args.control_mode, "init_states": args.init_states}
     if selected_task_ids is not None:
         env_kwargs["task_ids"] = selected_task_ids
@@ -3837,17 +3870,30 @@ def main() -> None:
             torch.compile = _identity_torch_compile
     else:
         PolicyClass = PI0FastPolicy
-    policy = PolicyClass.from_pretrained(args.policy).to(device=device, dtype=dtype).eval()
+    policy_config = PreTrainedConfig.from_pretrained(args.policy)
+    if hasattr(policy_config, "device"):
+        policy_config.device = str(device)
+    if hasattr(policy_config, "dtype"):
+        policy_config.dtype = args.dtype
+    if args.disable_gradient_checkpointing and hasattr(policy_config, "gradient_checkpointing"):
+        policy_config.gradient_checkpointing = False
+    if args.num_inference_steps is not None and hasattr(policy_config, "num_inference_steps"):
+        policy_config.num_inference_steps = int(args.num_inference_steps)
+    policy = PolicyClass.from_pretrained(args.policy, config=policy_config).to(device=device, dtype=dtype).eval()
     if args.disable_gradient_checkpointing and hasattr(policy.model, "gradient_checkpointing_disable"):
         policy.model.gradient_checkpointing_disable()
         policy.eval()
     if args.num_inference_steps is not None and hasattr(policy.config, "num_inference_steps"):
         policy.config.num_inference_steps = int(args.num_inference_steps)
     token_adapter = PI0FastTokenLogitAdapter(policy) if args.enable_fast_token_hooks else None
+    rename_map = _parse_rename_map(args.rename_map)
+    preprocessor_overrides = {"device_processor": {"device": str(device)}}
+    if rename_map:
+        preprocessor_overrides["rename_observations_processor"] = {"rename_map": rename_map}
     policy_preprocessor, policy_postprocessor = make_pre_post_processors(
         policy.config,
         args.policy,
-        preprocessor_overrides={"device_processor": {"device": str(device)}},
+        preprocessor_overrides=preprocessor_overrides,
     )
     env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=env_cfg, policy_cfg=policy.config)
     env_map = make_env(env_cfg, n_envs=1, use_async_envs=False)
@@ -4421,6 +4467,7 @@ def main() -> None:
         "task_ids": task_ids,
         "init_states": args.init_states,
         "control_mode": args.control_mode,
+        "rename_map": rename_map,
         "episode_ids": selected_episode_ids,
         "summary_baseline_mode": args.summary_baseline_mode,
         "token_trace_output_dir": None

@@ -93,6 +93,8 @@ Current HF-carded v044 sanity checks:
 | Custom runner `target_eos`, absolute control | `libero_goal`, task 0, episode 0 | `0/1` | `222.0` | Negative protocol check |
 | Official `lerobot-eval`, `env.init_states=false`, seed 1000 | `libero_goal`, task 0, episode 0 | `1/1` | `95.7 s/episode` | HF-style random-state eval recovers this weak row |
 | Custom runner `target_eos`, `--no-init-states --seed 1000` | `libero_goal`, task 0, episode 0 | `1/1` | `271.2` | Same row succeeds with action-end stopping |
+| Official `lerobot-eval`, `env.init_states=false`, seed 1000 | `libero_object`, task 0, episode 0 | `1/1` | `91.1 s/episode` | Official fixed-budget row succeeds |
+| Custom runner baseline, `--no-init-states --seed 1000` | `libero_object`, task 0, episode 0 | `0/1` | `559.2` | Sentinel mismatch; custom rollout SR is not the HF-card authority |
 
 The HF model card for `lerobot/pi0fast-libero-v044` reports `82.5%` LIBERO SR.
 The local 30-row v044 smoke is within that regime, and the extended 120-row
@@ -107,6 +109,12 @@ weak row was LeRobot's HF-style random-state eval: `env.init_states=false` with
 seed 1000 succeeds in both the official fixed-budget eval and the custom
 `target_eos` runner. The lower `93/120` row should therefore be read as a fixed
 LIBERO-init-state stress test, not as a reproduction of the HF card protocol.
+After adding the official camera `rename_map`, global seeding, and config-first
+policy load to the custom runner, one sentinel row still diverges: official
+`lerobot-eval` succeeds on `libero_object` task 0 seed 1000 while the custom
+baseline loop does not. Treat official `lerobot-eval` as the accuracy authority;
+use the custom runner for token-level latency/equivalence experiments until that
+rollout mismatch is fully reconciled.
 
 LeRobot's PI0-FAST action path does not call Hugging Face `generate()` for
 actions. It uses a hand-written loop in `sample_actions_fast` /
