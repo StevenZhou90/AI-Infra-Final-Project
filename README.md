@@ -155,8 +155,8 @@ FAST/text candidate head:
 | Path | Chunk mean | Per request | Per action | Notes |
 | --- | ---: | ---: | ---: | --- |
 | Public fixed decode probe | `4557.2 ms` | `4557.2 ms` | `455.7 ms` | LeRobot public path, 256 FAST tokens |
-| Single constrained `action_end` request | `554.5 ms` | `554.5 ms` | `55.4 ms` | Mean `29.8` FAST tokens, actions match public decode |
-| Replicated batch 8 constrained `action_end` | `717.5 ms` | `89.7 ms` | `9.0 ms` | 6.18x throughput speedup, meets 100 ms/request by batching |
+| Single constrained `action_end` request | `507.7 ms` | `507.7 ms` | `50.8 ms` | Mean `28.0` FAST tokens, actions match public decode |
+| Replicated batch 8 constrained `action_end` | `717.5 ms` | `89.7 ms` | `9.0 ms` | 6.18x throughput speedup; throughput-only, not single isolated-request latency |
 
 This is model-serving time, not full LIBERO rollout wall time. Full simulator
 rollout rows still include OSMesa/LIBERO stepping and image observation
@@ -165,6 +165,22 @@ probe on the same observation matched exactly (`max_abs_vs_public=0.0`) while
 reducing token generation from 256 tokens to 32 tokens on that row; aggregate
 benchmark artifact:
 `outputs/pi0fast_system_components/pi06_pi0fast_libero_action_end_constrained_task1_steps5.json`.
+
+Follow-up exact single-request probes on the current v0.6 stack:
+
+| Probe | Mean | Result |
+| --- | ---: | --- |
+| OSMesa real LIBERO constrained `action_end`, 3 measured steps | `507.7 ms` | Exact stop-token path, artifact `outputs/pi0fast_system_components/pi06_pi0fast_libero_action_end_constrained_task1_osmesa_steps3_warm1.json` |
+| OSMesa real LIBERO constrained char-stop, 3 measured steps | `513.7 ms` | Local FAST-character early stop did not reduce token count enough; artifact `outputs/pi0fast_system_components/pi06_pi0fast_libero_action_end_charstop_constrained_task1_osmesa_steps3_warm1.json` |
+| Synthetic no-env constrained `action_end`, SDPA | `464.0 ms` | No simulator/preprocess overhead, mean `23` FAST tokens, artifact `outputs/pi0fast_system_components/pi06_pi0fast_synthetic_default_noprofile_cap64_step5.json` |
+| `torch.compile` language-model forward, same real observations | `252.8 ms` | About `2.1x` faster but not exact: `1/3` token-equal, max action diff `0.533`; artifact `outputs/pi0fast_system_components/pi06_pi0fast_libero_compile_compare_task1_osmesa_steps3.json` |
+| `torch.compile` with margin recording, same real observations | `276.5 ms` | Not safely gateable by top-2 margin: `3/8` token-equal, max action diff `0.937`; artifact `outputs/pi0fast_system_components/pi06_pi0fast_libero_compile_compare_margin_task1_osmesa_steps8.json` |
+
+The current non-quantized exact single-request path therefore does not meet a
+100 ms isolated-request target. Public and local evidence point to model/runtime
+changes for that target: flow-action distillation such as SnapFlow for PI0.5,
+approximate FAST/DCT early decoding with a new success-rate validation, or a
+custom FP8/CUDA-graph runtime rather than stock PyTorch exact decoding.
 
 Historical strict 120-row artifact from an older custom
 `lerobot/pi0fast-libero` stack/protocol. The 120 rows are `libero_object`,

@@ -30,6 +30,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from lerobot.configs.policies import PreTrainedConfig  # noqa: E402
 from scripts.run_pi0fast_chunk_eval import (  # noqa: E402
     _ensure_libero_config,
     _env_step,
@@ -87,6 +88,29 @@ def parse_args() -> argparse.Namespace:
         help="Include tokens within this radius of the action-end token in constrained action_end decode.",
     )
     parser.add_argument(
+        "--action-end-stop-on-action-chars",
+        action="store_true",
+        help="Stop action_end decode once enough decoded FAST action characters have been emitted.",
+    )
+    parser.add_argument(
+        "--action-end-action-char-min-chars",
+        type=int,
+        default=-1,
+        help="Minimum decoded FAST-character count before char-stop plateau logic may stop; negative uses the full action target.",
+    )
+    parser.add_argument("--action-end-action-char-plateau-tokens", type=int, default=0)
+    parser.add_argument("--action-end-action-char-stable-checks", type=int, default=0)
+    parser.add_argument("--action-end-action-char-stable-tolerance", type=float, default=0.0)
+    parser.add_argument("--action-end-action-char-stable-max-chars", type=int, default=0)
+    parser.add_argument("--action-end-action-char-plateau-reject-eos-restart", action="store_true")
+    parser.add_argument("--action-end-action-char-restart-continue", action="store_true")
+    parser.add_argument("--action-end-action-char-restart-reset", action="store_true")
+    parser.add_argument("--action-end-action-char-restart-reset-low-text-tokens", type=int, default=0)
+    parser.add_argument("--action-end-action-char-plateau-low-text-tail-tokens", type=int, default=0)
+    parser.add_argument("--action-end-action-char-strict-target-stop", action="store_true")
+    parser.add_argument("--action-end-action-char-reset-requires-action-end", action="store_true")
+    parser.add_argument("--action-end-action-char-target-confirm-tokens", type=int, default=0)
+    parser.add_argument(
         "--max-decoding-steps",
         default="default",
         help="Comma-separated max_decoding_steps values to test, or 'default'. This is a plain decode cap, not speculative decoding.",
@@ -112,6 +136,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
+    parser.add_argument(
+        "--disable-gradient-checkpointing",
+        action="store_true",
+        help="Disable gradient checkpointing in the policy config and loaded model for serving-style latency.",
+    )
+    parser.add_argument(
+        "--attn-implementation",
+        choices=["default", "eager", "sdpa", "flash_attention_2"],
+        default="default",
+        help="Override the PI0-FAST language model attention implementation for serving benchmarks.",
+    )
+    parser.add_argument(
+        "--decode-attn-implementation",
+        choices=["default", "eager", "sdpa", "flash_attention_2"],
+        default="default",
+        help="For constrained action_end, optionally switch only one-token decode forwards to this attention backend after SDPA prefill.",
+    )
+    parser.add_argument(
+        "--compile-language-model-forward",
+        action="store_true",
+        help="Experimental: torch.compile the PI0-FAST language model forward method after loading; validate token exactness separately.",
+    )
+    parser.add_argument("--compile-mode", default="reduce-overhead")
+    parser.add_argument(
+        "--action-end-profile",
+        action="store_true",
+        help="Record synchronized internal timings for the action_end constrained decode path.",
+    )
     parser.add_argument("--target-latency-ms", type=float, default=250.0)
     parser.add_argument("--libero-config-path", default=os.environ.get("LIBERO_CONFIG_PATH"))
     parser.add_argument("--output", type=Path, default=Path("outputs/pi0fast_system_components/summary.json"))
@@ -123,6 +175,23 @@ def parse_args() -> argparse.Namespace:
             else "lerobot/pi0fast-libero-v044"
         )
     return args
+
+
+def load_dotenv_token() -> None:
+    env_path = Path(".env")
+    if not env_path.exists():
+        return
+    for raw_line in env_path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key in {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_HUB_TOKEN"} and value:
+            os.environ.setdefault("HF_TOKEN", value)
+            os.environ.setdefault("HUGGING_FACE_HUB_TOKEN", value)
+            os.environ.setdefault("HUGGINGFACE_HUB_TOKEN", value)
 
 
 def sync_if_cuda(device: torch.device) -> None:
@@ -217,6 +286,30 @@ def set_kv_mode(policy, mode: str) -> bool | None:
     return desired
 
 
+def pi0fast_language_model(policy):
+    try:
+        return policy.model.paligemma_with_expert.paligemma.model.language_model
+    except AttributeError:
+        return None
+
+
+def set_pi0fast_attn_implementation(policy, implementation: str) -> str | None:
+    language_model = pi0fast_language_model(policy)
+    if language_model is None or not hasattr(language_model, "config"):
+        return None
+    if implementation != "default":
+        language_model.config._attn_implementation = implementation
+    return getattr(language_model.config, "_attn_implementation", None)
+
+
+def compile_pi0fast_language_model_forward(policy, mode: str) -> bool:
+    language_model = pi0fast_language_model(policy)
+    if language_model is None:
+        return False
+    language_model.forward = torch.compile(language_model.forward, mode=mode)
+    return True
+
+
 def summarize(values: list[float]) -> dict[str, float]:
     if not values:
         return {"mean_ms": 0.0, "p50_ms": 0.0, "p95_ms": 0.0}
@@ -293,10 +386,10 @@ def pi0fast_recommendation(rows: list[dict[str, Any]], target_latency_ms: float)
         if row.get("decode_path") != "action_end" or row.get("errors"):
             continue
         single = row.get("single_inference", {})
-        if single.get("per_action_mean_ms", float("inf")) <= target_latency_ms:
+        if single.get("mean_ms", float("inf")) <= target_latency_ms:
             candidates.append(
                 {
-                    "path": "single_amortized",
+                    "path": "single_request",
                     "batch_size": 1,
                     "chunk_mean_ms": single.get("mean_ms", 0.0),
                     "per_request_mean_ms": single.get("mean_ms", 0.0),
@@ -304,21 +397,9 @@ def pi0fast_recommendation(rows: list[dict[str, Any]], target_latency_ms: float)
                     "actions_per_request": row.get("actions_per_request", 1),
                 }
             )
-        for raw_batch_size, stats in row.get("batch_inference", {}).items():
-            if stats.get("per_action_mean_ms", float("inf")) <= target_latency_ms:
-                candidates.append(
-                    {
-                        "path": "batched_amortized",
-                        "batch_size": int(raw_batch_size),
-                        "chunk_mean_ms": stats.get("mean_ms", 0.0),
-                        "per_request_mean_ms": stats.get("per_request_mean_ms", 0.0),
-                        "per_action_mean_ms": stats.get("per_action_mean_ms", 0.0),
-                        "actions_per_request": row.get("actions_per_request", 1),
-                    }
-                )
     if not candidates:
         return None
-    best = min(candidates, key=lambda item: (item["per_action_mean_ms"], item["per_request_mean_ms"]))
+    best = min(candidates, key=lambda item: item["per_request_mean_ms"])
     return {**best, "target_latency_ms": float(target_latency_ms), "meets_target": True}
 
 
@@ -343,14 +424,18 @@ def predict_chunk(
             trace = token_adapter.predict_action_chunk_action_end(batch, **(action_end_kwargs or {}))
             row_counts = (trace.stats or {}).get("row_token_counts")
             if row_counts:
-                return trace.actions, {"row_counts": [float(value) for value in row_counts]}
-            return trace.actions, {"row_counts": [float(trace.token_count)]}
+                return trace.actions, {
+                    "row_counts": [float(value) for value in row_counts],
+                    "stats": trace.stats or {},
+                }
+            return trace.actions, {"row_counts": [float(trace.token_count)], "stats": trace.stats or {}}
         raw = policy.predict_action_chunk(batch) if hasattr(policy, "predict_action_chunk") else policy.select_action(batch)
     return raw, None
 
 
 def main() -> None:
     args = parse_args()
+    load_dotenv_token()
     _ensure_libero_config(args.libero_config_path)
     (
         make_env,
@@ -368,16 +453,49 @@ def main() -> None:
     kv_modes = parse_csv_strings(args.kv_modes)
 
     load_start = time.perf_counter()
-    policy = PolicyClass.from_pretrained(args.policy).to(device=device, dtype=dtype).eval()
+    policy_config = PreTrainedConfig.from_pretrained(args.policy)
+    if hasattr(policy_config, "device"):
+        policy_config.device = str(device)
+    if hasattr(policy_config, "dtype"):
+        policy_config.dtype = args.dtype
+    if args.disable_gradient_checkpointing and hasattr(policy_config, "gradient_checkpointing"):
+        policy_config.gradient_checkpointing = False
+    policy = PolicyClass.from_pretrained(args.policy, config=policy_config).to(device=device, dtype=dtype).eval()
+    if args.disable_gradient_checkpointing and hasattr(policy.model, "gradient_checkpointing_disable"):
+        policy.model.gradient_checkpointing_disable()
+        policy.eval()
     token_adapter = PI0FastTokenLogitAdapter(policy) if args.decode_path == "action_end" else None
+    if token_adapter is not None:
+        token_adapter._profile_action_end_decode = bool(args.action_end_profile)
+    active_attn_implementation = set_pi0fast_attn_implementation(policy, args.attn_implementation)
+    compiled_language_model_forward = False
+    if args.compile_language_model_forward:
+        compiled_language_model_forward = compile_pi0fast_language_model_forward(policy, args.compile_mode)
     action_end_kwargs: dict[str, Any] = {}
-    if args.decode_path == "action_end" and args.action_end_constrained_vocab:
+    if args.decode_path == "action_end":
         action_end_kwargs = {
-            "constrained_action_vocab": True,
+            "constrained_action_vocab": bool(args.action_end_constrained_vocab),
             "constrained_action_vocab_size": args.action_end_constrained_action_vocab_size,
             "constrained_text_vocab_size": args.action_end_constrained_text_vocab_size,
             "constrained_full_head_margin": args.action_end_constrained_full_head_margin,
             "constrained_structural_token_radius": args.action_end_constrained_structural_token_radius,
+            "decode_attn_implementation": args.decode_attn_implementation,
+            "stop_on_action_chars": bool(args.action_end_stop_on_action_chars),
+            "action_char_min_chars": (
+                None if args.action_end_action_char_min_chars < 0 else args.action_end_action_char_min_chars
+            ),
+            "action_char_plateau_tokens": args.action_end_action_char_plateau_tokens,
+            "action_char_stable_checks": args.action_end_action_char_stable_checks,
+            "action_char_stable_tolerance": args.action_end_action_char_stable_tolerance,
+            "action_char_stable_max_chars": args.action_end_action_char_stable_max_chars,
+            "action_char_plateau_reject_eos_restart": args.action_end_action_char_plateau_reject_eos_restart,
+            "action_char_restart_continue": args.action_end_action_char_restart_continue,
+            "action_char_restart_reset": args.action_end_action_char_restart_reset,
+            "action_char_restart_reset_low_text_tokens": args.action_end_action_char_restart_reset_low_text_tokens,
+            "action_char_plateau_low_text_tail_tokens": args.action_end_action_char_plateau_low_text_tail_tokens,
+            "action_char_strict_target_stop": args.action_end_action_char_strict_target_stop,
+            "action_char_reset_requires_action_end": args.action_end_action_char_reset_requires_action_end,
+            "action_char_target_confirm_tokens": args.action_end_action_char_target_confirm_tokens,
         }
     actions_per_request = policy_action_horizon(policy)
     sync_if_cuda(device)
@@ -403,6 +521,13 @@ def main() -> None:
         "policy_use_kv_cache_initial": getattr(policy.config, "use_kv_cache", None),
         "policy_max_decoding_steps_initial": getattr(policy.config, "max_decoding_steps", None),
         "policy_num_inference_steps_initial": getattr(policy.config, "num_inference_steps", None),
+        "policy_gradient_checkpointing_initial": getattr(policy.config, "gradient_checkpointing", None),
+        "disable_gradient_checkpointing": bool(args.disable_gradient_checkpointing),
+        "language_model_attn_implementation": active_attn_implementation,
+        "compile_language_model_forward": bool(args.compile_language_model_forward),
+        "compiled_language_model_forward": bool(compiled_language_model_forward),
+        "compile_mode": args.compile_mode,
+        "action_end_profile": bool(args.action_end_profile),
         "actions_per_request": actions_per_request,
         "recommendation": None,
         "rows": rows,
@@ -450,6 +575,7 @@ def main() -> None:
                     preprocess_ms: list[float] = []
                     single_ms: list[float] = []
                     single_token_counts: list[float] = []
+                    action_end_stats: list[dict[str, Any]] = []
                     postprocess_ms: list[float] = []
                     batch_ms: dict[int, list[float]] = {size: [] for size in batch_sizes if size > 1}
                     batch_token_counts: dict[int, list[float]] = {size: [] for size in batch_sizes if size > 1}
@@ -483,6 +609,8 @@ def main() -> None:
                         )
                         single_ms.append(infer_ms)
                         extend_token_counts(single_token_counts, token_info)
+                        if token_info and isinstance(token_info.get("stats"), dict):
+                            action_end_stats.append(token_info["stats"])
 
                         processed, post_ms = timed_ms(device, lambda: policy_postprocessor(raw_action))
                         postprocess_ms.append(post_ms)
@@ -543,6 +671,7 @@ def main() -> None:
                             single_token_counts,
                             args.action_token_warn_threshold,
                         ),
+                        "action_end_stats": action_end_stats,
                         "postprocess": summarize(postprocess_ms),
                         "batch_inference": {},
                         "batch_source": args.batch_source,

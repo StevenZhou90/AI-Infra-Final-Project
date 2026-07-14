@@ -10,6 +10,7 @@ draft/verify checks without vendoring or forking LeRobot.
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -167,7 +168,22 @@ class PI0FastTokenLogitAdapter:
                 early_stop_action_end=early_stop_action_end,
             )
 
-        actions = self._detokenize_generated_actions(token_ids)
+        if bool(getattr(self, "_profile_action_end_decode", False)):
+            device = token_ids.device
+            if device.type == "cuda" and torch.cuda.is_available():
+                torch.cuda.synchronize(device)
+            profile_start = time.perf_counter()
+            actions = self._detokenize_generated_actions(token_ids)
+            if device.type == "cuda" and torch.cuda.is_available():
+                torch.cuda.synchronize(device)
+            profile = getattr(self, "_last_action_end_profile", None)
+            if isinstance(profile, dict):
+                segments = profile.setdefault("segments_ms", {})
+                segments["detokenize"] = float((time.perf_counter() - profile_start) * 1000.0)
+                counts = profile.setdefault("counts", {})
+                counts["detokenize"] = int(counts.get("detokenize", 0)) + 1
+        else:
+            actions = self._detokenize_generated_actions(token_ids)
         return PI0FastGenerationTrace(
             actions=actions,
             token_ids=token_ids,
@@ -193,6 +209,7 @@ class PI0FastTokenLogitAdapter:
         constrained_structural_token_radius: int = 512,
         constrained_full_head_prefix_tokens: int = 0,
         constrained_extra_token_ids: torch.Tensor | list[int] | None = None,
+        decode_attn_implementation: str | None = None,
         force_action_prefix: bool = False,
         stop_on_action_chars: bool = False,
         action_char_min_chars: int | None = None,
@@ -240,6 +257,7 @@ class PI0FastTokenLogitAdapter:
                 structural_token_radius=constrained_structural_token_radius,
                 full_head_prefix_tokens=constrained_full_head_prefix_tokens,
                 extra_token_ids=constrained_extra_token_ids,
+                decode_attn_implementation=decode_attn_implementation,
                 stop_on_action_chars=stop_on_action_chars,
                 action_char_min_chars=action_char_min_chars,
                 action_char_plateau_tokens=action_char_plateau_tokens,
@@ -317,6 +335,10 @@ class PI0FastTokenLogitAdapter:
                 "constrained_full_head_prefix_tokens": int(
                     getattr(self, "_last_constrained_full_head_prefix_tokens", 0)
                 ),
+                "decode_attn_implementation": str(getattr(self, "_last_decode_attn_implementation", "")),
+                "decode_attn_trimmed_language_tokens": int(
+                    getattr(self, "_last_decode_attn_trimmed_language_tokens", 0)
+                ),
                 "constrained_extra_token_count": int(getattr(self, "_last_constrained_extra_token_count", 0)),
                 "constrained_full_head_prefix_calls": int(
                     getattr(self, "_last_constrained_full_head_prefix_calls", 0)
@@ -389,6 +411,7 @@ class PI0FastTokenLogitAdapter:
                 ),
                 "action_char_stable_count_mean": float(getattr(self, "_last_action_char_stable_count_mean", 0.0)),
                 "action_char_lookup_raw_limit": int(getattr(self, "_action_char_length_raw_limit", 0)),
+                "action_end_profile": getattr(self, "_last_action_end_profile", None),
             },
         )
 
@@ -1979,6 +2002,7 @@ class PI0FastTokenLogitAdapter:
         structural_token_radius: int = 512,
         full_head_prefix_tokens: int = 0,
         extra_token_ids: torch.Tensor | list[int] | None = None,
+        decode_attn_implementation: str | None = None,
         stop_on_action_chars: bool = False,
         action_char_min_chars: int | None = None,
         action_char_plateau_tokens: int = 0,
@@ -2012,6 +2036,64 @@ class PI0FastTokenLogitAdapter:
         device = tokens.device
         lm_head = self.model.paligemma_with_expert.paligemma.lm_head
         action_end_token_id = self._action_end_token_id()
+        paligemma = self.model.paligemma_with_expert.paligemma
+        language_model = getattr(getattr(paligemma, "model", None), "language_model", None)
+        language_model_config = getattr(language_model, "config", None)
+        original_attn_implementation = (
+            None if language_model_config is None else getattr(language_model_config, "_attn_implementation", None)
+        )
+        if decode_attn_implementation in (None, "", "default"):
+            decode_attn_implementation = None
+        else:
+            decode_attn_implementation = str(decode_attn_implementation)
+        trimmed_language_tokens = 0
+        if decode_attn_implementation == "flash_attention_2" and bsize == 1 and masks.dtype == torch.bool:
+            keep_language = masks[0]
+            if bool(torch.any(~keep_language)):
+                trimmed_language_tokens = int(torch.sum(~keep_language).item())
+                tokens = tokens[:, keep_language]
+                masks = masks[:, keep_language]
+
+        def set_decode_attn_implementation() -> None:
+            if decode_attn_implementation is not None and language_model_config is not None:
+                language_model_config._attn_implementation = decode_attn_implementation
+
+        def restore_attn_implementation() -> None:
+            if decode_attn_implementation is not None and language_model_config is not None:
+                language_model_config._attn_implementation = original_attn_implementation
+
+        profile_enabled = bool(getattr(self, "_profile_action_end_decode", False))
+        profile_segments_ms: dict[str, float] = {}
+        profile_counts: dict[str, int] = {}
+        self._last_action_end_profile = None
+
+        def profile_sync() -> None:
+            if profile_enabled and device.type == "cuda" and torch.cuda.is_available():
+                torch.cuda.synchronize(device)
+
+        def profile_add(name: str, elapsed_ms: float) -> None:
+            profile_segments_ms[name] = profile_segments_ms.get(name, 0.0) + float(elapsed_ms)
+            profile_counts[name] = profile_counts.get(name, 0) + 1
+
+        def profile_begin() -> float:
+            profile_sync()
+            return time.perf_counter()
+
+        def profile_end(name: str, start: float) -> None:
+            profile_sync()
+            profile_add(name, (time.perf_counter() - start) * 1000.0)
+
+        def finish_profile() -> None:
+            if not profile_enabled:
+                return
+            self._last_action_end_profile = {
+                "segments_ms": {key: float(value) for key, value in profile_segments_ms.items()},
+                "counts": {key: int(value) for key, value in profile_counts.items()},
+                "row_token_counts": emitted_lengths.detach().cpu().tolist(),
+                "restricted_head_calls": int(restricted_head_calls),
+                "full_head_fallbacks": int(full_head_fallbacks),
+            }
+
         action_char_target = 0
         if stop_on_action_chars:
             action_dim = self.policy.config.output_features[self._action_key()].shape[0]
@@ -2178,6 +2260,12 @@ class PI0FastTokenLogitAdapter:
         self._last_forced_action_prefix_token_count = int(prefix_tokens.numel()) if force_action_prefix else 0
         self._last_constrained_full_head_margin = float(full_head_margin) if full_head_margin is not None else -1.0
         self._last_constrained_full_head_prefix_tokens = int(full_head_prefix_tokens)
+        self._last_decode_attn_implementation = (
+            str(decode_attn_implementation)
+            if decode_attn_implementation is not None
+            else str(original_attn_implementation)
+        )
+        self._last_decode_attn_trimmed_language_tokens = int(trimmed_language_tokens)
         self._last_constrained_full_head_prefix_calls = 0
         self._last_constrained_full_head_fallbacks = 0
         self._last_constrained_restricted_head_calls = 0
@@ -2202,20 +2290,23 @@ class PI0FastTokenLogitAdapter:
 
         def restricted_next(hidden: torch.Tensor) -> torch.Tensor:
             nonlocal restricted_head_calls, full_head_fallbacks, margin_min, margin_sum
+            profile_start = profile_begin() if profile_enabled else 0.0
             logits = F.linear(hidden, candidate_weight, candidate_bias)
             step_logits = logits[:, -1, :].float()
             restricted_head_calls += int(step_logits.shape[0])
-            if step_logits.shape[-1] >= 2:
-                local = torch.argmax(step_logits, dim=-1)
+            local = torch.argmax(step_logits, dim=-1)
+            if full_head_margin is not None and step_logits.shape[-1] >= 2:
                 top_values, top_indices = torch.topk(step_logits, k=2, dim=-1)
                 margins = top_values[:, 0] - top_values[:, 1]
                 margin_min = min(margin_min, float(torch.min(margins).item()))
                 margin_sum += float(torch.sum(margins).item())
-                if full_head_margin is not None and bool(torch.any(margins < float(full_head_margin))):
+                if bool(torch.any(margins < float(full_head_margin))):
                     full_head_fallbacks += int(step_logits.shape[0])
+                    if profile_enabled:
+                        profile_end("restricted_head", profile_start)
                     return full_next(hidden)
-            else:
-                local = torch.argmax(step_logits, dim=-1)
+            if profile_enabled:
+                profile_end("restricted_head", profile_start)
             return candidate_ids.index_select(0, local).unsqueeze(-1)
 
         def finish_constrained_stats() -> None:
@@ -2459,6 +2550,8 @@ class PI0FastTokenLogitAdapter:
 
         def finish_return(max_len: int, *, append_action_end: bool | None = None) -> torch.Tensor:
             finish_constrained_stats()
+            finish_profile()
+            restore_attn_implementation()
             self._last_action_end_row_token_counts = emitted_lengths.detach().cpu().tolist()
             if stop_on_action_chars:
                 self._last_action_char_stop_count = int(stopped_by_chars.sum().item())
@@ -2502,6 +2595,7 @@ class PI0FastTokenLogitAdapter:
         )
         tokens_in = torch.cat([tokens, bos_token], dim=1)
         masks_in = torch.cat([masks, torch.ones((bsize, 1), dtype=torch.bool, device=device)], dim=1)
+        profile_start = profile_begin() if profile_enabled else 0.0
         prefix_embs, prefix_pad_masks, prefix_att_masks, _total_t_images, _ = self.model.embed_prefix_fast(
             images,
             img_masks,
@@ -2510,9 +2604,15 @@ class PI0FastTokenLogitAdapter:
             fast_action_tokens=None,
             fast_action_masks=None,
         )
+        if profile_enabled:
+            profile_end("prefix_embed", profile_start)
         prefix_embs = self._match_model_precision(prefix_embs)
+        profile_start = profile_begin() if profile_enabled else 0.0
         position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         att_4d = self.model._prepare_attention_masks_4d(prefix_att_masks, dtype=prefix_embs.dtype)
+        if profile_enabled:
+            profile_end("prefill_mask", profile_start)
+        profile_start = profile_begin() if profile_enabled else 0.0
         (prefix_out, _), past_key_values = self.model.paligemma_with_expert.forward(
             attention_mask=att_4d,
             position_ids=position_ids,
@@ -2521,6 +2621,8 @@ class PI0FastTokenLogitAdapter:
             use_cache=True,
             adarms_cond=[None, None],
         )
+        if profile_enabled:
+            profile_end("prefill_forward", profile_start)
 
         generated = torch.full((bsize, max_decoding_steps), action_end_token_id, dtype=torch.long, device=device)
         if force_action_prefix:
@@ -2530,34 +2632,51 @@ class PI0FastTokenLogitAdapter:
         generated[:, 0] = next_token.squeeze(-1)
         current_pad_mask = prefix_pad_masks
         selected = next_token.squeeze(-1)
+        profile_start = profile_begin() if profile_enabled else 0.0
         finished_by_chars = record_action_chars(selected)
         finished_by_action_end = selected == action_end_token_id
         if action_char_plateau_reject_eos_restart and has_restart_guard_tokens and not action_char_restart_continue:
             finished_by_action_end = finished_by_action_end & ~plateau_tail_eos_restart[active_indices]
         finished = finished_by_action_end | finished_by_chars
+        if profile_enabled:
+            profile_end("stop_checks", profile_start)
         if bool(torch.all(finished)):
             append_action_end = bool(torch.any(finished_by_chars & ~finished_by_action_end).item())
             return finish_return(1, append_action_end=append_action_end)
         if bool(torch.any(finished)):
+            profile_start = profile_begin() if profile_enabled else 0.0
             keep = torch.nonzero(~finished, as_tuple=False).flatten()
             past_key_values = past_key_values.batch_select_indices(keep)
             current_pad_mask = current_pad_mask[keep]
             next_token = next_token[keep]
             active_indices = active_indices[keep]
+            if profile_enabled:
+                profile_end("row_compact", profile_start)
 
+        set_decode_attn_implementation()
         for t in range(1, max_decoding_steps):
+            profile_start = profile_begin() if profile_enabled else 0.0
             next_token_emb = self._embed_decode_language_tokens(next_token)
             next_token_emb = next_token_emb.to(dtype=prefix_embs.dtype)
+            if profile_enabled:
+                profile_end("decode_embed", profile_start)
             active_bsize = int(active_indices.numel())
+            profile_start = profile_begin() if profile_enabled else 0.0
             current_pad_mask = torch.cat(
                 [current_pad_mask, torch.ones((active_bsize, 1), dtype=torch.bool, device=device)],
                 dim=1,
             )
             current_position_ids = (torch.sum(current_pad_mask, dim=1, keepdim=True) - 1).long()
-            step_att_mask = self.model._prepare_attention_masks_4d(
-                current_pad_mask.unsqueeze(1),
-                dtype=next_token_emb.dtype,
-            )
+            if decode_attn_implementation == "flash_attention_2" and bool(torch.all(current_pad_mask)):
+                step_att_mask = None
+            else:
+                step_att_mask = self.model._prepare_attention_masks_4d(
+                    current_pad_mask.unsqueeze(1),
+                    dtype=next_token_emb.dtype,
+                )
+            if profile_enabled:
+                profile_end("decode_mask", profile_start)
+            profile_start = profile_begin() if profile_enabled else 0.0
             (step_out, _), past_key_values = self.model.paligemma_with_expert.forward(
                 attention_mask=step_att_mask,
                 position_ids=current_position_ids,
@@ -2566,6 +2685,8 @@ class PI0FastTokenLogitAdapter:
                 use_cache=True,
                 adarms_cond=[None, None],
             )
+            if profile_enabled:
+                profile_end("decode_forward", profile_start)
             if force_action_prefix and t < int(prefix_tokens.numel()):
                 next_token = prefix_tokens[t].view(1, 1).expand(active_bsize, 1)
             else:
@@ -2573,21 +2694,27 @@ class PI0FastTokenLogitAdapter:
             selected = next_token.squeeze(-1)
             generated[active_indices, t] = selected
             emitted_lengths[active_indices] = t + 1
+            profile_start = profile_begin() if profile_enabled else 0.0
             finished_by_chars = record_action_chars(selected)
             finished_by_action_end = selected == action_end_token_id
             if action_char_plateau_reject_eos_restart and has_restart_guard_tokens and not action_char_restart_continue:
                 finished_by_action_end = finished_by_action_end & ~plateau_tail_eos_restart[active_indices]
             finished = finished_by_action_end | finished_by_chars
+            if profile_enabled:
+                profile_end("stop_checks", profile_start)
             if bool(torch.all(finished)):
                 max_len = int(emitted_lengths.max().item())
                 append_action_end = bool(torch.any(finished_by_chars & ~finished_by_action_end).item())
                 return finish_return(max_len, append_action_end=append_action_end)
             if bool(torch.any(finished)):
+                profile_start = profile_begin() if profile_enabled else 0.0
                 keep = torch.nonzero(~finished, as_tuple=False).flatten()
                 past_key_values = past_key_values.batch_select_indices(keep)
                 current_pad_mask = current_pad_mask[keep]
                 next_token = next_token[keep]
                 active_indices = active_indices[keep]
+                if profile_enabled:
+                    profile_end("row_compact", profile_start)
 
         return finish_return(int(max_decoding_steps), append_action_end=False)
 
@@ -6731,7 +6858,7 @@ class PI0FastTokenLogitAdapter:
             # LeRobot v0.6 PI0-FAST decodes generated tokens without the Gemma
             # sqrt(hidden_dim) embedding scale. Keep scaling opt-in for older
             # experimental configs, but default to matching upstream.
-            value = bool(getattr(self.policy.config, "scale_decode_token_embeddings", False))
+            value = bool(getattr(getattr(self.policy, "config", None), "scale_decode_token_embeddings", False))
             self._scale_decode_token_embeddings_cache = value
         return bool(value)
 
