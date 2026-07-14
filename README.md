@@ -177,6 +177,8 @@ Follow-up exact single-request probes on the current v0.6 stack:
 | `torch.compile` with margin recording, same real observations | `276.5 ms` | Not safely gateable by top-2 margin: `3/8` token-equal, max action diff `0.937`; artifact `outputs/pi0fast_system_components/pi06_pi0fast_libero_compile_compare_margin_task1_osmesa_steps8.json` |
 | Approx FAST-char early stop sweep, same real observations | best `169.7 ms` | Target 4 decoded FAST chars emits mean `7` tokens but has large action error, mean max diff `1.08`; artifact `outputs/pi0fast_system_components/pi06_pi0fast_libero_early_stop_target_chars_task1_osmesa_steps3.json` |
 | Approx FAST-char early stop + prefixed action-token prefill, same real observations | best `119.7 ms` | Target 4 decoded FAST chars emits mean `7` tokens but has large action error, mean max diff `1.08`; full-target prefill is still not exact, mean max diff `0.278`; artifact `outputs/pi0fast_system_components/pi06_pi0fast_libero_early_stop_prefill_prefix_target_chars_task1_osmesa_steps3.json` |
+| Profiled OSMesa real LIBERO constrained `action_end`, 3 measured steps | `518.4 ms` | Decode LM forwards dominate: `352-479 ms` across `22-30` decode forwards, about `16 ms/token`; prefix embed+prefill is about `62 ms`; constrained head is only `2-3 ms`; artifact `outputs/pi0fast_system_components/pi06_pi0fast_libero_profile_exact_task1_osmesa_steps3.json` |
+| Stock Pi0.5 public path, `10` flow steps, same A100, warmed compiler cache | `84.6 ms` inference | Meets a model-only `100 ms` single-request target; preprocessing adds `25.9 ms`, so preprocess+inference+postprocess is about `110.6 ms`; artifact `outputs/pi0fast_system_components/pi05_libero_public_steps10_1_task1_osmesa_steps5_warm3.json` |
 
 The current non-quantized exact single-request path therefore does not meet a
 100 ms isolated-request target. Public and local evidence point to model/runtime
@@ -186,6 +188,12 @@ custom FP8/CUDA-graph runtime rather than stock PyTorch exact decoding.
 The prefixed action-token prefill experiment is kept opt-in because it changes
 the generated action even when the decoded FAST-character target is long enough
 to emit the full action.
+FlashRT's public Pi0-FAST docs report the same shape of bottleneck:
+autoregressive latency is `prefill + N * per_token_decode`, with about
+`480 ms` for 50 tokens by default and about `447 ms` with decode CUDA Graph.
+That is faster than this stock PyTorch path but still not a 100 ms exact
+Pi0-FAST route. The local sub-100 model-only result is the stock Pi0.5
+flow path above, not the autoregressive FAST-token path.
 
 Historical strict 120-row artifact from an older custom
 `lerobot/pi0fast-libero` stack/protocol. The 120 rows are `libero_object`,
