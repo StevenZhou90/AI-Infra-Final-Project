@@ -169,6 +169,76 @@ def test_pi0fast_action_end_decode_can_stop_after_action_chars() -> None:
     assert adapter._last_action_char_count_mean == 8.0
 
 
+def test_pi0fast_action_char_target_override_stops_before_full_action() -> None:
+    adapter = PI0FastTokenLogitAdapter(_CharStopPolicy())
+    adapter._match_model_precision = lambda tensor: tensor
+    adapter._action_key = lambda: "action"
+
+    token_ids = adapter.sample_actions_fast_kv_cache_action_end(
+        images=torch.empty(1),
+        img_masks=torch.empty(1),
+        tokens=torch.zeros((1, 2), dtype=torch.long),
+        masks=torch.ones((1, 2), dtype=torch.bool),
+        max_decoding_steps=8,
+        stop_on_action_chars=True,
+        action_char_target_chars=4,
+    )
+
+    assert token_ids.tolist() == [[90, 99]]
+    assert adapter._last_action_char_target == 4
+    assert adapter._last_action_char_stop_count == 1
+    assert adapter._last_action_char_count_mean == 4.0
+
+
+def test_pi0fast_constrained_action_char_target_override_stops_before_full_action() -> None:
+    policy = _CharStopPolicy()
+    policy.model._targets = [0, 0, 0, 90, 91, 92, 99]
+    _install_identity_linear_head(policy)
+    adapter = PI0FastTokenLogitAdapter(policy)
+    adapter._match_model_precision = lambda tensor: tensor
+    adapter._action_key = lambda: "action"
+
+    token_ids = adapter.sample_actions_fast_kv_cache_action_end_constrained(
+        images=torch.empty(1),
+        img_masks=torch.empty(1),
+        tokens=torch.zeros((1, 2), dtype=torch.long),
+        masks=torch.ones((1, 2), dtype=torch.bool),
+        max_decoding_steps=8,
+        stop_on_action_chars=True,
+        action_char_target_chars=4,
+    )
+
+    assert token_ids.tolist() == [[2, 3, 4, 90, 99]]
+    assert adapter._last_action_char_target == 4
+    assert adapter._last_action_char_stop_count == 1
+    assert adapter._last_action_char_count_mean == 4.0
+
+
+def test_pi0fast_constrained_prefilled_action_prefix_stops_before_full_action() -> None:
+    policy = _CharStopPolicy()
+    _install_identity_linear_head(policy)
+    adapter = PI0FastTokenLogitAdapter(policy)
+    adapter._match_model_precision = lambda tensor: tensor
+    adapter._action_key = lambda: "action"
+
+    token_ids = adapter.sample_actions_fast_kv_cache_action_end_constrained(
+        images=torch.empty(1),
+        img_masks=torch.empty(1),
+        tokens=torch.zeros((1, 2), dtype=torch.long),
+        masks=torch.ones((1, 2), dtype=torch.bool),
+        max_decoding_steps=8,
+        prefill_action_prefix=True,
+        stop_on_action_chars=True,
+        action_char_target_chars=4,
+    )
+
+    assert token_ids.tolist() == [[2, 3, 4, 90, 99]]
+    assert adapter._last_constrained_prefill_action_prefix_tokens == 3
+    assert adapter._last_constrained_restricted_head_calls == 1
+    assert adapter._last_action_char_target == 4
+    assert adapter._last_action_char_count_mean == 4.0
+
+
 def test_pi0fast_strict_action_char_target_waits_for_extra_action_token() -> None:
     adapter = PI0FastTokenLogitAdapter(_CharStopPolicy())
     adapter._match_model_precision = lambda tensor: tensor

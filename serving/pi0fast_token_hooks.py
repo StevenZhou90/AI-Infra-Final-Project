@@ -206,12 +206,14 @@ class PI0FastTokenLogitAdapter:
         constrained_text_vocab_size: int | None = None,
         constrained_full_head_margin: float | None = None,
         constrained_force_action_prefix: bool = True,
+        constrained_prefill_action_prefix: bool = False,
         constrained_structural_token_radius: int = 512,
         constrained_full_head_prefix_tokens: int = 0,
         constrained_extra_token_ids: torch.Tensor | list[int] | None = None,
         decode_attn_implementation: str | None = None,
         force_action_prefix: bool = False,
         stop_on_action_chars: bool = False,
+        action_char_target_chars: int | None = None,
         action_char_min_chars: int | None = None,
         action_char_plateau_tokens: int = 0,
         action_char_stable_checks: int = 0,
@@ -254,11 +256,13 @@ class PI0FastTokenLogitAdapter:
                 text_vocab_size=constrained_text_vocab_size,
                 full_head_margin=constrained_full_head_margin,
                 force_action_prefix=constrained_force_action_prefix,
+                prefill_action_prefix=constrained_prefill_action_prefix,
                 structural_token_radius=constrained_structural_token_radius,
                 full_head_prefix_tokens=constrained_full_head_prefix_tokens,
                 extra_token_ids=constrained_extra_token_ids,
                 decode_attn_implementation=decode_attn_implementation,
                 stop_on_action_chars=stop_on_action_chars,
+                action_char_target_chars=action_char_target_chars,
                 action_char_min_chars=action_char_min_chars,
                 action_char_plateau_tokens=action_char_plateau_tokens,
                 action_char_stable_checks=action_char_stable_checks,
@@ -284,6 +288,7 @@ class PI0FastTokenLogitAdapter:
                 temperature=decode_temperature,
                 force_action_prefix=force_action_prefix,
                 stop_on_action_chars=stop_on_action_chars,
+                action_char_target_chars=action_char_target_chars,
                 action_char_min_chars=action_char_min_chars,
                 action_char_plateau_tokens=action_char_plateau_tokens,
                 action_char_stable_checks=action_char_stable_checks,
@@ -331,6 +336,9 @@ class PI0FastTokenLogitAdapter:
                     getattr(self, "_last_constrained_structural_token_radius", 0)
                 ),
                 "constrained_force_action_prefix": int(bool(getattr(self, "_last_constrained_force_action_prefix", False))),
+                "constrained_prefill_action_prefix_tokens": int(
+                    getattr(self, "_last_constrained_prefill_action_prefix_tokens", 0)
+                ),
                 "constrained_full_head_margin": float(getattr(self, "_last_constrained_full_head_margin", -1.0)),
                 "constrained_full_head_prefix_tokens": int(
                     getattr(self, "_last_constrained_full_head_prefix_tokens", 0)
@@ -1484,6 +1492,7 @@ class PI0FastTokenLogitAdapter:
         temperature: float = 0.0,
         force_action_prefix: bool = False,
         stop_on_action_chars: bool = False,
+        action_char_target_chars: int | None = None,
         action_char_min_chars: int | None = None,
         action_char_plateau_tokens: int = 0,
         action_char_stable_checks: int = 0,
@@ -1517,6 +1526,9 @@ class PI0FastTokenLogitAdapter:
                 raise ValueError("PI0-FAST action-char stop currently supports greedy temperature=0 only")
             action_dim = self.policy.config.output_features[self._action_key()].shape[0]
             action_char_target = int(self.policy.config.n_action_steps) * int(action_dim)
+            if action_char_target_chars is not None:
+                action_char_target = int(action_char_target_chars)
+            action_char_target = max(0, int(action_char_target))
         action_char_min_chars = int(action_char_target if action_char_min_chars is None else action_char_min_chars)
         action_char_min_chars = max(0, int(action_char_min_chars))
         action_char_plateau_tokens = max(0, int(action_char_plateau_tokens))
@@ -1999,11 +2011,13 @@ class PI0FastTokenLogitAdapter:
         text_vocab_size: int | None = None,
         full_head_margin: float | None = None,
         force_action_prefix: bool = True,
+        prefill_action_prefix: bool = False,
         structural_token_radius: int = 512,
         full_head_prefix_tokens: int = 0,
         extra_token_ids: torch.Tensor | list[int] | None = None,
         decode_attn_implementation: str | None = None,
         stop_on_action_chars: bool = False,
+        action_char_target_chars: int | None = None,
         action_char_min_chars: int | None = None,
         action_char_plateau_tokens: int = 0,
         action_char_stable_checks: int = 0,
@@ -2098,6 +2112,9 @@ class PI0FastTokenLogitAdapter:
         if stop_on_action_chars:
             action_dim = self.policy.config.output_features[self._action_key()].shape[0]
             action_char_target = int(self.policy.config.n_action_steps) * int(action_dim)
+            if action_char_target_chars is not None:
+                action_char_target = int(action_char_target_chars)
+            action_char_target = max(0, int(action_char_target))
         action_char_min_chars = int(action_char_target if action_char_min_chars is None else action_char_min_chars)
         action_char_min_chars = max(0, int(action_char_min_chars))
         action_char_plateau_tokens = max(0, int(action_char_plateau_tokens))
@@ -2257,6 +2274,9 @@ class PI0FastTokenLogitAdapter:
         self._last_constrained_structural_token_radius = int(cached["structural_token_radius"])
         self._last_constrained_extra_token_count = int(cached["extra_token_count"])
         self._last_constrained_force_action_prefix = int(bool(force_action_prefix))
+        self._last_constrained_prefill_action_prefix_tokens = (
+            int(prefix_tokens.numel()) if force_action_prefix and prefill_action_prefix else 0
+        )
         self._last_forced_action_prefix_token_count = int(prefix_tokens.numel()) if force_action_prefix else 0
         self._last_constrained_full_head_margin = float(full_head_margin) if full_head_margin is not None else -1.0
         self._last_constrained_full_head_prefix_tokens = int(full_head_prefix_tokens)
@@ -2595,14 +2615,23 @@ class PI0FastTokenLogitAdapter:
         )
         tokens_in = torch.cat([tokens, bos_token], dim=1)
         masks_in = torch.cat([masks, torch.ones((bsize, 1), dtype=torch.bool, device=device)], dim=1)
+        prefill_prefix_tokens = None
+        prefill_prefix_masks = None
+        if force_action_prefix and prefill_action_prefix:
+            prefill_prefix_tokens = prefix_tokens.view(1, -1).expand(bsize, -1)
+            prefill_prefix_masks = torch.ones(
+                (bsize, int(prefix_tokens.numel())),
+                dtype=torch.bool,
+                device=device,
+            )
         profile_start = profile_begin() if profile_enabled else 0.0
         prefix_embs, prefix_pad_masks, prefix_att_masks, _total_t_images, _ = self.model.embed_prefix_fast(
             images,
             img_masks,
             tokens_in,
             masks_in,
-            fast_action_tokens=None,
-            fast_action_masks=None,
+            fast_action_tokens=prefill_prefix_tokens,
+            fast_action_masks=prefill_prefix_masks,
         )
         if profile_enabled:
             profile_end("prefix_embed", profile_start)
@@ -2625,13 +2654,24 @@ class PI0FastTokenLogitAdapter:
             profile_end("prefill_forward", profile_start)
 
         generated = torch.full((bsize, max_decoding_steps), action_end_token_id, dtype=torch.long, device=device)
-        if force_action_prefix:
+        prefilled_prefix_len = int(prefix_tokens.numel()) if prefill_prefix_tokens is not None else 0
+        if prefilled_prefix_len:
+            if prefilled_prefix_len >= int(max_decoding_steps):
+                return finish_return(int(max_decoding_steps), append_action_end=False)
+            generated[:, :prefilled_prefix_len] = prefix_tokens.view(1, -1).expand(bsize, -1)
+            emitted_lengths[:] = prefilled_prefix_len
+            next_token = constrained_next(prefix_out[:, -1:, :], prefilled_prefix_len)
+            initial_position = prefilled_prefix_len
+        elif force_action_prefix:
             next_token = prefix_tokens[0].view(1, 1).expand(bsize, 1)
+            initial_position = 0
         else:
             next_token = constrained_next(prefix_out[:, -1:, :], 0)
-        generated[:, 0] = next_token.squeeze(-1)
+            initial_position = 0
+        generated[:, initial_position] = next_token.squeeze(-1)
         current_pad_mask = prefix_pad_masks
         selected = next_token.squeeze(-1)
+        emitted_lengths[active_indices] = initial_position + 1
         profile_start = profile_begin() if profile_enabled else 0.0
         finished_by_chars = record_action_chars(selected)
         finished_by_action_end = selected == action_end_token_id
@@ -2642,7 +2682,7 @@ class PI0FastTokenLogitAdapter:
             profile_end("stop_checks", profile_start)
         if bool(torch.all(finished)):
             append_action_end = bool(torch.any(finished_by_chars & ~finished_by_action_end).item())
-            return finish_return(1, append_action_end=append_action_end)
+            return finish_return(initial_position + 1, append_action_end=append_action_end)
         if bool(torch.any(finished)):
             profile_start = profile_begin() if profile_enabled else 0.0
             keep = torch.nonzero(~finished, as_tuple=False).flatten()
@@ -2654,7 +2694,7 @@ class PI0FastTokenLogitAdapter:
                 profile_end("row_compact", profile_start)
 
         set_decode_attn_implementation()
-        for t in range(1, max_decoding_steps):
+        for t in range(initial_position + 1, max_decoding_steps):
             profile_start = profile_begin() if profile_enabled else 0.0
             next_token_emb = self._embed_decode_language_tokens(next_token)
             next_token_emb = next_token_emb.to(dtype=prefix_embs.dtype)

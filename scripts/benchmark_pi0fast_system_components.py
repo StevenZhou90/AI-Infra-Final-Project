@@ -88,6 +88,11 @@ def parse_args() -> argparse.Namespace:
         help="Include tokens within this radius of the action-end token in constrained action_end decode.",
     )
     parser.add_argument(
+        "--action-end-constrained-prefill-action-prefix",
+        action="store_true",
+        help="Experimentally prefill the fixed 'Action: ' target prefix as causal FAST tokens.",
+    )
+    parser.add_argument(
         "--action-end-stop-on-action-chars",
         action="store_true",
         help="Stop action_end decode once enough decoded FAST action characters have been emitted.",
@@ -97,6 +102,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=-1,
         help="Minimum decoded FAST-character count before char-stop plateau logic may stop; negative uses the full action target.",
+    )
+    parser.add_argument(
+        "--action-end-action-char-target-chars",
+        type=int,
+        default=-1,
+        help="Override the decoded FAST-character stop target; negative uses the full action horizon.",
     )
     parser.add_argument("--action-end-action-char-plateau-tokens", type=int, default=0)
     parser.add_argument("--action-end-action-char-stable-checks", type=int, default=0)
@@ -479,8 +490,12 @@ def main() -> None:
             "constrained_text_vocab_size": args.action_end_constrained_text_vocab_size,
             "constrained_full_head_margin": args.action_end_constrained_full_head_margin,
             "constrained_structural_token_radius": args.action_end_constrained_structural_token_radius,
+            "constrained_prefill_action_prefix": bool(args.action_end_constrained_prefill_action_prefix),
             "decode_attn_implementation": args.decode_attn_implementation,
             "stop_on_action_chars": bool(args.action_end_stop_on_action_chars),
+            "action_char_target_chars": (
+                None if args.action_end_action_char_target_chars < 0 else args.action_end_action_char_target_chars
+            ),
             "action_char_min_chars": (
                 None if args.action_end_action_char_min_chars < 0 else args.action_end_action_char_min_chars
             ),

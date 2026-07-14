@@ -175,12 +175,17 @@ Follow-up exact single-request probes on the current v0.6 stack:
 | Synthetic no-env constrained `action_end`, SDPA | `464.0 ms` | No simulator/preprocess overhead, mean `23` FAST tokens, artifact `outputs/pi0fast_system_components/pi06_pi0fast_synthetic_default_noprofile_cap64_step5.json` |
 | `torch.compile` language-model forward, same real observations | `252.8 ms` | About `2.1x` faster but not exact: `1/3` token-equal, max action diff `0.533`; artifact `outputs/pi0fast_system_components/pi06_pi0fast_libero_compile_compare_task1_osmesa_steps3.json` |
 | `torch.compile` with margin recording, same real observations | `276.5 ms` | Not safely gateable by top-2 margin: `3/8` token-equal, max action diff `0.937`; artifact `outputs/pi0fast_system_components/pi06_pi0fast_libero_compile_compare_margin_task1_osmesa_steps8.json` |
+| Approx FAST-char early stop sweep, same real observations | best `169.7 ms` | Target 4 decoded FAST chars emits mean `7` tokens but has large action error, mean max diff `1.08`; artifact `outputs/pi0fast_system_components/pi06_pi0fast_libero_early_stop_target_chars_task1_osmesa_steps3.json` |
+| Approx FAST-char early stop + prefixed action-token prefill, same real observations | best `119.7 ms` | Target 4 decoded FAST chars emits mean `7` tokens but has large action error, mean max diff `1.08`; full-target prefill is still not exact, mean max diff `0.278`; artifact `outputs/pi0fast_system_components/pi06_pi0fast_libero_early_stop_prefill_prefix_target_chars_task1_osmesa_steps3.json` |
 
 The current non-quantized exact single-request path therefore does not meet a
 100 ms isolated-request target. Public and local evidence point to model/runtime
 changes for that target: flow-action distillation such as SnapFlow for PI0.5,
 approximate FAST/DCT early decoding with a new success-rate validation, or a
 custom FP8/CUDA-graph runtime rather than stock PyTorch exact decoding.
+The prefixed action-token prefill experiment is kept opt-in because it changes
+the generated action even when the decoded FAST-character target is long enough
+to emit the full action.
 
 Historical strict 120-row artifact from an older custom
 `lerobot/pi0fast-libero` stack/protocol. The 120 rows are `libero_object`,
