@@ -58,6 +58,35 @@ def parse_args() -> argparse.Namespace:
         help="public uses policy.predict_action_chunk; action_end uses greedy FAST-token decode that stops on '|'.",
     )
     parser.add_argument(
+        "--action-end-constrained-vocab",
+        action="store_true",
+        help="For PI0-FAST action_end, restrict each LM head projection to the FAST-action/text candidate set.",
+    )
+    parser.add_argument(
+        "--action-end-constrained-action-vocab-size",
+        type=int,
+        default=None,
+        help="Optional FAST action-vocab candidate size for constrained action_end decode.",
+    )
+    parser.add_argument(
+        "--action-end-constrained-text-vocab-size",
+        type=int,
+        default=None,
+        help="Optional low text-vocab candidate size for constrained action_end decode.",
+    )
+    parser.add_argument(
+        "--action-end-constrained-full-head-margin",
+        type=float,
+        default=None,
+        help="If set, fall back to the full LM head when the constrained top-1/top-2 margin is below this value.",
+    )
+    parser.add_argument(
+        "--action-end-constrained-structural-token-radius",
+        type=int,
+        default=512,
+        help="Include tokens within this radius of the action-end token in constrained action_end decode.",
+    )
+    parser.add_argument(
         "--max-decoding-steps",
         default="default",
         help="Comma-separated max_decoding_steps values to test, or 'default'. This is a plain decode cap, not speculative decoding.",
@@ -301,6 +330,7 @@ def predict_chunk(
     decode_path: str,
     device: torch.device,
     autocast_dtype: torch.dtype | None = None,
+    action_end_kwargs: dict[str, Any] | None = None,
 ) -> tuple[Any, dict[str, Any] | None]:
     if autocast_dtype is not None and device.type == "cuda":
         cast_context = torch.autocast(device_type=device.type, dtype=autocast_dtype)
@@ -310,7 +340,7 @@ def predict_chunk(
         if decode_path == "action_end":
             if token_adapter is None:
                 raise ValueError("action_end decode path requires PI0FastTokenLogitAdapter")
-            trace = token_adapter.predict_action_chunk_action_end(batch)
+            trace = token_adapter.predict_action_chunk_action_end(batch, **(action_end_kwargs or {}))
             row_counts = (trace.stats or {}).get("row_token_counts")
             if row_counts:
                 return trace.actions, {"row_counts": [float(value) for value in row_counts]}
@@ -340,6 +370,15 @@ def main() -> None:
     load_start = time.perf_counter()
     policy = PolicyClass.from_pretrained(args.policy).to(device=device, dtype=dtype).eval()
     token_adapter = PI0FastTokenLogitAdapter(policy) if args.decode_path == "action_end" else None
+    action_end_kwargs: dict[str, Any] = {}
+    if args.decode_path == "action_end" and args.action_end_constrained_vocab:
+        action_end_kwargs = {
+            "constrained_action_vocab": True,
+            "constrained_action_vocab_size": args.action_end_constrained_action_vocab_size,
+            "constrained_text_vocab_size": args.action_end_constrained_text_vocab_size,
+            "constrained_full_head_margin": args.action_end_constrained_full_head_margin,
+            "constrained_structural_token_radius": args.action_end_constrained_structural_token_radius,
+        }
     actions_per_request = policy_action_horizon(policy)
     sync_if_cuda(device)
     load_ms = (time.perf_counter() - load_start) * 1000.0
@@ -382,6 +421,7 @@ def main() -> None:
                     decode_path=args.decode_path,
                     device=device,
                     autocast_dtype=inference_autocast_dtype,
+                    action_end_kwargs=action_end_kwargs,
                 )
             try:
                 action = _to_numpy_action(policy_postprocessor(raw_action))[0]
@@ -438,6 +478,7 @@ def main() -> None:
                                     decode_path=args.decode_path,
                                     device=device,
                                     autocast_dtype=inference_autocast_dtype,
+                                    action_end_kwargs=action_end_kwargs,
                                 ),
                         )
                         single_ms.append(infer_ms)
@@ -472,6 +513,7 @@ def main() -> None:
                                             decode_path=args.decode_path,
                                             device=device,
                                             autocast_dtype=inference_autocast_dtype,
+                                            action_end_kwargs=action_end_kwargs,
                                         ),
                                     )
                                 batch_ms[batch_size].append(batched_ms)

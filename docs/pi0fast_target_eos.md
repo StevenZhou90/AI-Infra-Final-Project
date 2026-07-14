@@ -15,7 +15,10 @@ with LeRobot `0.6.0` reached `39/40 = 97.5%` on object/spatial/goal/10, one
 episode per task. Corrected serving benchmark:
 `outputs/pi0fast_system_components/pi06_pi0fast_libero_action_end_fixed_task1_steps5.json`
 reports single-request `action_end` at `568.3 ms` per 10-action chunk and
-replicated batch 8 at `91.2 ms/request`.
+replicated batch 8 at `91.2 ms/request`. The constrained-vocab variant in
+`outputs/pi0fast_system_components/pi06_pi0fast_libero_action_end_constrained_task1_steps5.json`
+improves that to `554.5 ms` single-request and `89.7 ms/request` at replicated
+batch 8.
 
 ## setup
 

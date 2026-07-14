@@ -149,13 +149,14 @@ then detokenizes. Action-end stopping is therefore a real latency optimization
 for this policy path, not a generic built-in EOS option that was already active.
 
 Current v0.6 non-quantized serving-component result after fixing the adapter to
-match LeRobot v0.6 token embedding semantics:
+match LeRobot v0.6 token embedding semantics and enabling the constrained
+FAST/text candidate head:
 
 | Path | Chunk mean | Per request | Per action | Notes |
 | --- | ---: | ---: | ---: | --- |
 | Public fixed decode probe | `4557.2 ms` | `4557.2 ms` | `455.7 ms` | LeRobot public path, 256 FAST tokens |
-| Single `action_end` request | `568.3 ms` | `568.3 ms` | `56.8 ms` | Mean `29.8` FAST tokens, actions match public decode |
-| Replicated batch 8 `action_end` | `729.7 ms` | `91.2 ms` | `9.1 ms` | 6.23x throughput speedup, meets 100 ms/request by batching |
+| Single constrained `action_end` request | `554.5 ms` | `554.5 ms` | `55.4 ms` | Mean `29.8` FAST tokens, actions match public decode |
+| Replicated batch 8 constrained `action_end` | `717.5 ms` | `89.7 ms` | `9.0 ms` | 6.18x throughput speedup, meets 100 ms/request by batching |
 
 This is model-serving time, not full LIBERO rollout wall time. Full simulator
 rollout rows still include OSMesa/LIBERO stepping and image observation
@@ -163,7 +164,7 @@ formatting overhead. The fixed public decode probe and corrected action-end
 probe on the same observation matched exactly (`max_abs_vs_public=0.0`) while
 reducing token generation from 256 tokens to 32 tokens on that row; aggregate
 benchmark artifact:
-`outputs/pi0fast_system_components/pi06_pi0fast_libero_action_end_fixed_task1_steps5.json`.
+`outputs/pi0fast_system_components/pi06_pi0fast_libero_action_end_constrained_task1_steps5.json`.
 
 Historical strict 120-row artifact from an older custom
 `lerobot/pi0fast-libero` stack/protocol. The 120 rows are `libero_object`,

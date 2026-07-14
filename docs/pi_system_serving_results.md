@@ -77,22 +77,25 @@ goal `10/10`, and `libero_10` `10/10`; the only failed task was
 `libero_spatial_5`. Artifact:
 `outputs/eval/2026-07-14/03-10-08_pi06_pi0fast_libero_full40/eval_info.json`.
 
-PI0-FAST v0.6 model-serving component benchmark, bf16, corrected action-end
-decode, `outputs/pi0fast_system_components/pi06_pi0fast_libero_action_end_fixed_task1_steps5.json`:
+PI0-FAST v0.6 model-serving component benchmark, bf16, corrected constrained
+action-end decode,
+`outputs/pi0fast_system_components/pi06_pi0fast_libero_action_end_constrained_task1_steps5.json`:
 
 | Mode | Chunk mean | Per request | Per action | Token count |
 | --- | ---: | ---: | ---: | ---: |
 | Single public fixed decode probe | 4557.2 ms | 4557.2 ms | 455.7 ms | 256 |
-| Single `action_end` request | 568.3 ms | 568.3 ms | 56.8 ms | 29.8 mean |
-| Replicated batch 2 `action_end` | 616.0 ms | 308.0 ms | 30.8 ms | 30.6 mean |
-| Replicated batch 4 `action_end` | 652.2 ms | 163.0 ms | 16.3 ms | 30.0 mean |
-| Replicated batch 8 `action_end` | 729.7 ms | 91.2 ms | 9.1 ms | 28.4 mean |
+| Single constrained `action_end` request | 554.5 ms | 554.5 ms | 55.4 ms | 29.8 mean |
+| Replicated batch 2 constrained `action_end` | 604.3 ms | 302.2 ms | 30.2 ms | 30.6 mean |
+| Replicated batch 4 constrained `action_end` | 639.8 ms | 160.0 ms | 16.0 ms | 30.0 mean |
+| Replicated batch 8 constrained `action_end` | 717.5 ms | 89.7 ms | 9.0 ms | 28.4 mean |
 
 The corrected adapter was validated on a same-observation probe against the
 public fixed decode with `max_abs_vs_public=0.0`; the stop-token path generated
 32 tokens instead of 256 on that probe. Batch 8 meets a 100 ms/request target by
 amortizing one 10-action chunk across replicated requests. Single request
-meets 100 ms/action but not 100 ms/request.
+meets 100 ms/action but not 100 ms/request. The constrained path restricts the
+LM head projection to the FAST-action/text candidate set and matched default
+action-end tokens/actions on the probe.
 
 PI0-FAST historical v044 accuracy sanity checks:
 
@@ -228,12 +231,13 @@ or projected utilization from `--max-admission-utilization`.  The gRPC server
 also has a dedicated GPU worker queue so request handler threads only decode and
 enqueue work, and it can run startup warmup from a saved prepared observation.
 
-PI0-FAST, bf16, current `lerobot/pi0fast-libero`, corrected action-end decode:
+PI0-FAST, bf16, current `lerobot/pi0fast-libero`, corrected constrained
+action-end decode:
 
 | Mode | Mean latency |
 | --- | ---: |
-| Single request | 568.3 ms |
-| Replicated batch 8 | 729.7 ms total, 91.2 ms/request |
+| Single request | 554.5 ms |
+| Replicated batch 8 | 717.5 ms total, 89.7 ms/request |
 | Public fixed decode probe | 4557.2 ms |
 
 The PI0-FAST serving path should keep token-count telemetry and straggler
@@ -452,10 +456,11 @@ MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa TOKENIZERS_PARALLELISM=false WANDB_MOD
   --policy-kind pi0fast --policy lerobot/pi0fast-libero \
   --task libero_object --task-id 1 --warmup 1 --steps 5 \
   --batch-sizes 1,2,4,8 --decode-path action_end \
+  --action-end-constrained-vocab \
   --max-decoding-steps default --kv-modes default \
   --batch-source replicated --device cuda --dtype bfloat16 \
   --target-latency-ms 100 \
-  --output outputs/pi0fast_system_components/pi06_pi0fast_libero_action_end_fixed_task1_steps5.json
+  --output outputs/pi0fast_system_components/pi06_pi0fast_libero_action_end_constrained_task1_steps5.json
 ```
 
 PI0-FAST distinct-reset straggler check:
@@ -467,6 +472,7 @@ MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa TOKENIZERS_PARALLELISM=false WANDB_MOD
   --policy-kind pi0fast --policy lerobot/pi0fast-libero \
   --task libero_object --task-id 1 --warmup 1 --steps 1 \
   --batch-sizes 1,2,4,8 --decode-path action_end \
+  --action-end-constrained-vocab \
   --max-decoding-steps default --kv-modes default \
   --batch-source distinct-reset --device cuda --dtype bfloat16 \
   --action-token-warn-threshold 96 \
