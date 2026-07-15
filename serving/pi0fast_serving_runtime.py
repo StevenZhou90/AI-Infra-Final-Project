@@ -20,6 +20,7 @@ import numpy as np
 import torch
 
 from serving.kv_cache_manager import KVCacheManager
+from serving.pi0fast_token_hooks import PI0FastTokenLogitAdapter
 
 NS_PER_MS = 1_000_000
 
@@ -332,6 +333,94 @@ class RealPI0FastBatchBackend(RealPIBatchBackend):
         postprocessor: Callable[[Any], Any] | None = None,
     ) -> None:
         super().__init__(policy, postprocessor, accelerator="real_pi0fast_batch")
+
+
+class RealPI0FastActionEndBatchBackend(RealPIBatchBackend):
+    """Real PI0-FAST backend that decodes FAST tokens only until action end."""
+
+    def __init__(
+        self,
+        policy: Any,
+        postprocessor: Callable[[Any], Any] | None = None,
+        *,
+        token_adapter: Any | None = None,
+        autocast_dtype: torch.dtype | None = None,
+        inference_kwargs: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(
+            policy,
+            postprocessor,
+            accelerator="real_pi0fast_action_end_batch",
+            autocast_dtype=autocast_dtype,
+            inference_kwargs=inference_kwargs,
+        )
+        self.token_adapter = token_adapter or PI0FastTokenLogitAdapter(policy)
+
+    def predict_batch(
+        self,
+        batch: PI0FastBatch,
+        sessions: Mapping[str, PI0FastSessionState],
+    ) -> Sequence[PI0FastBackendResult]:
+        prepared = []
+        for request in batch.requests:
+            if request.observation is None:
+                raise ValueError(f"Request {request.request_id} has no prepared PI0-FAST observation")
+            prepared.append(request.observation)
+        merged = merge_prepared_pi0fast_batches(prepared)
+
+        device = self._policy_device()
+        if device is not None and device.type == "cuda":
+            torch.cuda.synchronize(device)
+        t0 = time.perf_counter()
+        with torch.inference_mode():
+            if self.autocast_dtype is not None and device is not None and device.type == "cuda":
+                cast_context = torch.autocast(device_type=device.type, dtype=self.autocast_dtype)
+            else:
+                cast_context = contextlib.nullcontext()
+            with cast_context:
+                trace = self.token_adapter.predict_action_chunk_action_end(merged, **self.inference_kwargs)
+                raw_actions = trace.actions
+            processed = self.postprocessor(raw_actions) if self.postprocessor is not None else raw_actions
+        if device is not None and device.type == "cuda":
+            torch.cuda.synchronize(device)
+        self.last_runtime_ms = (time.perf_counter() - t0) * 1000.0
+        self.calls += 1
+
+        action_batch = actions_to_numpy(processed)
+        if action_batch.shape[0] != batch.size:
+            raise RuntimeError(f"Expected {batch.size} action chunks, got shape {action_batch.shape}")
+
+        trace_stats = dict(getattr(trace, "stats", None) or {})
+        raw_row_counts = trace_stats.get("row_token_counts")
+        if raw_row_counts is None:
+            row_counts = [int(getattr(trace, "token_count", 0) or 0)] * batch.size
+        else:
+            row_counts = [int(value) for value in raw_row_counts]
+            if len(row_counts) != batch.size:
+                row_counts = [max(row_counts or [0])] * batch.size
+
+        return [
+            PI0FastBackendResult(
+                actions=action_batch[idx],
+                action_tokens=row_counts[idx],
+                accelerator=self.accelerator,
+                extra={
+                    "batch_runtime_ms": self.last_runtime_ms,
+                    "decode_path": "action_end",
+                    "row_token_counts": row_counts,
+                    "inference_kwargs": dict(self.inference_kwargs),
+                    "autocast_dtype": str(self.autocast_dtype).replace("torch.", "")
+                    if self.autocast_dtype is not None
+                    else None,
+                    **{
+                        key: value
+                        for key, value in trace_stats.items()
+                        if key in {"stopped_on_action_end", "action_end_token_id"}
+                    },
+                },
+            )
+            for idx in range(batch.size)
+        ]
 
 
 class PI0FastDeadlineBatchScheduler:

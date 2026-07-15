@@ -16,6 +16,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from lerobot.configs.policies import PreTrainedConfig  # noqa: E402
 from scripts.benchmark_pi0fast_ngram_latency import _action_diff_summary, _postprocess_action  # noqa: E402
 from scripts.generate_pi0fast_eagle_data import _ensure_libero_config  # noqa: E402
 from scripts.run_pi0fast_chunk_eval import _env_step, _import_lerobot, _prepare_observation  # noqa: E402
@@ -27,6 +28,31 @@ if "MUJOCO_GL" not in os.environ and not os.environ.get("DISPLAY"):
     os.environ["MUJOCO_GL"] = "egl"
 
 logger = logging.getLogger("benchmark_pi0fast_block_drafter_latency")
+
+
+def _jsonable(value):
+    if isinstance(value, torch.Tensor):
+        detached = value.detach()
+        if detached.numel() == 1:
+            return detached.item()
+        if detached.numel() <= 16:
+            return detached.cpu().tolist()
+        return {
+            "shape": list(detached.shape),
+            "dtype": str(detached.dtype),
+            "device": str(detached.device),
+        }
+    if isinstance(value, np.ndarray):
+        if value.size <= 16:
+            return value.tolist()
+        return {"shape": list(value.shape), "dtype": str(value.dtype)}
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {str(key): _jsonable(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    return value
 
 
 def parse_args() -> argparse.Namespace:
@@ -116,6 +142,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
+    parser.add_argument(
+        "--disable-gradient-checkpointing",
+        action="store_true",
+        help="Disable gradient checkpointing in the policy config and loaded model for serving-style latency.",
+    )
     parser.add_argument("--control-mode", choices=["relative", "absolute"], default="relative")
     parser.add_argument("--output", required=True)
     parser.add_argument("--libero-config-path", default=os.environ.get("LIBERO_CONFIG_PATH"))
@@ -153,7 +184,17 @@ def main() -> None:
 
     env_cfg = LiberoEnv(task=args.task, task_ids=[args.task_id], control_mode=args.control_mode)
     logger.info("Loading policy %s on %s", args.policy, device)
-    policy = PI0FastPolicy.from_pretrained(args.policy).to(device=device, dtype=dtype).eval()
+    policy_config = PreTrainedConfig.from_pretrained(args.policy)
+    if hasattr(policy_config, "device"):
+        policy_config.device = str(device)
+    if hasattr(policy_config, "dtype"):
+        policy_config.dtype = args.dtype
+    if args.disable_gradient_checkpointing and hasattr(policy_config, "gradient_checkpointing"):
+        policy_config.gradient_checkpointing = False
+    policy = PI0FastPolicy.from_pretrained(args.policy, config=policy_config).to(device=device, dtype=dtype).eval()
+    if args.disable_gradient_checkpointing and hasattr(policy.model, "gradient_checkpointing_disable"):
+        policy.model.gradient_checkpointing_disable()
+        policy.eval()
     adapter = PI0FastTokenLogitAdapter(policy)
     policy_preprocessor, policy_postprocessor = make_pre_post_processors(
         policy.config,
@@ -253,7 +294,7 @@ def main() -> None:
                     "tokens_equal": tokens_equal,
                     "first_token_diff": first_token_diff,
                     "action_diff": action_diff,
-                    "spec_stats": spec.stats,
+                    "spec_stats": _jsonable(spec.stats),
                 }
                 rows.append(row)
                 logger.info(
@@ -264,7 +305,7 @@ def main() -> None:
                     spec_ms,
                     baseline_ms / spec_ms if spec_ms else 0.0,
                     tokens_equal,
-                    spec.stats,
+                    _jsonable(spec.stats),
                 )
             for action in baseline_actions[: policy.config.n_action_steps]:
                 observation, _reward, terminated, truncated, _info = _env_step(env, action, env_postprocessor)
