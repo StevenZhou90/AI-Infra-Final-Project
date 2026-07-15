@@ -26,7 +26,9 @@ serving when distinct robot observations are batched together.
   same task/seed failed at 4, 6, and 10 steps, so the failure is not explained
   by the lower latency setting.
 - Keep PI0-FAST on the `action_end` decode path for serving.  Do not use the
-  public fixed-256-token decode path except as a baseline.
+  public fixed-256-token decode path except as a baseline.  The adapter must
+  match LeRobot v0.6 token embedding semantics; generated token embeddings are
+  not scaled by `sqrt(hidden_dim)` on the current upstream path.
 - Treat PI0-FAST rows above `96` FAST tokens as stragglers in telemetry.  Use a
   hard serving cap such as `128` tokens for latency experiments, and keep `256`
   only for correctness comparisons.
@@ -60,6 +62,112 @@ PI0.5 rollout smoke, `libero_object` task 0, baseline chunk execution:
 The one 4-step failure was `libero_object` task 7, seed 43.  The same episode
 also failed at 6 and 10 flow steps, so this result does not appear to be caused
 by the 4-step latency setting.
+
+PI0-FAST v0.6 accuracy sanity checks:
+
+| Path | Slice | Result |
+| --- | --- | ---: |
+| Official LeRobot eval, `.venv-pi06`, `lerobot/pi0fast-libero` | HF task list, object/spatial/goal/10, 1 episode each | 39/40 success, 97.5%, 110.0 s/episode |
+| Official LeRobot eval, `.venv-pi06`, `lerobot/pi0fast-libero` | `libero_object`, task 0, 1 episode | 1/1 success |
+
+The v0.6 run uses LeRobot `0.6.0`, bf16 on CUDA, the current
+`lerobot/pi0fast-libero` checkpoint, default LIBERO camera keys, and fixed
+public 256-token decode. Per-suite success was object `10/10`, spatial `9/10`,
+goal `10/10`, and `libero_10` `10/10`; the only failed task was
+`libero_spatial_5`. Artifact:
+`outputs/eval/2026-07-14/03-10-08_pi06_pi0fast_libero_full40/eval_info.json`.
+
+PI0-FAST v0.6 model-serving component benchmark, bf16, corrected constrained
+action-end decode,
+`outputs/pi0fast_system_components/pi06_pi0fast_libero_action_end_constrained_task1_steps5.json`:
+
+| Mode | Chunk mean | Per request | Per action | Token count |
+| --- | ---: | ---: | ---: | ---: |
+| Single public fixed decode probe | 4557.2 ms | 4557.2 ms | 455.7 ms | 256 |
+| Single constrained `action_end` request | 554.5 ms | 554.5 ms | 55.4 ms | 29.8 mean |
+| Replicated batch 2 constrained `action_end` | 604.3 ms | 302.2 ms | 30.2 ms | 30.6 mean |
+| Replicated batch 4 constrained `action_end` | 639.8 ms | 160.0 ms | 16.0 ms | 30.0 mean |
+| Replicated batch 8 constrained `action_end` | 717.5 ms | 89.7 ms | 9.0 ms | 28.4 mean |
+
+The corrected adapter was validated on a same-observation probe against the
+public fixed decode with `max_abs_vs_public=0.0`; the stop-token path generated
+32 tokens instead of 256 on that probe. Batch 8 meets a 100 ms/request target by
+amortizing one 10-action chunk across replicated requests. Single request
+meets 100 ms/action but not 100 ms/request. The constrained path restricts the
+LM head projection to the FAST-action/text candidate set and matched default
+action-end tokens/actions on the probe.
+
+PI0-FAST historical v044 accuracy sanity checks:
+
+| Path | Slice | Result |
+| --- | --- | ---: |
+| Official LeRobot eval with camera `rename_map` | HF task list, object/spatial/goal/10, 1 episode each | 30/40 success, 75.0%, 139.8 s/episode |
+| Official LeRobot eval with camera `rename_map` | `libero_object`, task 1, 2 episodes | 2/2 success, 88.9 s/episode |
+| Custom fixed-budget runner | `libero_object`, task 1, episode 0 | 1/1 success, 602.6 ms/control |
+| Custom `action_end` runner | `libero_object`, task 1, episode 0 | 1/1 success, 224.1 ms/control |
+| Custom `action_end` runner | `libero_object`, tasks 0-9, episode 0 | 8/10 success, 206.1 ms/control |
+| Custom `action_end` runner | `libero_spatial`, tasks 0-9, episode 0 | 9/10 success, 330.0 ms/control |
+| Custom `action_end` runner | `libero_goal`, tasks 0-9, episode 0 | 7/10 success, 282.6 ms/control |
+| Custom `action_end` runner | object + spatial + goal, tasks 0-9, episode 0 | 24/30 success, 272.9 ms/control |
+| Custom `action_end` runner | object + spatial + goal, tasks 0-9, episodes 0-3 | 93/120 success, 269.2 ms/control |
+| Custom `action_end` runner | `libero_10`, tasks 0-9, episode 0 | 1/10 success, 182.5 ms/control |
+| Custom `action_end` exact validator | `libero_object`, task 1, episode 0 | 1/1 success, 14 exact verifies, max action diff 0.0 |
+| Custom `action_end` exact validator | weak `libero_goal` rows, task ids 0/6/9, episode 0 | 0/3 success, 90 exact verifies, max action diff 0.0 |
+| Custom `action_end`, absolute control | `libero_goal`, task 0, episode 0 | 0/1 success, 222.0 ms/control |
+| Official LeRobot eval, `env.init_states=false`, seed 1000 | `libero_goal`, task 0, episode 0 | 1/1 success, 95.7 s/episode |
+| Custom `action_end`, `--no-init-states --seed 1000` | `libero_goal`, task 0, episode 0 | 1/1 success, 271.2 ms/control |
+| Official LeRobot eval, `env.init_states=false`, seed 1000 | `libero_object`, task 0, episode 0 | 1/1 success, 91.1 s/episode |
+| Custom baseline, `--no-init-states --seed 1000` | `libero_object`, task 0, episode 0 | 0/1 success, 559.2 ms/control |
+
+The older 7/120 strict PI0-FAST rows came from an earlier custom
+`lerobot/pi0fast-libero` stack/protocol. They are neither the current v0.6
+official eval result nor the HF-carded `lerobot/pi0fast-libero-v044` checkpoint
+that reports 82.5% LIBERO SR. Treat those rows as historical
+latency/equivalence artifacts only.
+The official LeRobot command on this v0.4.4 install, using the carded v044
+checkpoint, the HF task list, `eval.n_episodes=1`, and the camera `rename_map`,
+is `30/40 = 75.0%`: object `9/10`, spatial `8/10`, goal `8/10`, and
+`libero_10` `5/10`. Failed task ids are `libero_object_0`,
+`libero_spatial_1`, `libero_spatial_9`, `libero_goal_3`, `libero_goal_9`, and
+`libero_10_{0,2,4,6,9}`. This is below the HF card's `82.5%` table, but it is
+not the old `7/120` baseline, and it used fixed 256-token decode, so the gap is
+not caused by action-end early stopping. Artifact:
+`outputs/eval/2026-07-14/00-35-17_libero_pi0_fast/eval_info.json`.
+
+Follow-up HF/cache check: the v0.6 rerun resolved the apparent high-level
+accuracy gap. The old `7/120` row was not an out-of-the-box HF baseline. It was
+a historical custom strict run on a different stack/protocol. The current
+`lerobot/pi0fast-libero` checkpoint is also not a drop-in replacement for the
+v044 runner: it expects default LIBERO camera keys, while v044 expects
+`base_0_rgb` and `left_wrist_0_rgb` via `rename_map`.
+
+The current v044 30-row smoke is in the same broad accuracy regime, and the
+v044 120-row custom run is `93/120 = 77.5%` with object `38/40`, spatial
+`31/40`, and goal `24/40`. Exact validation on representative failed goal rows
+matched the fixed 256-token decode exactly. Read the `93/120` row as a fixed
+LIBERO-init-state stress test, not as an exact HF-card protocol reproduction. A
+sentinel row exposed a remaining custom-runner gap: official LeRobot eval
+succeeds on `libero_object` task 0 seed 1000, while the custom baseline loop
+still fails after adding the official camera `rename_map`, global seeding, and
+config-first policy load. For HF-card accuracy claims, use official
+`lerobot-eval`; use the custom runner for token-level latency/equivalence
+diagnostics until the rollout mismatch is fully reconciled.
+
+PI0-FAST v044 model-serving component benchmark, bf16, action-end decode,
+`outputs/pi0fast_system_components/v044_action_end_replicated_task1_steps5.json`:
+
+| Mode | Chunk mean | Per request | Per action |
+| --- | ---: | ---: | ---: |
+| Single request | 605.1 ms | 605.1 ms | 60.5 ms |
+| Replicated batch 2 | 636.2 ms | 318.1 ms | 31.8 ms |
+| Replicated batch 4 | 676.1 ms | 169.0 ms | 16.9 ms |
+| Replicated batch 8 | 788.6 ms | 98.6 ms | 9.9 ms |
+
+The benchmark recommendation marks batch 8 as meeting a 100 ms/request target,
+and the single-request path already meets a 100 ms/action target by amortizing
+one policy call over the 10-action PI0-FAST chunk. These rows exclude simulator
+render/step overhead; rollout wall-clock rows above include LIBERO/OSMesa
+observation cost.
 
 PI0.5 synthetic serving capacity, calibrated from 4-step bf16 latency and
 staggered robot chunk requests:
@@ -123,17 +231,19 @@ or projected utilization from `--max-admission-utilization`.  The gRPC server
 also has a dedicated GPU worker queue so request handler threads only decode and
 enqueue work, and it can run startup warmup from a saved prepared observation.
 
-PI0-FAST, bf16, `lerobot/pi0fast-libero`, action-end decode:
+PI0-FAST, bf16, current `lerobot/pi0fast-libero`, corrected constrained
+action-end decode:
 
 | Mode | Mean latency |
 | --- | ---: |
-| Single request | ~613-658 ms |
-| Replicated batch 8 | ~821 ms total, ~103 ms/request |
-| Distinct-reset batch 8 | ~4.7 s total when stragglers run near the 256-token cap |
+| Single request | 554.5 ms |
+| Replicated batch 8 | 717.5 ms total, 89.7 ms/request |
+| Public fixed decode probe | 4557.2 ms |
 
-The PI0-FAST result means the implementation should expose token-count
-telemetry and straggler warnings rather than presenting distinct batching as a
-reliable low-latency path.
+The PI0-FAST serving path should keep token-count telemetry and straggler
+warnings. Replicated batches meet a 100 ms/request target here; distinct
+real-observation batches still need separate straggler checks before being
+presented as reliable low-latency serving.
 
 ## Benchmark Commands
 
@@ -340,30 +450,31 @@ one `--worker` entry per address.  Router telemetry is added to
 PI0-FAST action-end replicated batch:
 
 ```bash
-HF_HOME=/home/ubuntu/AI-Infra-Final-Project/.hf_cache \
-LIBERO_CONFIG_PATH=/home/ubuntu/AI-Infra-Final-Project/.libero_config \
-MPLCONFIGDIR=/tmp/matplotlib-cache MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa \
-.venv-pi/bin/python scripts/benchmark_pi0fast_system_components.py \
+set -a; . ./.env; set +a
+MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa TOKENIZERS_PARALLELISM=false WANDB_MODE=offline \
+.venv-pi06/bin/python scripts/benchmark_pi0fast_system_components.py \
   --policy-kind pi0fast --policy lerobot/pi0fast-libero \
-  --task libero_object --task-id 0 --warmup 1 --steps 2 \
+  --task libero_object --task-id 1 --warmup 1 --steps 5 \
   --batch-sizes 1,2,4,8 --decode-path action_end \
+  --action-end-constrained-vocab \
   --max-decoding-steps default --kv-modes default \
   --batch-source replicated --device cuda --dtype bfloat16 \
-  --output outputs/pi0fast_system_components/pi0fast_action_end_compaction_replicated_steps2.json
+  --target-latency-ms 100 \
+  --output outputs/pi0fast_system_components/pi06_pi0fast_libero_action_end_constrained_task1_steps5.json
 ```
 
 PI0-FAST distinct-reset straggler check:
 
 ```bash
-HF_HOME=/home/ubuntu/AI-Infra-Final-Project/.hf_cache \
-LIBERO_CONFIG_PATH=/home/ubuntu/AI-Infra-Final-Project/.libero_config \
-MPLCONFIGDIR=/tmp/matplotlib-cache MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa \
-.venv-pi/bin/python scripts/benchmark_pi0fast_system_components.py \
+set -a; . ./.env; set +a
+MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa TOKENIZERS_PARALLELISM=false WANDB_MODE=offline \
+.venv-pi06/bin/python scripts/benchmark_pi0fast_system_components.py \
   --policy-kind pi0fast --policy lerobot/pi0fast-libero \
-  --task libero_object --task-id 0 --warmup 1 --steps 1 \
+  --task libero_object --task-id 1 --warmup 1 --steps 1 \
   --batch-sizes 1,2,4,8 --decode-path action_end \
+  --action-end-constrained-vocab \
   --max-decoding-steps default --kv-modes default \
   --batch-source distinct-reset --device cuda --dtype bfloat16 \
   --action-token-warn-threshold 96 \
-  --output outputs/pi0fast_system_components/pi0fast_action_end_compaction_distinct_steps1_tokenmean.json
+  --output outputs/pi0fast_system_components/pi06_pi0fast_libero_action_end_distinct_task1_steps1.json
 ```
