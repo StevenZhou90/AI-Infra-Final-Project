@@ -12,6 +12,7 @@ import argparse
 import json
 import logging
 import os
+import random
 import re
 import sys
 import time
@@ -36,6 +37,7 @@ from serving.pi0fast_chunking import (  # noqa: E402
 from serving.pi0fast_action_gate import ACTION_GATE_FEATURES, action_gate_feature_values, load_action_gate  # noqa: E402
 from serving.pi0fast_eagle import load_trace_records  # noqa: E402
 from serving.pi0fast_ngram import NgramDraftConfig, NgramFastTokenDrafter  # noqa: E402
+from serving.pi0fast_pattern_drafter import PatternDraftConfig, PatternFastTokenDrafter, parse_source_priority  # noqa: E402
 from serving.pi0fast_block_drafter import load_block_drafter_checkpoint  # noqa: E402
 from serving.pi0fast_block_gate import load_block_gate  # noqa: E402
 from serving.pi0fast_cutoff_selector import load_cutoff_selector  # noqa: E402
@@ -44,11 +46,153 @@ from serving.pi0fast_prefix_gate import PREFIX_GATE_FEATURES, action_feature_val
 from serving.pi0fast_token_hooks import PI0FastTokenLogitAdapter  # noqa: E402
 from serving.pi0fast_action_dflash import load_action_dflash_checkpoint  # noqa: E402
 from serving.pi0fast_trajectory_head import load_trajectory_tail_checkpoint  # noqa: E402
+from scripts.pi0fast_token_trace_export import TokenTraceSink, parse_token_trace_modes  # noqa: E402
 
 if "MUJOCO_GL" not in os.environ and not os.environ.get("DISPLAY"):
     os.environ["MUJOCO_GL"] = "egl"
 
 logger = logging.getLogger("run_pi0fast_chunk_eval")
+
+PI0FAST_DEFAULT_POLICY = "lerobot/pi0fast-libero-v044"
+PI05_DEFAULT_POLICY = "lerobot/pi05_libero_finetuned_v044"
+DEFAULT_LIBERO_RENAME_MAP = {
+    "observation.images.image": "observation.images.base_0_rgb",
+    "observation.images.image2": "observation.images.left_wrist_0_rgb",
+}
+
+RISK_GATE_CLAUSE_KEYS = {
+    "min_checkpoint",
+    "max_checkpoint",
+    "min_token_count",
+    "max_token_count",
+    "max_logprob_mean",
+    "min_entropy_mean",
+    "min_action_abs_max",
+    "max_action_abs_max",
+    "min_position_span",
+    "max_position_span",
+    "min_rotation_span",
+    "max_rotation_span",
+    "min_max_step_delta",
+    "max_max_step_delta",
+}
+
+PI0FAST_TOKEN_MODE_PREFIXES = (
+    "target_eos",
+    "target_cutoff",
+    "ngram_sd",
+    "ngram_extend",
+    "ngram_traj_tail",
+    "pattern_sd",
+    "medusa_sd",
+    "block_sd",
+    "exact_fast_sd",
+)
+
+
+def _load_token_id_file(path: Path | str | None) -> list[int]:
+    if path is None:
+        return []
+    token_path = Path(path)
+    data = json.loads(token_path.read_text())
+    if isinstance(data, dict):
+        raw_ids = None
+        for key in ("token_ids", "tokens", "candidate_token_ids", "extra_token_ids"):
+            if key in data:
+                raw_ids = data[key]
+                break
+    else:
+        raw_ids = data
+    if raw_ids is None:
+        raise ValueError(f"{token_path} must contain token_ids or a JSON list")
+    return sorted({int(token_id) for token_id in raw_ids})
+
+
+def parse_checkpoint_stable_checks(value: str) -> dict[int, int]:
+    """Parse comma-separated CHECKPOINT=CHECKS adaptive stop overrides."""
+
+    overrides: dict[int, int] = {}
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise argparse.ArgumentTypeError(
+                f"checkpoint stable override must use CHECKPOINT=CHECKS syntax, got {part!r}"
+            )
+        raw_checkpoint, raw_checks = part.split("=", 1)
+        try:
+            checkpoint = int(raw_checkpoint.strip())
+            checks = int(raw_checks.strip())
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                f"checkpoint stable override must contain integers, got {part!r}"
+            ) from exc
+        if checkpoint <= 0:
+            raise argparse.ArgumentTypeError(f"checkpoint must be positive, got {checkpoint}")
+        if checks <= 0:
+            raise argparse.ArgumentTypeError(f"stable checks must be positive, got {checks}")
+        overrides[checkpoint] = checks
+    return overrides
+
+
+def _parse_risk_gate_clause_spec(value: str) -> dict[str, float]:
+    """Parse a risk-gate OR clause as KEY=VALUE pairs or a JSON object."""
+
+    raw_value = value.strip()
+    if not raw_value:
+        raise argparse.ArgumentTypeError("risk gate clause must not be empty")
+
+    if raw_value.startswith("{"):
+        try:
+            raw_clause = json.loads(raw_value)
+        except json.JSONDecodeError as exc:
+            raise argparse.ArgumentTypeError(f"invalid risk gate JSON clause: {exc}") from exc
+        if not isinstance(raw_clause, dict):
+            raise argparse.ArgumentTypeError("risk gate JSON clause must be an object")
+        raw_items = raw_clause.items()
+    else:
+        raw_items = []
+        for part in raw_value.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "=" not in part:
+                raise argparse.ArgumentTypeError(
+                    f"risk gate clause entries must use KEY=VALUE syntax, got {part!r}"
+                )
+            key, raw = part.split("=", 1)
+            raw_items.append((key.strip(), raw.strip()))
+
+    clause: dict[str, float] = {}
+    for key, raw in raw_items:
+        if key not in RISK_GATE_CLAUSE_KEYS:
+            allowed = ", ".join(sorted(RISK_GATE_CLAUSE_KEYS))
+            raise argparse.ArgumentTypeError(f"unknown risk gate clause key {key!r}; allowed keys: {allowed}")
+        try:
+            clause[key] = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise argparse.ArgumentTypeError(
+                f"risk gate clause value for {key!r} must be numeric, got {raw!r}"
+            ) from exc
+
+    if not clause:
+        raise argparse.ArgumentTypeError("risk gate clause must include at least one threshold")
+    return clause
+
+
+def _pi05_unsupported_fast_token_modes(modes: list[str]) -> list[str]:
+    return [
+        mode
+        for mode in modes
+        if any(mode.startswith(prefix) for prefix in PI0FAST_TOKEN_MODE_PREFIXES)
+    ]
+
+
+def _identity_torch_compile(model=None, *args, **kwargs):
+    if model is None:
+        return lambda fn: fn
+    return model
 
 
 def _ensure_libero_config(config_path: str | None) -> None:
@@ -145,6 +289,23 @@ def _extract_success(info: dict[str, Any]) -> bool:
     return False
 
 
+def _parse_rename_map(raw: str | None) -> dict[str, str]:
+    if raw is None or raw.strip().lower() in {"", "none", "null", "{}"}:
+        return {}
+    value = json.loads(raw)
+    if not isinstance(value, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in value.items()):
+        raise ValueError("--rename-map must be a JSON object mapping source observation keys to target keys")
+    return value
+
+
+def _set_global_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def _call_task(env) -> list[str]:
     try:
         return list(env.call("task_description"))
@@ -153,6 +314,26 @@ def _call_task(env) -> list[str]:
             return list(env.call("task"))
         except (AttributeError, NotImplementedError):
             return [""] * env.num_envs
+
+
+def _set_env_episode_index(env, episode: int) -> None:
+    """Keep LIBERO init-state ids aligned with requested episode labels.
+
+    LeRobot's LIBERO env advances ``init_state_id`` on every reset.  That is fine
+    for a single official eval stream, but this runner may evaluate several
+    modes against the same vector env.  Resetting the index before each rollout
+    makes ``task_id``/``episode`` pairs comparable across modes and shards.
+    """
+
+    envs = getattr(env, "envs", None)
+    if envs is None:
+        envs = [env]
+    for offset, inner_env in enumerate(envs):
+        init_state_id = int(episode) + offset
+        if hasattr(inner_env, "init_state_id"):
+            inner_env.init_state_id = init_state_id
+        if hasattr(inner_env, "episode_index"):
+            inner_env.episode_index = init_state_id
 
 
 def _prepare_observation(
@@ -315,10 +496,13 @@ def _predict_action_chunk(
         raw_action = trace.actions
         token_count = trace.token_count
         token_ids = trace.token_ids.detach()
+        stats = trace.stats
     elif hasattr(policy, "predict_action_chunk"):
         raw_action = policy.predict_action_chunk(batch)
+        stats = None
     else:
         raw_action = policy.select_action(batch)
+        stats = None
 
     if device.startswith("cuda") and torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -335,7 +519,106 @@ def _predict_action_chunk(
             token_count = int(np.asarray(policy._last_action_tokens).size)
         except Exception:
             token_count = None
-    return PredictionTrace(actions=actions, elapsed_ms=elapsed_ms, token_count=token_count, token_ids=token_ids)
+    return PredictionTrace(actions=actions, elapsed_ms=elapsed_ms, token_count=token_count, token_ids=token_ids, stats=stats)
+
+
+@torch.inference_mode()
+def _predict_target_eos_chunk(
+    token_adapter: PI0FastTokenLogitAdapter,
+    batch: dict[str, Any],
+    postprocessor,
+    device: str,
+    *,
+    constrained_action_vocab: bool = False,
+    constrained_action_vocab_size: int | None = None,
+    constrained_text_vocab_size: int | None = None,
+    constrained_full_head_margin: float | None = None,
+    constrained_force_action_prefix: bool = True,
+    constrained_structural_token_radius: int = 512,
+    constrained_full_head_prefix_tokens: int = 0,
+    constrained_extra_token_ids: list[int] | None = None,
+    force_action_prefix: bool = False,
+    stop_on_action_chars: bool = False,
+    action_char_min_chars: int | None = None,
+    action_char_plateau_tokens: int = 0,
+    action_char_stable_checks: int = 0,
+    action_char_stable_tolerance: float = 0.0,
+    action_char_stable_max_chars: int = 0,
+    action_char_plateau_reject_eos_restart: bool = False,
+    action_char_restart_continue: bool = False,
+    action_char_restart_reset: bool = False,
+    action_char_restart_reset_low_text_tokens: int = 0,
+    action_char_plateau_low_text_tail_tokens: int = 0,
+    action_char_strict_target_stop: bool = False,
+    action_char_reset_requires_action_end: bool = False,
+    action_char_target_confirm_tokens: int = 0,
+) -> PredictionTrace:
+    if stop_on_action_chars and hasattr(token_adapter, "prepare_action_char_length_lookup"):
+        token_adapter.prepare_action_char_length_lookup(device=device)
+    if device.startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    if constrained_action_vocab:
+        trace = token_adapter.predict_action_chunk_action_end(
+            batch,
+            constrained_action_vocab=True,
+            constrained_action_vocab_size=constrained_action_vocab_size,
+            constrained_text_vocab_size=constrained_text_vocab_size,
+            constrained_full_head_margin=constrained_full_head_margin,
+            constrained_force_action_prefix=constrained_force_action_prefix,
+            constrained_structural_token_radius=constrained_structural_token_radius,
+            constrained_full_head_prefix_tokens=constrained_full_head_prefix_tokens,
+            constrained_extra_token_ids=constrained_extra_token_ids,
+            force_action_prefix=force_action_prefix,
+            stop_on_action_chars=stop_on_action_chars,
+            action_char_min_chars=action_char_min_chars,
+            action_char_plateau_tokens=action_char_plateau_tokens,
+            action_char_stable_checks=action_char_stable_checks,
+            action_char_stable_tolerance=action_char_stable_tolerance,
+            action_char_stable_max_chars=action_char_stable_max_chars,
+            action_char_plateau_reject_eos_restart=action_char_plateau_reject_eos_restart,
+            action_char_restart_continue=action_char_restart_continue,
+            action_char_restart_reset=action_char_restart_reset,
+            action_char_restart_reset_low_text_tokens=action_char_restart_reset_low_text_tokens,
+            action_char_plateau_low_text_tail_tokens=action_char_plateau_low_text_tail_tokens,
+            action_char_strict_target_stop=action_char_strict_target_stop,
+            action_char_reset_requires_action_end=action_char_reset_requires_action_end,
+            action_char_target_confirm_tokens=action_char_target_confirm_tokens,
+        )
+    else:
+        trace = token_adapter.predict_action_chunk_action_end(
+            batch,
+            force_action_prefix=force_action_prefix,
+            stop_on_action_chars=stop_on_action_chars,
+            action_char_min_chars=action_char_min_chars,
+            action_char_plateau_tokens=action_char_plateau_tokens,
+            action_char_stable_checks=action_char_stable_checks,
+            action_char_stable_tolerance=action_char_stable_tolerance,
+            action_char_stable_max_chars=action_char_stable_max_chars,
+            action_char_plateau_reject_eos_restart=action_char_plateau_reject_eos_restart,
+            action_char_restart_continue=action_char_restart_continue,
+            action_char_restart_reset=action_char_restart_reset,
+            action_char_restart_reset_low_text_tokens=action_char_restart_reset_low_text_tokens,
+            action_char_plateau_low_text_tail_tokens=action_char_plateau_low_text_tail_tokens,
+            action_char_strict_target_stop=action_char_strict_target_stop,
+            action_char_reset_requires_action_end=action_char_reset_requires_action_end,
+            action_char_target_confirm_tokens=action_char_target_confirm_tokens,
+        )
+    if device.startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+
+    try:
+        processed = postprocessor(trace.actions)
+    except Exception:
+        processed = trace.actions
+    return PredictionTrace(
+        actions=_to_numpy_action(processed),
+        elapsed_ms=elapsed_ms,
+        token_count=trace.token_count,
+        token_ids=trace.token_ids.detach(),
+        stats=trace.stats,
+    )
 
 
 @torch.inference_mode()
@@ -349,9 +632,12 @@ def _predict_adaptive_prefix_chunk(
     stable_checks: int,
     early_stable_checks: int | None,
     early_max_stable_checkpoint: int | None,
+    checkpoint_stable_checks: dict[int, int] | None,
     skip_unproductive_checks: bool,
     skip_unproductive_after_checkpoint: int,
     continue_to_action_end_on_unstable: bool,
+    stability_continue_to_action_end: bool,
+    stability_risk_gate: dict[str, Any] | None,
     prefix_gate,
     prefix_gate_threshold: float,
 ) -> PredictionTrace:
@@ -365,9 +651,12 @@ def _predict_adaptive_prefix_chunk(
         stable_checks=stable_checks,
         early_stable_checks=early_stable_checks,
         early_max_stable_checkpoint=early_max_stable_checkpoint,
+        checkpoint_stable_checks=checkpoint_stable_checks,
         skip_unproductive_checks=skip_unproductive_checks,
         skip_unproductive_after_checkpoint=skip_unproductive_after_checkpoint,
         continue_to_action_end_on_unstable=continue_to_action_end_on_unstable,
+        stability_continue_to_action_end=stability_continue_to_action_end,
+        stability_risk_gate=stability_risk_gate,
         prefix_gate=prefix_gate,
         prefix_gate_threshold=prefix_gate_threshold,
         early_stop_action_end=True,
@@ -396,6 +685,8 @@ def _predict_prefix_cutoff_chunk(
     postprocessor,
     device: str,
     cutoff_tokens: int,
+    collect_logits: bool = False,
+    force_action_prefix: bool = False,
 ) -> PredictionTrace:
     if device.startswith("cuda") and torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -404,6 +695,8 @@ def _predict_prefix_cutoff_chunk(
         batch,
         cutoff_tokens=cutoff_tokens,
         early_stop_action_end=True,
+        collect_logits=collect_logits,
+        force_action_prefix=force_action_prefix,
     )
     if device.startswith("cuda") and torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -431,6 +724,25 @@ def _predict_ngram_spec_chunk(
     ngram_drafter: NgramFastTokenDrafter,
     lookahead: int,
     reuse_full_blocks: bool,
+    min_verify_margin: float = 0.0,
+    emit_bonus_token: bool = False,
+    defer_correction_token: bool = False,
+    verify_from_scratch: bool = False,
+    replay_accepted_cache: bool = False,
+    resync_accepted_cache: bool = False,
+    diagnose_verify_alignment: bool = False,
+    dynamic_lookahead: bool = False,
+    min_lookahead: int = 1,
+    lookahead_growth: int = 1,
+    lookahead_shrink: int = 4,
+    tree_width: int = 1,
+    tree_branch_width: int = 4,
+    dynamic_tree_width: bool = False,
+    min_tree_width: int = 1,
+    tree_width_growth: int = 1,
+    tree_width_shrink: int = 1,
+    tree_anchor_target_token: bool = False,
+    tree_anchor_target_continuation: bool = False,
     early_stop_action_end: bool = True,
 ) -> PredictionTrace:
     if device.startswith("cuda") and torch.cuda.is_available():
@@ -441,6 +753,25 @@ def _predict_ngram_spec_chunk(
         drafter=ngram_drafter,
         lookahead=lookahead,
         reuse_full_blocks=reuse_full_blocks,
+        min_verify_margin=min_verify_margin,
+        verify_from_scratch=verify_from_scratch,
+        emit_bonus_token=emit_bonus_token,
+        defer_correction_token=defer_correction_token,
+        replay_accepted_cache=replay_accepted_cache,
+        resync_accepted_cache=resync_accepted_cache,
+        diagnose_verify_alignment=diagnose_verify_alignment,
+        dynamic_lookahead=dynamic_lookahead,
+        min_lookahead=min_lookahead,
+        lookahead_growth=lookahead_growth,
+        lookahead_shrink=lookahead_shrink,
+        tree_width=tree_width,
+        tree_branch_width=tree_branch_width,
+        dynamic_tree_width=dynamic_tree_width,
+        min_tree_width=min_tree_width,
+        tree_width_growth=tree_width_growth,
+        tree_width_shrink=tree_width_shrink,
+        tree_anchor_target_token=tree_anchor_target_token,
+        tree_anchor_target_continuation=tree_anchor_target_continuation,
         early_stop_action_end=early_stop_action_end,
     )
     if device.startswith("cuda") and torch.cuda.is_available():
@@ -682,6 +1013,41 @@ def _prediction_action_diff(a: np.ndarray, b: np.ndarray) -> tuple[float, float]
     return float(np.max(delta)), float(np.mean(delta))
 
 
+def _prediction_token_diff_stats(prediction: PredictionTrace, target: PredictionTrace, prefix: str) -> dict[str, float]:
+    if prediction.token_ids is None or target.token_ids is None:
+        return {
+            f"{prefix}_token_comparison_available": 0.0,
+            f"{prefix}_token_exact": 0.0,
+        }
+    pred = prediction.token_ids.detach().flatten().cpu().tolist()
+    tgt = target.token_ids.detach().flatten().cpu().tolist()
+    shared = min(len(pred), len(tgt))
+    mismatch_pos = -1
+    for idx in range(shared):
+        if int(pred[idx]) != int(tgt[idx]):
+            mismatch_pos = idx
+            break
+    if mismatch_pos < 0 and len(pred) != len(tgt):
+        mismatch_pos = shared
+    pred_token = pred[mismatch_pos] if 0 <= mismatch_pos < len(pred) else -1
+    tgt_token = tgt[mismatch_pos] if 0 <= mismatch_pos < len(tgt) else -1
+    exact = float(mismatch_pos < 0)
+    return {
+        f"{prefix}_token_comparison_available": 1.0,
+        f"{prefix}_token_exact": exact,
+        f"{prefix}_token_first_mismatch_pos": float(mismatch_pos),
+        f"{prefix}_token_pred_at_mismatch": float(pred_token),
+        f"{prefix}_token_target_at_mismatch": float(tgt_token),
+        f"{prefix}_token_pred_len": float(len(pred)),
+        f"{prefix}_token_target_len": float(len(tgt)),
+    }
+
+
+def _adapter_action_end_token_id(token_adapter: PI0FastTokenLogitAdapter) -> int:
+    value = getattr(token_adapter, "action_end_token_id")
+    return int(value() if callable(value) else value)
+
+
 @torch.no_grad()
 def _prefix_gate_probability_for_prediction(
     prediction: PredictionTrace,
@@ -772,7 +1138,7 @@ def _stable_block_prefix_prediction(
     if prediction.token_ids is None or not cutoffs:
         return None, {"stable_prefix_selected": 0.0, "stable_prefix_reason": "missing_tokens"}
     token_ids = prediction.token_ids
-    action_end = token_adapter.action_end_token_id
+    action_end = _adapter_action_end_token_id(token_adapter)
     previous_actions: np.ndarray | None = None
     stable_count = 0
     checked: list[dict[str, Any]] = []
@@ -860,6 +1226,7 @@ def run_episode(
     drafter: RetrievalChunkDrafter | None,
     token_adapter: PI0FastTokenLogitAdapter | None,
     ngram_drafter: NgramFastTokenDrafter | None,
+    pattern_drafter: PatternFastTokenDrafter | None,
     block_drafter,
     block_token_map,
     block_gate,
@@ -906,6 +1273,27 @@ def run_episode(
     block_draft_after_known_token: bool,
     ngram_lookahead: int,
     ngram_reuse_full_blocks: bool,
+    pattern_lookahead: int,
+    pattern_reuse_full_blocks: bool,
+    pattern_min_verify_margin: float,
+    pattern_emit_bonus_token: bool,
+    pattern_defer_correction_token: bool,
+    pattern_verify_from_scratch: bool,
+    pattern_replay_accepted_cache: bool,
+    pattern_resync_accepted_cache: bool,
+    pattern_diagnose_verify_alignment: bool,
+    pattern_dynamic_lookahead: bool,
+    pattern_min_lookahead: int,
+    pattern_lookahead_growth: int,
+    pattern_lookahead_shrink: int,
+    pattern_tree_width: int,
+    pattern_tree_branch_width: int,
+    pattern_dynamic_tree_width: bool,
+    pattern_min_tree_width: int,
+    pattern_tree_width_growth: int,
+    pattern_tree_width_shrink: int,
+    pattern_tree_anchor_target_token: bool,
+    pattern_tree_anchor_target_continuation: bool,
     trajectory_head,
     trajectory_tail_blend: float,
     trajectory_project_smooth: bool,
@@ -923,20 +1311,59 @@ def run_episode(
     adaptive_stable_checks: int,
     adaptive_early_stable_checks: int | None,
     adaptive_early_max_stable_checkpoint: int | None,
+    adaptive_checkpoint_stable_checks: dict[int, int],
     adaptive_skip_unproductive_checks: bool,
     adaptive_skip_unproductive_after_checkpoint: int,
     adaptive_continue_to_action_end_on_unstable: bool,
+    adaptive_stability_target_eos_after_step: int | None,
+    adaptive_stability_target_eos_max_fallbacks: int,
+    adaptive_stability_continue_to_action_end_after_step: int | None,
+    adaptive_stability_continue_to_action_end_max_fallbacks: int,
+    adaptive_stability_risk_after_step: int | None,
+    adaptive_stability_risk_max_rejections: int,
+    adaptive_stability_risk_gate: dict[str, Any],
+    adaptive_stability_risk_target_eos_fallback: bool,
+    adaptive_validate_label_all_stability_stops: bool,
+    adaptive_validate_stability_stops_only: bool,
     adaptive_prefix_gate,
     adaptive_prefix_gate_threshold: float,
+    target_eos_constrained_action_vocab_size: int,
+    target_eos_constrained_text_vocab_size: int,
+    target_eos_constrained_full_head_margin: float | None,
+    target_eos_constrained_no_force_prefix: bool,
+    target_eos_constrained_structural_token_radius: int,
+    target_eos_constrained_full_head_prefix_tokens: int,
+    target_eos_constrained_extra_token_ids: list[int] | None,
+    target_eos_action_char_min_chars: int | None,
+    target_eos_action_char_plateau_tokens: int,
+    target_eos_action_char_stable_checks: int,
+    target_eos_action_char_stable_tolerance: float,
+    target_eos_action_char_stable_max_chars: int,
+    target_eos_action_char_plateau_reject_eos_restart: bool,
+    target_eos_action_char_restart_continue: bool,
+    target_eos_action_char_restart_reset: bool,
+    target_eos_action_char_restart_reset_low_text_tokens: int,
+    target_eos_action_char_plateau_low_text_tail_tokens: int,
+    target_eos_action_char_strict_target_stop: bool,
+    target_eos_action_char_reset_requires_action_end: bool,
+    target_eos_action_char_target_confirm_tokens: int,
+    token_trace_sink: TokenTraceSink | None,
     device: str,
     use_amp: bool,
     amp_dtype: torch.dtype | None = None,
 ) -> EpisodeResult:
     policy.reset()
     controller.reset()
+    if pattern_drafter is not None and hasattr(pattern_drafter, "reset_history"):
+        pattern_drafter.reset_history()
+    _set_env_episode_index(env, episode)
     observation, _info = env.reset(seed=[seed])
     done = False
     steps = 0
+    late_stability_target_eos_fallbacks = 0
+    late_stability_action_end_continues = 0
+    late_stability_risk_rejections = 0
+    late_stability_risk_target_eos_fallbacks = 0
     reward_sum = 0.0
     success = False
     control_step_ms: list[float] = []
@@ -951,6 +1378,7 @@ def run_episode(
 
     while not done and steps < max_steps:
         step_start = time.perf_counter()
+        prediction: PredictionTrace | None = None
         buffered = controller.pop() if mode != "baseline" else None
         if buffered is None:
             state_key = _state_key(observation)
@@ -1005,6 +1433,8 @@ def run_episode(
                             ngram_drafter,
                             ngram_lookahead,
                             ngram_reuse_full_blocks,
+                            0.0,
+                            False,
                             early_stop_action_end=True,
                         )
                     controller.stats.record_trace_stats(prediction.stats)
@@ -1036,7 +1466,170 @@ def run_episode(
                             },
                         )
                         controller.stats.guard_reasons.update(["guarded_sd_fallback"])
+                    if mode.startswith("ngram_sd_validate"):
+                        with autocast_ctx:
+                            target_prediction = _predict_action_chunk(
+                                policy,
+                                batch,
+                                policy_postprocessor,
+                                device,
+                                token_adapter,
+                                early_stop_action_end=True,
+                            )
+                        max_diff, mean_diff = _prediction_action_diff(prediction.actions, target_prediction.actions)
+                        controller.stats.exact_verifies += 1
+                        controller.stats.action_max_diffs.append(max_diff)
+                        controller.stats.action_mean_diffs.append(mean_diff)
+                        if max_diff != 0.0:
+                            controller.stats.guard_reasons.update(["ngram_sd_action_diff_fallback"])
+                            prediction = PredictionTrace(
+                                actions=target_prediction.actions,
+                                elapsed_ms=prediction.elapsed_ms + target_prediction.elapsed_ms,
+                                token_count=target_prediction.token_count,
+                                token_ids=target_prediction.token_ids,
+                                stats={
+                                    **(prediction.stats or {}),
+                                    "fallback_target_ms": target_prediction.elapsed_ms,
+                                    "fallback_action_max_diff": max_diff,
+                                },
+                            )
                     if mode.startswith("ngram_sd_direct") or mode.startswith("ngram_sd_guarded"):
+                        controller.queue.clear()
+                        for queued_action in prediction.actions:
+                            controller.queue.append(queued_action.copy())
+                        controller.stats.chunks_seen += 1
+                        controller.stats.chunks_accepted += 1
+                        controller.stats.actions_enqueued += int(prediction.actions.shape[0])
+                        controller.stats.accepted_windows.append(int(prediction.actions.shape[0]))
+                        controller.stats.model_calls += 1
+                        controller.stats.inference_ms.append(prediction.elapsed_ms)
+                        if prediction.token_count is not None:
+                            controller.stats.token_counts.append(prediction.token_count)
+                    else:
+                        controller.offer_chunk(
+                            prediction.actions,
+                            confidence=1.0,
+                            inference_ms=prediction.elapsed_ms,
+                            token_count=prediction.token_count,
+                        )
+                    action = controller.pop()
+                    if action is None:
+                        action = prediction.actions[0]
+                elif mode.startswith("pattern_sd"):
+                    if token_adapter is None or pattern_drafter is None:
+                        raise RuntimeError("pattern_sd mode requires token hooks")
+                    with autocast_ctx:
+                        prediction = _predict_ngram_spec_chunk(
+                            token_adapter,
+                            batch,
+                            policy_postprocessor,
+                            device,
+                            pattern_drafter,
+                            pattern_lookahead,
+                            pattern_reuse_full_blocks,
+                            pattern_min_verify_margin,
+                            pattern_emit_bonus_token,
+                            pattern_defer_correction_token,
+                            pattern_verify_from_scratch,
+                            pattern_replay_accepted_cache,
+                            pattern_resync_accepted_cache,
+                            pattern_diagnose_verify_alignment,
+                            pattern_dynamic_lookahead,
+                            pattern_min_lookahead,
+                            pattern_lookahead_growth,
+                            pattern_lookahead_shrink,
+                            pattern_tree_width,
+                            pattern_tree_branch_width,
+                            pattern_dynamic_tree_width,
+                            pattern_min_tree_width,
+                            pattern_tree_width_growth,
+                            pattern_tree_width_shrink,
+                            pattern_tree_anchor_target_token,
+                            pattern_tree_anchor_target_continuation,
+                            early_stop_action_end=True,
+                        )
+                    prediction.stats = {**(prediction.stats or {}), "pattern_sd": 1.0}
+                    controller.stats.record_trace_stats(prediction.stats)
+                    guarded_fallback = mode.startswith("pattern_sd_guarded") and not _ngram_spec_is_safe(
+                        prediction,
+                        min_acceptance=guarded_min_acceptance,
+                        min_tokens_per_forward=guarded_min_tokens_per_forward,
+                        max_fallback_rate=guarded_max_fallback_rate,
+                    )
+                    if guarded_fallback:
+                        with autocast_ctx:
+                            fallback_prediction = _predict_action_chunk(
+                                policy,
+                                batch,
+                                policy_postprocessor,
+                                device,
+                                token_adapter,
+                                early_stop_action_end=True,
+                            )
+                        prediction = PredictionTrace(
+                            actions=fallback_prediction.actions,
+                            elapsed_ms=prediction.elapsed_ms + fallback_prediction.elapsed_ms,
+                            token_count=fallback_prediction.token_count,
+                            token_ids=fallback_prediction.token_ids,
+                            stats={
+                                **(prediction.stats or {}),
+                                "guarded_fallback": True,
+                                "fallback_target_ms": fallback_prediction.elapsed_ms,
+                            },
+                        )
+                        controller.stats.guard_reasons.update(["pattern_sd_guarded_fallback"])
+                    if mode.startswith("pattern_sd_validate"):
+                        with autocast_ctx:
+                            target_prediction = _predict_action_chunk(
+                                policy,
+                                batch,
+                                policy_postprocessor,
+                                device,
+                                token_adapter,
+                                early_stop_action_end=True,
+                            )
+                        if token_trace_sink is not None:
+                            token_trace_sink.record(
+                                prediction,
+                                mode=f"{mode}_pattern_raw",
+                                task=task,
+                                task_id=task_id,
+                                episode=episode,
+                                seed=seed,
+                                step=steps,
+                            )
+                            token_trace_sink.record(
+                                target_prediction,
+                                mode=f"{mode}_target",
+                                task=task,
+                                task_id=task_id,
+                                episode=episode,
+                                seed=seed,
+                                step=steps,
+                            )
+                        max_diff, mean_diff = _prediction_action_diff(prediction.actions, target_prediction.actions)
+                        controller.stats.record_trace_stats(
+                            _prediction_token_diff_stats(prediction, target_prediction, "pattern")
+                        )
+                        controller.stats.exact_verifies += 1
+                        controller.stats.action_max_diffs.append(max_diff)
+                        controller.stats.action_mean_diffs.append(mean_diff)
+                        if max_diff != 0.0:
+                            controller.stats.guard_reasons.update(["pattern_sd_action_diff_fallback"])
+                            prediction = PredictionTrace(
+                                actions=target_prediction.actions,
+                                elapsed_ms=prediction.elapsed_ms + target_prediction.elapsed_ms,
+                                token_count=target_prediction.token_count,
+                                token_ids=target_prediction.token_ids,
+                                stats={
+                                    **(prediction.stats or {}),
+                                    "fallback_target_ms": target_prediction.elapsed_ms,
+                                    "fallback_action_max_diff": max_diff,
+                                    },
+                                )
+                    if prediction.token_ids is not None and hasattr(pattern_drafter, "observe"):
+                        pattern_drafter.observe(prediction.token_ids[0].detach().cpu().tolist())
+                    if mode.startswith("pattern_sd_direct") or mode.startswith("pattern_sd_guarded"):
                         controller.queue.clear()
                         for queued_action in prediction.actions:
                             controller.queue.append(queued_action.copy())
@@ -1572,6 +2165,7 @@ def run_episode(
                             ngram_drafter,
                             ngram_lookahead,
                             ngram_reuse_full_blocks,
+                            0.0,
                             early_stop_action_end=True,
                         )
                     suffix = mode.removeprefix("ngram_extend")
@@ -1607,6 +2201,7 @@ def run_episode(
                             ngram_drafter,
                             ngram_lookahead,
                             ngram_reuse_full_blocks,
+                            0.0,
                             early_stop_action_end=True,
                         )
                     suffix = mode.removeprefix("ngram_traj_tail")
@@ -1671,6 +2266,8 @@ def run_episode(
                                 policy_postprocessor,
                                 device,
                                 cutoff_tokens=cutoff_tokens,
+                                collect_logits="_gatefull" in mode,
+                                force_action_prefix="_prefix" in mode,
                             )
                         if "_gatefull" in mode:
                             if adaptive_prefix_gate is None:
@@ -1710,6 +2307,25 @@ def run_episode(
                     elif mode.startswith("target_eos_adaptive"):
                         if not adaptive_prefix_checkpoints:
                             raise RuntimeError("target_eos_adaptive requires --adaptive-prefix-checkpoints")
+                        stability_continue_to_action_end = (
+                            adaptive_stability_continue_to_action_end_after_step is not None
+                            and steps >= adaptive_stability_continue_to_action_end_after_step
+                            and (
+                                adaptive_stability_continue_to_action_end_max_fallbacks < 0
+                                or late_stability_action_end_continues
+                                < adaptive_stability_continue_to_action_end_max_fallbacks
+                            )
+                        )
+                        stability_risk_gate = (
+                            adaptive_stability_risk_gate
+                            if adaptive_stability_risk_after_step is not None
+                            and steps >= adaptive_stability_risk_after_step
+                            and (
+                                adaptive_stability_risk_max_rejections < 0
+                                or late_stability_risk_rejections < adaptive_stability_risk_max_rejections
+                            )
+                            else None
+                        )
                         with autocast_ctx:
                             prediction = _predict_adaptive_prefix_chunk(
                                 token_adapter,
@@ -1721,13 +2337,21 @@ def run_episode(
                                 stable_checks=adaptive_stable_checks,
                                 early_stable_checks=adaptive_early_stable_checks,
                                 early_max_stable_checkpoint=adaptive_early_max_stable_checkpoint,
+                                checkpoint_stable_checks=adaptive_checkpoint_stable_checks,
                                 skip_unproductive_checks=adaptive_skip_unproductive_checks,
                                 skip_unproductive_after_checkpoint=adaptive_skip_unproductive_after_checkpoint,
                                 continue_to_action_end_on_unstable=adaptive_continue_to_action_end_on_unstable,
+                                stability_continue_to_action_end=stability_continue_to_action_end,
+                                stability_risk_gate=stability_risk_gate,
                                 prefix_gate=adaptive_prefix_gate,
                                 prefix_gate_threshold=adaptive_prefix_gate_threshold,
                             )
-                        if mode.startswith("target_eos_adaptive_validate"):
+                        risk_rejections = int((prediction.stats or {}).get("stability_risk_gate_rejections", 0))
+                        if risk_rejections:
+                            late_stability_risk_rejections += risk_rejections
+                            controller.stats.guard_reasons.update(["adaptive_stability_risk_gate_reject"])
+                        risk_target_eos_fallback_applied = False
+                        if adaptive_stability_risk_target_eos_fallback and risk_rejections:
                             with autocast_ctx:
                                 target_prediction = _predict_action_chunk(
                                     policy,
@@ -1737,23 +2361,207 @@ def run_episode(
                                     token_adapter,
                                     early_stop_action_end=True,
                                 )
-                            max_diff, mean_diff = _prediction_action_diff(prediction.actions, target_prediction.actions)
-                            controller.stats.exact_verifies += 1
-                            controller.stats.action_max_diffs.append(max_diff)
-                            controller.stats.action_mean_diffs.append(mean_diff)
-                            if max_diff != 0.0:
-                                controller.stats.guard_reasons.update(["adaptive_action_diff_fallback"])
-                                prediction = PredictionTrace(
-                                    actions=target_prediction.actions,
-                                    elapsed_ms=prediction.elapsed_ms + target_prediction.elapsed_ms,
-                                    token_count=target_prediction.token_count,
-                                    token_ids=target_prediction.token_ids,
-                                    stats={
-                                        **(prediction.stats or {}),
-                                        "fallback_target_ms": target_prediction.elapsed_ms,
-                                        "fallback_action_max_diff": max_diff,
-                                    },
+                            late_stability_risk_target_eos_fallbacks += 1
+                            risk_target_eos_fallback_applied = True
+                            controller.stats.guard_reasons.update(
+                                ["adaptive_stability_risk_target_eos_fallback"]
+                            )
+                            prediction = PredictionTrace(
+                                actions=target_prediction.actions,
+                                elapsed_ms=prediction.elapsed_ms + target_prediction.elapsed_ms,
+                                token_count=target_prediction.token_count,
+                                token_ids=target_prediction.token_ids,
+                                stats={
+                                    **(prediction.stats or {}),
+                                    "stability_risk_target_eos_fallback": 1.0,
+                                    "stability_risk_target_eos_fallback_index": float(
+                                        late_stability_risk_target_eos_fallbacks
+                                    ),
+                                    "stability_risk_target_eos_ms": target_prediction.elapsed_ms,
+                                },
+                            )
+                        if bool((prediction.stats or {}).get("continued_after_stability_stop", False)):
+                            late_stability_action_end_continues += 1
+                            controller.stats.guard_reasons.update(["adaptive_late_stability_action_end_continue"])
+                        if (
+                            adaptive_stability_target_eos_after_step is not None
+                            and not risk_target_eos_fallback_applied
+                            and steps >= adaptive_stability_target_eos_after_step
+                            and bool((prediction.stats or {}).get("stopped_on_stability", False))
+                            and (
+                                adaptive_stability_target_eos_max_fallbacks < 0
+                                or late_stability_target_eos_fallbacks
+                                < adaptive_stability_target_eos_max_fallbacks
+                            )
+                        ):
+                            with autocast_ctx:
+                                target_prediction = _predict_action_chunk(
+                                    policy,
+                                    batch,
+                                    policy_postprocessor,
+                                    device,
+                                    token_adapter,
+                                    early_stop_action_end=True,
                                 )
+                            controller.stats.guard_reasons.update(["adaptive_late_stability_target_eos_fallback"])
+                            late_stability_target_eos_fallbacks += 1
+                            prediction = PredictionTrace(
+                                actions=target_prediction.actions,
+                                elapsed_ms=prediction.elapsed_ms + target_prediction.elapsed_ms,
+                                token_count=target_prediction.token_count,
+                                token_ids=target_prediction.token_ids,
+                                stats={
+                                    **(prediction.stats or {}),
+                                    "late_stability_target_eos_fallback": 1.0,
+                                    "late_stability_target_eos_after_step": float(
+                                        adaptive_stability_target_eos_after_step
+                                    ),
+                                    "late_stability_target_eos_fallback_index": float(
+                                        late_stability_target_eos_fallbacks
+                                    ),
+                                    "late_stability_target_eos_ms": target_prediction.elapsed_ms,
+                                },
+                            )
+                        controller.stats.record_trace_stats(prediction.stats)
+                        if mode.startswith("target_eos_adaptive_validate"):
+                            prediction_stats = prediction.stats or {}
+                            is_stability_candidate = bool(
+                                prediction_stats.get("stopped_on_stability", False)
+                                or prediction_stats.get("continued_after_stability_stop", False)
+                            )
+                            should_validate_adaptive = (
+                                not adaptive_validate_stability_stops_only or is_stability_candidate
+                            )
+                            if should_validate_adaptive:
+                                with autocast_ctx:
+                                    target_prediction = _predict_action_chunk(
+                                        policy,
+                                        batch,
+                                        policy_postprocessor,
+                                        device,
+                                        token_adapter,
+                                        early_stop_action_end=True,
+                                    )
+                                max_diff, mean_diff = _prediction_action_diff(
+                                    prediction.actions, target_prediction.actions
+                                )
+                                controller.stats.exact_verifies += 1
+                                controller.stats.action_max_diffs.append(max_diff)
+                                controller.stats.action_mean_diffs.append(mean_diff)
+                                validate_stats = {
+                                    "validate_target_ms": target_prediction.elapsed_ms,
+                                    "validate_action_max_diff": max_diff,
+                                    "validate_action_mean_diff": mean_diff,
+                                }
+                                if max_diff != 0.0 or (
+                                    adaptive_validate_label_all_stability_stops and is_stability_candidate
+                                ):
+                                    validate_stats["fallback_action_max_diff"] = max_diff
+                                if max_diff != 0.0:
+                                    controller.stats.guard_reasons.update(["adaptive_action_diff_fallback"])
+                                    prediction = PredictionTrace(
+                                        actions=target_prediction.actions,
+                                        elapsed_ms=prediction.elapsed_ms + target_prediction.elapsed_ms,
+                                        token_count=target_prediction.token_count,
+                                        token_ids=target_prediction.token_ids,
+                                        stats={
+                                            **prediction_stats,
+                                            **validate_stats,
+                                            "fallback_target_ms": target_prediction.elapsed_ms,
+                                        },
+                                    )
+                                else:
+                                    prediction.stats = {
+                                        **prediction_stats,
+                                        **validate_stats,
+                                    }
+                            else:
+                                prediction.stats = {
+                                    **prediction_stats,
+                                    "validate_skipped_non_stability_stop": 1.0,
+                                }
+                    elif mode.startswith("target_eos"):
+                        with autocast_ctx:
+                            prediction = _predict_target_eos_chunk(
+                                token_adapter,
+                                batch,
+                                policy_postprocessor,
+                                device,
+                                constrained_action_vocab="constrained" in mode,
+                                constrained_action_vocab_size=target_eos_constrained_action_vocab_size,
+                                constrained_text_vocab_size=target_eos_constrained_text_vocab_size,
+                                constrained_full_head_margin=target_eos_constrained_full_head_margin,
+                                constrained_force_action_prefix=not (
+                                    target_eos_constrained_no_force_prefix or "_noforce" in mode
+                                ),
+                                constrained_structural_token_radius=target_eos_constrained_structural_token_radius,
+                                constrained_full_head_prefix_tokens=target_eos_constrained_full_head_prefix_tokens,
+                                constrained_extra_token_ids=target_eos_constrained_extra_token_ids,
+                                force_action_prefix="_prefix" in mode,
+                                stop_on_action_chars="_charstop" in mode,
+                                action_char_min_chars=target_eos_action_char_min_chars,
+                                action_char_plateau_tokens=target_eos_action_char_plateau_tokens,
+                                action_char_stable_checks=target_eos_action_char_stable_checks,
+                                action_char_stable_tolerance=target_eos_action_char_stable_tolerance,
+                                action_char_stable_max_chars=target_eos_action_char_stable_max_chars,
+                                action_char_plateau_reject_eos_restart=(
+                                    target_eos_action_char_plateau_reject_eos_restart
+                                ),
+                                action_char_restart_continue=target_eos_action_char_restart_continue,
+                                action_char_restart_reset=target_eos_action_char_restart_reset,
+                                action_char_restart_reset_low_text_tokens=(
+                                    target_eos_action_char_restart_reset_low_text_tokens
+                                ),
+                                action_char_plateau_low_text_tail_tokens=(
+                                    target_eos_action_char_plateau_low_text_tail_tokens
+                                ),
+                                action_char_strict_target_stop=target_eos_action_char_strict_target_stop,
+                                action_char_reset_requires_action_end=(
+                                    target_eos_action_char_reset_requires_action_end
+                                ),
+                                action_char_target_confirm_tokens=target_eos_action_char_target_confirm_tokens,
+                            )
+                        restart_fallback_count = int(
+                            (prediction.stats or {}).get("action_char_restart_fallback_count", 0)
+                        )
+                        if restart_fallback_count > 0:
+                            with autocast_ctx:
+                                fallback_prediction = _predict_target_eos_chunk(
+                                    token_adapter,
+                                    batch,
+                                    policy_postprocessor,
+                                    device,
+                                    constrained_action_vocab="constrained" in mode,
+                                    constrained_action_vocab_size=target_eos_constrained_action_vocab_size,
+                                    constrained_text_vocab_size=target_eos_constrained_text_vocab_size,
+                                    constrained_full_head_margin=target_eos_constrained_full_head_margin,
+                                    constrained_force_action_prefix=not (
+                                        target_eos_constrained_no_force_prefix or "_noforce" in mode
+                                    ),
+                                    constrained_structural_token_radius=target_eos_constrained_structural_token_radius,
+                                    constrained_full_head_prefix_tokens=(
+                                        target_eos_constrained_full_head_prefix_tokens
+                                    ),
+                                    constrained_extra_token_ids=target_eos_constrained_extra_token_ids,
+                                    force_action_prefix="_prefix" in mode,
+                                    stop_on_action_chars=False,
+                                )
+                            controller.stats.guard_reasons.update(["target_eos_restart_fallback"])
+                            prediction = PredictionTrace(
+                                actions=fallback_prediction.actions,
+                                elapsed_ms=prediction.elapsed_ms + fallback_prediction.elapsed_ms,
+                                token_count=fallback_prediction.token_count,
+                                token_ids=fallback_prediction.token_ids,
+                                stats={
+                                    **(prediction.stats or {}),
+                                    "action_char_restart_fallback": 1.0,
+                                    "action_char_restart_fallback_ms": fallback_prediction.elapsed_ms,
+                                    "action_char_restart_fallback_token_count": float(
+                                        fallback_prediction.token_count or 0
+                                    ),
+                                },
+                            )
+                        controller.stats.record_trace_stats(prediction.stats)
                     else:
                         with autocast_ctx:
                             prediction = _predict_action_chunk(
@@ -1791,24 +2599,99 @@ def run_episode(
                                     "fallback_action_max_diff": max_diff,
                                 },
                             )
-                    if mode.startswith("target_eos_validate"):
+                    skip_target_eos_validate_for_stop_labels = (
+                        mode.startswith("target_eos_adaptive_validate")
+                        and adaptive_validate_stability_stops_only
+                    )
+                    if (
+                        mode.startswith("target_eos")
+                        and "validate" in mode
+                        and not skip_target_eos_validate_for_stop_labels
+                    ):
                         with autocast_ctx:
-                            full_prediction = _predict_action_chunk(
-                                policy,
-                                batch,
-                                policy_postprocessor,
-                                device,
-                                token_adapter=None,
-                            )
+                            if "constrained" in mode or "_prefix" in mode:
+                                full_prediction = _predict_target_eos_chunk(
+                                    token_adapter,
+                                    batch,
+                                    policy_postprocessor,
+                                    device,
+                                    constrained_action_vocab=False,
+                                )
+                            else:
+                                full_prediction = _predict_action_chunk(
+                                    policy,
+                                    batch,
+                                    policy_postprocessor,
+                                    device,
+                                    token_adapter=None,
+                                )
+                        token_reference_prediction = full_prediction
+                        candidate_trace_mode = f"{mode}_candidate"
+                        target_trace_mode = f"{mode}_target"
+                        wants_target_trace = (
+                            token_trace_sink is not None
+                            and (token_trace_sink.modes is None or target_trace_mode in token_trace_sink.modes)
+                        )
+                        if wants_target_trace and token_reference_prediction.token_ids is None:
+                            with autocast_ctx:
+                                token_reference_prediction = _predict_target_eos_chunk(
+                                    token_adapter,
+                                    batch,
+                                    policy_postprocessor,
+                                    device,
+                                )
                         horizon = min(len(prediction.actions), len(full_prediction.actions))
                         diff = np.abs(prediction.actions[:horizon] - full_prediction.actions[:horizon])
                         max_diff = float(np.max(diff)) if diff.size else 0.0
                         mean_diff = float(np.mean(diff)) if diff.size else 0.0
+                        target_eos_diff_stats = {
+                            **_prediction_token_diff_stats(prediction, token_reference_prediction, "target_eos"),
+                            "target_eos_action_max_diff": float(max_diff),
+                            "target_eos_action_mean_diff": float(mean_diff),
+                            "target_eos_candidate_elapsed_ms": float(prediction.elapsed_ms),
+                            "target_eos_reference_elapsed_ms": float(token_reference_prediction.elapsed_ms),
+                            "target_eos_candidate_token_count": float(prediction.token_count or 0),
+                            "target_eos_reference_token_count": float(token_reference_prediction.token_count or 0),
+                        }
+                        prediction.stats = {
+                            **(prediction.stats or {}),
+                            **target_eos_diff_stats,
+                        }
+                        token_reference_prediction.stats = {
+                            **(token_reference_prediction.stats or {}),
+                            "paired_candidate_mode": mode,
+                            **target_eos_diff_stats,
+                        }
+                        controller.stats.record_trace_stats(target_eos_diff_stats)
                         controller.stats.exact_verifies += 1
                         controller.stats.action_max_diffs.append(max_diff)
                         controller.stats.action_mean_diffs.append(mean_diff)
+                        if token_trace_sink is not None:
+                            token_trace_sink.record(
+                                prediction,
+                                mode=candidate_trace_mode,
+                                task=task,
+                                task_id=task_id,
+                                episode=episode,
+                                seed=seed,
+                                step=steps,
+                            )
+                            token_trace_sink.record(
+                                token_reference_prediction,
+                                mode=target_trace_mode,
+                                task=task,
+                                task_id=task_id,
+                                episode=episode,
+                                seed=seed,
+                                step=steps,
+                            )
                         if max_diff != 0.0:
                             controller.stats.guard_reasons.update(["target_eos_action_diff"])
+                    elif skip_target_eos_validate_for_stop_labels:
+                        prediction.stats = {
+                            **(prediction.stats or {}),
+                            "target_eos_validate_skipped_for_stability_stop_collection": 1.0,
+                        }
                     chunk = prediction.actions
                     relaxed_tail = False
                     chunk_extend_handled = False
@@ -1942,6 +2825,17 @@ def run_episode(
         else:
             action = buffered
 
+        if buffered is None and token_trace_sink is not None and prediction is not None:
+            token_trace_sink.record(
+                prediction,
+                mode=mode,
+                task=task,
+                task_id=task_id,
+                episode=episode,
+                seed=seed,
+                step=steps,
+            )
+
         observation, reward, terminated, truncated, info = _env_step(env, action, env_postprocessor)
         steps += 1
         reward_sum += reward
@@ -2009,9 +2903,31 @@ def parse_args() -> argparse.Namespace:
         help="Optional comma-separated task ids to evaluate in one process. Overrides --task-id.",
     )
     parser.add_argument("--episodes", type=int, default=3)
+    parser.add_argument(
+        "--episode-ids",
+        default=None,
+        help="Optional comma-separated episode indices to run. Seeds remain args.seed + episode_index.",
+    )
     parser.add_argument("--steps", type=int, default=300)
     parser.add_argument("--modes", default="baseline,chunk_m3,chunk_m5_smooth")
     parser.add_argument("--output-dir", default="outputs/pi0fast_chunk")
+    parser.add_argument(
+        "--token-trace-output-dir",
+        type=Path,
+        default=None,
+        help="Optional directory for lightweight shard_*.pt FAST-token traces used by offline pattern sweeps.",
+    )
+    parser.add_argument(
+        "--token-trace-modes",
+        default="target_eos",
+        help="Comma-separated modes to export when --token-trace-output-dir is set; use all to export every mode.",
+    )
+    parser.add_argument(
+        "--token-trace-max-rows-per-shard",
+        type=int,
+        default=512,
+        help="Maximum decoded chunks per lightweight token trace shard.",
+    )
     parser.add_argument(
         "--summary-baseline-mode",
         default="baseline",
@@ -2024,10 +2940,179 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-amp", action="store_true")
     parser.add_argument("--amp-dtype", choices=["bfloat16", "float16"], default=None)
     parser.add_argument(
+        "--disable-gradient-checkpointing",
+        action="store_true",
+        help="Disable model gradient checkpointing after loading for inference latency measurements.",
+    )
+    parser.add_argument(
+        "--target-eos-constrained-action-vocab-size",
+        type=int,
+        default=8192,
+        help="Raw high-token action span for target_eos_constrained modes.",
+    )
+    parser.add_argument(
+        "--target-eos-constrained-text-vocab-size",
+        type=int,
+        default=8192,
+        help="Low-token text/special span for target_eos_constrained modes.",
+    )
+    parser.add_argument(
+        "--target-eos-constrained-full-head-margin",
+        type=float,
+        default=-1.0,
+        help=(
+            "If non-negative, target_eos_constrained modes fall back to the full lm_head when the "
+            "restricted top-1/top-2 logit margin is below this value."
+        ),
+    )
+    parser.add_argument(
+        "--target-eos-constrained-no-force-prefix",
+        action="store_true",
+        help="Let constrained target_eos choose the Action prefix through the restricted/full-head path.",
+    )
+    parser.add_argument(
+        "--target-eos-constrained-structural-token-radius",
+        type=int,
+        default=512,
+        help="Include token ids within this radius of the PI0-FAST action-end token in constrained modes.",
+    )
+    parser.add_argument(
+        "--target-eos-constrained-full-head-prefix-tokens",
+        type=int,
+        default=0,
+        help=(
+            "Use the exact full lm_head for this many initial generated tokens in constrained modes, "
+            "then switch to the restricted head."
+        ),
+    )
+    parser.add_argument(
+        "--target-eos-constrained-extra-token-id-file",
+        type=Path,
+        default=None,
+        help=(
+            "JSON list or object with token_ids to add to the restricted candidate set for "
+            "target_eos_constrained modes."
+        ),
+    )
+    parser.add_argument(
+        "--target-eos-action-char-min-chars",
+        type=int,
+        default=-1,
+        help=(
+            "Minimum decoded FAST-character count before target_eos_charstop can use plateau stopping. "
+            "Negative keeps the default full action-dimension target."
+        ),
+    )
+    parser.add_argument(
+        "--target-eos-action-char-plateau-tokens",
+        type=int,
+        default=0,
+        help=(
+            "If positive, target_eos_charstop may stop once decoded FAST-character count has not increased "
+            "for this many generated tokens after the minimum character count."
+        ),
+    )
+    parser.add_argument(
+        "--target-eos-action-char-stable-checks",
+        type=int,
+        default=0,
+        help=(
+            "If positive, target_eos_charstop plateau stops require this many consecutive equal "
+            "detokenized-action snapshots at decoded FAST-character increments."
+        ),
+    )
+    parser.add_argument(
+        "--target-eos-action-char-stable-tolerance",
+        type=float,
+        default=0.0,
+        help="Maximum action delta considered stable for --target-eos-action-char-stable-checks.",
+    )
+    parser.add_argument(
+        "--target-eos-action-char-stable-max-chars",
+        type=int,
+        default=0,
+        help=(
+            "If positive, apply --target-eos-action-char-stable-checks only to plateau stops below "
+            "this decoded FAST-character count. Zero applies stability checks to every plateau stop."
+        ),
+    )
+    parser.add_argument(
+        "--target-eos-action-char-plateau-reject-eos-restart",
+        action="store_true",
+        help=(
+            "Block target_eos_charstop plateau stops when the no-character plateau tail emits EOS "
+            "and then resumes with a non-EOS token."
+        ),
+    )
+    parser.add_argument(
+        "--target-eos-action-char-restart-continue",
+        action="store_true",
+        help=(
+            "When restart rejection taints a target_eos_charstop row, keep decoding in the same "
+            "KV-cache pass until the normal action-end token instead of requesting a full rerun."
+        ),
+    )
+    parser.add_argument(
+        "--target-eos-action-char-restart-reset",
+        action="store_true",
+        help=(
+            "When an EOS/BOS restart is detected in a target_eos_charstop row, reset decoded "
+            "FAST-character counts and allow char stops to mature again on the restarted action."
+        ),
+    )
+    parser.add_argument(
+        "--target-eos-action-char-restart-reset-low-text-tokens",
+        type=int,
+        default=0,
+        help=(
+            "If positive with --target-eos-action-char-restart-reset, delay the reset until the "
+            "restarted tail emits this many non-prefix low/text tokens."
+        ),
+    )
+    parser.add_argument(
+        "--target-eos-action-char-plateau-low-text-tail-tokens",
+        type=int,
+        default=0,
+        help=(
+            "If positive, block target_eos_charstop plateau stops when the no-action tail contains "
+            "at least this many non-prefix low/text tokens."
+        ),
+    )
+    parser.add_argument(
+        "--target-eos-action-char-strict-target-stop",
+        action="store_true",
+        help=(
+            "Require decoded FAST-character count to exceed, not merely equal, the action target "
+            "before target_eos_charstop can use the target-count stop."
+        ),
+    )
+    parser.add_argument(
+        "--target-eos-action-char-reset-requires-action-end",
+        action="store_true",
+        help=(
+            "After an EOS/BOS restart reset, suppress target_eos_charstop char/plateau stops "
+            "until the normal PI0-FAST action-end token is emitted."
+        ),
+    )
+    parser.add_argument(
+        "--target-eos-action-char-target-confirm-tokens",
+        type=int,
+        default=0,
+        help=(
+            "If positive, wait this many generated tokens after first crossing the decoded "
+            "FAST-character target before target_eos_charstop may use the target-count stop."
+        ),
+    )
+    parser.add_argument(
         "--num-inference-steps",
         type=int,
         default=None,
         help="Flow inference steps for PI0.5 policies.",
+    )
+    parser.add_argument(
+        "--pi05-disable-compile",
+        action="store_true",
+        help="Load PI0.5 with config.compile_model disabled for eager rollout/debug runs.",
     )
     parser.add_argument(
         "--enable-fast-token-hooks",
@@ -2035,6 +3120,20 @@ def parse_args() -> argparse.Namespace:
         help="Use LeRobot π0-FAST internals to return generated FAST token IDs and logits.",
     )
     parser.add_argument("--control-mode", choices=["relative", "absolute"], default="relative")
+    parser.add_argument(
+        "--init-states",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use LIBERO's packaged init states; pass --no-init-states to match LeRobot's env.init_states=false eval.",
+    )
+    parser.add_argument(
+        "--rename-map",
+        default=json.dumps(DEFAULT_LIBERO_RENAME_MAP),
+        help=(
+            "JSON observation-key rename map passed to LeRobot's rename_observations_processor. "
+            "Use 'none' to disable. Defaults to the v044 LIBERO camera map used by lerobot-eval."
+        ),
+    )
     parser.add_argument("--default-window", type=int, default=3)
     parser.add_argument("--smooth-window", type=int, default=5)
     parser.add_argument("--max-window", type=int, default=6)
@@ -2059,6 +3158,345 @@ def parse_args() -> argparse.Namespace:
         "--ngram-reuse-full-blocks",
         action="store_true",
         help="Reuse verifier KV on fully accepted n-gram draft blocks. Faster but approximate.",
+    )
+    parser.add_argument("--pattern-lookahead", type=int, default=8)
+    parser.add_argument("--pattern-action-dim", type=int, default=7)
+    parser.add_argument("--pattern-max-period", type=int, default=16)
+    parser.add_argument("--pattern-min-period-repeats", type=int, default=2)
+    parser.add_argument("--pattern-repeat-token-min-run", type=int, default=3)
+    parser.add_argument("--pattern-linear-action-extrapolation", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--pattern-second-order-action-extrapolation", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--pattern-second-order-max-accel",
+        type=int,
+        default=8,
+        help="Maximum per-dimension token acceleration for second-order pattern drafts; use -1 for no guard.",
+    )
+    parser.add_argument(
+        "--pattern-action-trend-regression",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Draft from a short per-action-dimension regression trend over verified FAST tokens.",
+    )
+    parser.add_argument("--pattern-action-trend-history", type=int, default=4)
+    parser.add_argument("--pattern-action-trend-top-k", type=int, default=3)
+    parser.add_argument(
+        "--pattern-action-trend-max-abs",
+        type=int,
+        default=12,
+        help="Maximum absolute projected same-dimension token step for trend drafts; use -1 for no guard.",
+    )
+    parser.add_argument(
+        "--pattern-action-prefix-lookup",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Draft later action dimensions from prior action vectors with the same verified intra-action prefix.",
+    )
+    parser.add_argument("--pattern-action-prefix-history-size", type=int, default=4)
+    parser.add_argument("--pattern-action-prefix-top-k", type=int, default=3)
+    parser.add_argument("--pattern-action-prefix-min-prefix", type=int, default=1)
+    parser.add_argument("--pattern-action-prefix-max-mismatches", type=int, default=0)
+    parser.add_argument(
+        "--pattern-action-vector-suffix-lookup",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Draft later action dimensions from prior full action vectors whose verified "
+            "intra-action prefix matches the current prefix."
+        ),
+    )
+    parser.add_argument("--pattern-action-vector-suffix-history-size", type=int, default=4)
+    parser.add_argument("--pattern-action-vector-suffix-top-k", type=int, default=3)
+    parser.add_argument("--pattern-action-vector-suffix-min-prefix", type=int, default=1)
+    parser.add_argument("--pattern-action-vector-suffix-min-count", type=int, default=1)
+    parser.add_argument("--pattern-action-vector-suffix-max-prefix-delta", type=int, default=0)
+    parser.add_argument(
+        "--pattern-action-vector-transition",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Draft later action dimensions from prior full action-vector transitions whose previous "
+            "vector and current prefix match verified tokens."
+        ),
+    )
+    parser.add_argument("--pattern-action-vector-transition-history-size", type=int, default=4)
+    parser.add_argument("--pattern-action-vector-transition-top-k", type=int, default=3)
+    parser.add_argument("--pattern-action-vector-transition-min-count", type=int, default=1)
+    parser.add_argument("--pattern-action-vector-transition-max-prev-delta", type=int, default=0)
+    parser.add_argument("--pattern-action-vector-transition-max-prefix-delta", type=int, default=0)
+    parser.add_argument(
+        "--pattern-action-repeat-vector",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Draft from repeated full action vectors when the current partial vector still matches.",
+    )
+    parser.add_argument("--pattern-action-repeat-min-repeats", type=int, default=2)
+    parser.add_argument("--pattern-action-repeat-max-delta", type=int, default=0)
+    parser.add_argument(
+        "--pattern-chunk-length-stop",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Draft the FAST stop token when recent verified chunks ended at this prefix length.",
+    )
+    parser.add_argument("--pattern-chunk-length-stop-history-size", type=int, default=4)
+    parser.add_argument("--pattern-chunk-length-stop-min-count", type=int, default=2)
+    parser.add_argument(
+        "--pattern-action-transition-histogram",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Draft from same-action-dimension transition histograms in verified FAST tokens and recent chunks.",
+    )
+    parser.add_argument(
+        "--pattern-action-context-tree",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Draft from same-action-dimension context trees over verified FAST tokens and recent chunks.",
+    )
+    parser.add_argument("--pattern-action-context-tree-history-size", type=int, default=4)
+    parser.add_argument("--pattern-action-context-tree-max-context", type=int, default=3)
+    parser.add_argument("--pattern-action-context-tree-top-k", type=int, default=3)
+    parser.add_argument("--pattern-action-context-tree-min-count", type=int, default=1)
+    parser.add_argument("--pattern-action-transition-history-size", type=int, default=4)
+    parser.add_argument("--pattern-action-transition-top-k", type=int, default=3)
+    parser.add_argument("--pattern-action-transition-min-count", type=int, default=1)
+    parser.add_argument(
+        "--pattern-action-delta-histogram",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Draft from frequent recent same-action-dimension FAST-token deltas.",
+    )
+    parser.add_argument("--pattern-action-delta-history", type=int, default=8)
+    parser.add_argument("--pattern-action-delta-top-k", type=int, default=3)
+    parser.add_argument("--pattern-action-delta-min-count", type=int, default=1)
+    parser.add_argument(
+        "--pattern-action-delta-max-abs",
+        type=int,
+        default=12,
+        help="Maximum absolute token delta for action-delta histogram pattern drafts; use -1 for no guard.",
+    )
+    parser.add_argument(
+        "--pattern-action-delta-ngram",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Draft by matching same-action-dimension FAST-token delta n-grams in verified tokens and chunks.",
+    )
+    parser.add_argument("--pattern-action-delta-ngram-history-size", type=int, default=4)
+    parser.add_argument("--pattern-action-delta-ngram-min-context", type=int, default=1)
+    parser.add_argument("--pattern-action-delta-ngram-max-context", type=int, default=4)
+    parser.add_argument("--pattern-action-delta-ngram-top-k", type=int, default=3)
+    parser.add_argument("--pattern-action-delta-ngram-min-count", type=int, default=1)
+    parser.add_argument(
+        "--pattern-action-delta-ngram-max-abs",
+        type=int,
+        default=12,
+        help="Maximum absolute token delta for action-delta n-gram pattern drafts; use -1 for no guard.",
+    )
+    parser.add_argument(
+        "--pattern-chunk-position-delta",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Draft per-position FAST-token deltas from recent verified action chunks.",
+    )
+    parser.add_argument("--pattern-chunk-position-delta-history-size", type=int, default=4)
+    parser.add_argument("--pattern-chunk-position-delta-top-k", type=int, default=3)
+    parser.add_argument("--pattern-chunk-position-delta-min-count", type=int, default=1)
+    parser.add_argument(
+        "--pattern-chunk-position-delta-max-abs",
+        type=int,
+        default=12,
+        help="Maximum absolute token delta for chunk-position delta pattern drafts; use -1 for no guard.",
+    )
+    parser.add_argument(
+        "--pattern-chunk-delta-template",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Draft from recent verified chunks whose same-dimension delta prefix matches the current chunk.",
+    )
+    parser.add_argument("--pattern-chunk-delta-template-history-size", type=int, default=4)
+    parser.add_argument("--pattern-chunk-delta-template-top-k", type=int, default=3)
+    parser.add_argument("--pattern-chunk-delta-template-min-prefix-deltas", type=int, default=1)
+    parser.add_argument(
+        "--pattern-chunk-delta-template-max-delta-mismatch",
+        type=int,
+        default=0,
+        help="Allowed total absolute mismatch in matched delta prefixes; use -1 for no guard.",
+    )
+    parser.add_argument(
+        "--pattern-chunk-delta-template-max-abs",
+        type=int,
+        default=12,
+        help="Maximum absolute token delta for chunk-delta template pattern drafts; use -1 for no guard.",
+    )
+    parser.add_argument(
+        "--pattern-previous-chunk-position",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Draft token i from token i of recent verified chunks from the same episode before local pattern rules.",
+    )
+    parser.add_argument("--pattern-previous-chunk-history-size", type=int, default=1)
+    parser.add_argument(
+        "--pattern-chunk-prefix-retrieval",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Draft from recent verified chunks whose prefix mostly matches the current partial action chunk.",
+    )
+    parser.add_argument("--pattern-chunk-prefix-history-size", type=int, default=4)
+    parser.add_argument("--pattern-chunk-prefix-top-k", type=int, default=3)
+    parser.add_argument("--pattern-chunk-prefix-min-matches", type=int, default=2)
+    parser.add_argument("--pattern-chunk-prefix-max-mismatches", type=int, default=1)
+    parser.add_argument(
+        "--pattern-action-token-neighborhood",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Draft small FAST-token neighborhoods around smooth action extrapolations for exact tree verification.",
+    )
+    parser.add_argument("--pattern-action-token-neighborhood-radius", type=int, default=1)
+    parser.add_argument("--pattern-action-token-neighborhood-top-k", type=int, default=3)
+    parser.add_argument(
+        "--pattern-position-mode-histogram",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Draft the per-position mode token from recent verified chunks with the same current prefix.",
+    )
+    parser.add_argument("--pattern-position-mode-history-size", type=int, default=4)
+    parser.add_argument("--pattern-position-mode-top-k", type=int, default=3)
+    parser.add_argument("--pattern-position-mode-min-count", type=int, default=2)
+    parser.add_argument(
+        "--pattern-global-position-mode",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Draft per-position modal tokens from recent verified chunks without requiring the current prefix to match.",
+    )
+    parser.add_argument("--pattern-global-position-history-size", type=int, default=16)
+    parser.add_argument("--pattern-global-position-top-k", type=int, default=3)
+    parser.add_argument("--pattern-global-position-min-count", type=int, default=3)
+    parser.add_argument(
+        "--pattern-action-dimension-mode",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Draft the most common verified FAST token for the current action dimension.",
+    )
+    parser.add_argument("--pattern-action-dimension-mode-history-size", type=int, default=4)
+    parser.add_argument("--pattern-action-dimension-mode-top-k", type=int, default=3)
+    parser.add_argument("--pattern-action-dimension-mode-min-count", type=int, default=2)
+    parser.add_argument(
+        "--pattern-hold-action-token",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Draft the token from the same action dimension in the previous action step.",
+    )
+    parser.add_argument(
+        "--pattern-ngram-continuation",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Draft from prompt-lookup suffix matches in verified FAST tokens and recent verified chunks.",
+    )
+    parser.add_argument("--pattern-ngram-min-context", type=int, default=3)
+    parser.add_argument("--pattern-ngram-max-context", type=int, default=16)
+    parser.add_argument("--pattern-ngram-history-size", type=int, default=4)
+    parser.add_argument(
+        "--pattern-min-source-agreement",
+        type=int,
+        default=1,
+        help="Prefer a pattern token only when at least this many configured sources propose it.",
+    )
+    parser.add_argument(
+        "--pattern-source-priority",
+        default="default",
+        help="Named source priority mode or comma-separated source names for pattern drafts.",
+    )
+    parser.add_argument(
+        "--pattern-source-cooldown",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Temporarily skip pattern sources after verified rejections within the same decode.",
+    )
+    parser.add_argument("--pattern-source-cooldown-after", type=int, default=1)
+    parser.add_argument("--pattern-source-cooldown-steps", type=int, default=1)
+    parser.add_argument(
+        "--pattern-source-acceptance-bias",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Reorder cheap sources by recent verified source acceptance within each decode.",
+    )
+    parser.add_argument("--pattern-source-acceptance-bias-history-size", type=int, default=32)
+    parser.add_argument("--pattern-source-acceptance-bias-min-observations", type=int, default=2)
+    parser.add_argument(
+        "--pattern-reuse-full-blocks",
+        action="store_true",
+        help="Reuse verifier KV on fully accepted checkpoint-free pattern draft blocks.",
+    )
+    parser.add_argument(
+        "--pattern-min-verify-margin",
+        type=float,
+        default=0.0,
+        help=(
+            "When >0, pattern_sd only reuses a batched verifier block if every draft token "
+            "matches and every verifier top-1/top-2 margin is at least this value."
+        ),
+    )
+    parser.add_argument(
+        "--pattern-emit-bonus-token",
+        action="store_true",
+        help="After a fully accepted pattern_sd block, emit the verifier's next greedy token and process it in the next verify pass.",
+    )
+    parser.add_argument(
+        "--pattern-defer-correction-token",
+        action="store_true",
+        help="After a rejected pattern_sd block, emit the verifier correction token but process it in the next verify pass.",
+    )
+    parser.add_argument(
+        "--pattern-verify-from-scratch",
+        action="store_true",
+        help="Verify pattern_sd candidates by replaying the full FAST prefix instead of using the speculative KV cache.",
+    )
+    parser.add_argument(
+        "--pattern-replay-accepted-cache",
+        action="store_true",
+        help="After accepting pattern_sd draft tokens, replay them through the one-token target cache path.",
+    )
+    parser.add_argument(
+        "--pattern-resync-accepted-cache",
+        action="store_true",
+        help="After accepting pattern_sd draft tokens, rebuild the target KV cache from the emitted FAST prefix.",
+    )
+    parser.add_argument(
+        "--pattern-diagnose-verify-alignment",
+        action="store_true",
+        help="Compare pattern_sd batched verifier argmaxes with stepwise teacher-forced target argmaxes.",
+    )
+    parser.add_argument(
+        "--pattern-dynamic-lookahead",
+        action="store_true",
+        help="Grow or shrink pattern_sd lookahead from recent exact acceptance in the same decode.",
+    )
+    parser.add_argument("--pattern-min-lookahead", type=int, default=1)
+    parser.add_argument("--pattern-lookahead-growth", type=int, default=1)
+    parser.add_argument("--pattern-lookahead-shrink", type=int, default=4)
+    parser.add_argument(
+        "--pattern-tree-width",
+        type=int,
+        default=1,
+        help="Verify multiple pattern candidates in one target pass. 1 keeps the single-chain verifier.",
+    )
+    parser.add_argument("--pattern-tree-branch-width", type=int, default=4)
+    parser.add_argument(
+        "--pattern-dynamic-tree-width",
+        action="store_true",
+        help="Grow or shrink pattern_sd tree candidate count from recent exact acceptance.",
+    )
+    parser.add_argument("--pattern-min-tree-width", type=int, default=1)
+    parser.add_argument("--pattern-tree-width-growth", type=int, default=1)
+    parser.add_argument("--pattern-tree-width-shrink", type=int, default=1)
+    parser.add_argument(
+        "--pattern-tree-anchor-target-token",
+        action="store_true",
+        help="When every tree row starts with the wrong token, anchor on the target greedy token and verify drafted continuations after it.",
+    )
+    parser.add_argument(
+        "--pattern-tree-anchor-target-continuation",
+        action="store_true",
+        help="Always anchor on the target greedy token and verify drafted continuations after it for tree pattern_sd.",
     )
     parser.add_argument(
         "--medusa-checkpoint",
@@ -2174,9 +3612,98 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adaptive-stable-checks", type=int, default=3)
     parser.add_argument("--adaptive-early-stable-checks", type=int, default=0)
     parser.add_argument("--adaptive-early-max-stable-checkpoint", type=int, default=0)
+    parser.add_argument(
+        "--adaptive-checkpoint-stable-checks",
+        default="",
+        help="Comma-separated CHECKPOINT=CHECKS overrides for adaptive stability stops, e.g. 152=5.",
+    )
     parser.add_argument("--adaptive-skip-unproductive-checks", action="store_true")
     parser.add_argument("--adaptive-skip-unproductive-after-checkpoint", type=int, default=0)
     parser.add_argument("--adaptive-continue-to-action-end-on-unstable", action="store_true")
+    parser.add_argument(
+        "--adaptive-stability-target-eos-after-step",
+        type=int,
+        default=-1,
+        help="Fallback stability-stop chunks at or after this control step to target-EOS; negative disables it.",
+    )
+    parser.add_argument(
+        "--adaptive-stability-target-eos-max-fallbacks",
+        type=int,
+        default=-1,
+        help="Maximum late stability target-EOS fallbacks per episode; negative leaves uncapped.",
+    )
+    parser.add_argument(
+        "--adaptive-stability-continue-to-action-end-after-step",
+        type=int,
+        default=-1,
+        help=(
+            "Continue late stability-stop chunks to action-end using the existing KV cache at or after this "
+            "control step; negative disables it."
+        ),
+    )
+    parser.add_argument(
+        "--adaptive-stability-continue-to-action-end-max-fallbacks",
+        type=int,
+        default=-1,
+        help="Maximum late stability action-end continuations per episode; negative leaves uncapped.",
+    )
+    parser.add_argument(
+        "--adaptive-stability-risk-after-step",
+        type=int,
+        default=-1,
+        help="Enable threshold-based stability-stop rejection at or after this control step; negative disables it.",
+    )
+    parser.add_argument(
+        "--adaptive-stability-risk-max-rejections",
+        type=int,
+        default=-1,
+        help="Maximum risk-gate stability-stop rejections per episode; negative leaves uncapped.",
+    )
+    parser.add_argument("--adaptive-stability-risk-min-checkpoint", type=int, default=-1)
+    parser.add_argument("--adaptive-stability-risk-max-checkpoint", type=int, default=-1)
+    parser.add_argument("--adaptive-stability-risk-max-token-count", type=int, default=-1)
+    parser.add_argument("--adaptive-stability-risk-logprob-mean-max", type=float, default=None)
+    parser.add_argument("--adaptive-stability-risk-entropy-mean-min", type=float, default=None)
+    parser.add_argument("--adaptive-stability-risk-action-abs-min", type=float, default=None)
+    parser.add_argument("--adaptive-stability-risk-position-span-max", type=float, default=None)
+    parser.add_argument("--adaptive-stability-risk-rotation-span-max", type=float, default=None)
+    parser.add_argument("--adaptive-stability-risk-max-step-delta-max", type=float, default=None)
+    parser.add_argument("--adaptive-stability-motion-risk-min-checkpoint", type=int, default=-1)
+    parser.add_argument("--adaptive-stability-motion-risk-logprob-mean-max", type=float, default=None)
+    parser.add_argument("--adaptive-stability-motion-risk-position-span-min", type=float, default=None)
+    parser.add_argument("--adaptive-stability-motion-risk-rotation-span-min", type=float, default=None)
+    parser.add_argument("--adaptive-stability-motion-risk-max-step-delta-min", type=float, default=None)
+    parser.add_argument(
+        "--adaptive-stability-risk-extra-clause",
+        type=_parse_risk_gate_clause_spec,
+        action="append",
+        default=[],
+        help=(
+            "Append an additional risk-gate OR clause as KEY=VALUE pairs or a JSON object. "
+            "Supported keys match the adaptive stability risk gate feature thresholds."
+        ),
+    )
+    parser.add_argument(
+        "--adaptive-stability-risk-target-eos-fallback",
+        action="store_true",
+        help="Use target-EOS output for a refresh whenever the stability risk gate rejects a candidate.",
+    )
+    parser.add_argument(
+        "--adaptive-validate-label-all-stability-stops",
+        action="store_true",
+        help=(
+            "In target_eos_adaptive_validate modes, attach fallback_action_max_diff to every stability-stop "
+            "candidate trace row, including exact matches. This is for gate-label extraction only."
+        ),
+    )
+    parser.add_argument(
+        "--adaptive-validate-stability-stops-only",
+        action="store_true",
+        help=(
+            "In target_eos_adaptive_validate modes, only run the target-EOS validation fallback for "
+            "stability-stop candidates. This speeds gate-label collection and is not a full exactness audit."
+        ),
+    )
     parser.add_argument("--adaptive-prefix-gate-checkpoint", default=None)
     parser.add_argument("--adaptive-prefix-gate-threshold", type=float, default=0.98)
     parser.add_argument(
@@ -2231,17 +3758,85 @@ def _mode_int_after(mode: str, marker: str, default: int = 0) -> int:
     return _leading_int(mode.split(marker, 1)[1], default)
 
 
+def _risk_gate_clause(
+    int_options: dict[str, int],
+    float_options: dict[str, float | None],
+) -> dict[str, float]:
+    gate: dict[str, float] = {}
+    for key, value in int_options.items():
+        if value >= 0:
+            gate[key] = float(value)
+    for key, value in float_options.items():
+        if value is not None:
+            gate[key] = float(value)
+    return gate
+
+
+def _adaptive_stability_risk_gate_from_args(args: argparse.Namespace) -> dict[str, Any]:
+    base_gate = _risk_gate_clause(
+        {
+            "min_checkpoint": args.adaptive_stability_risk_min_checkpoint,
+            "max_checkpoint": args.adaptive_stability_risk_max_checkpoint,
+            "max_token_count": args.adaptive_stability_risk_max_token_count,
+        },
+        {
+            "max_logprob_mean": args.adaptive_stability_risk_logprob_mean_max,
+            "min_entropy_mean": args.adaptive_stability_risk_entropy_mean_min,
+            "min_action_abs_max": args.adaptive_stability_risk_action_abs_min,
+            "max_position_span": args.adaptive_stability_risk_position_span_max,
+            "max_rotation_span": args.adaptive_stability_risk_rotation_span_max,
+            "max_max_step_delta": args.adaptive_stability_risk_max_step_delta_max,
+        },
+    )
+    motion_gate = _risk_gate_clause(
+        {
+            "min_checkpoint": getattr(args, "adaptive_stability_motion_risk_min_checkpoint", -1),
+        },
+        {
+            "max_logprob_mean": getattr(args, "adaptive_stability_motion_risk_logprob_mean_max", None),
+            "min_position_span": getattr(args, "adaptive_stability_motion_risk_position_span_min", None),
+            "min_rotation_span": getattr(args, "adaptive_stability_motion_risk_rotation_span_min", None),
+            "min_max_step_delta": getattr(args, "adaptive_stability_motion_risk_max_step_delta_min", None),
+        },
+    )
+    extra_clauses = [dict(clause) for clause in (getattr(args, "adaptive_stability_risk_extra_clause", []) or [])]
+    clauses = [gate for gate in (base_gate, motion_gate, *extra_clauses) if gate]
+    if len(clauses) == 1:
+        return clauses[0]
+    if clauses:
+        return {"clauses": clauses}
+    return {}
+
+
 def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     _ensure_libero_config(args.libero_config_path)
     make_env, make_env_pre_post_processors, preprocess_observation, LiberoEnv, make_pre_post_processors, PI0FastPolicy = _import_lerobot()
+    from lerobot.configs.policies import PreTrainedConfig
     if args.policy is None:
-        args.policy = "lerobot/pi05_libero_finetuned_v044" if args.policy_kind == "pi05" else "lerobot/pi0fast-libero"
+        args.policy = PI05_DEFAULT_POLICY if args.policy_kind == "pi05" else PI0FAST_DEFAULT_POLICY
+    modes = [m.strip() for m in args.modes.split(",") if m.strip()]
+    if args.policy_kind == "pi05":
+        unsupported_modes = _pi05_unsupported_fast_token_modes(modes)
+        if unsupported_modes:
+            raise ValueError(
+                "PI0.5 LeRobot policies use flow-action sampling and do not expose the "
+                "PI0-FAST FAST-token decode hooks required by modes "
+                f"{unsupported_modes}. Use PI0.5 baseline flow modes, or add a "
+                "PI0.5-specific stop-token/token-adapter path before running these modes."
+            )
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = out_dir / "metrics.jsonl"
+    token_trace_sink = None
+    if args.token_trace_output_dir is not None:
+        token_trace_sink = TokenTraceSink(
+            output_dir=args.token_trace_output_dir,
+            modes=parse_token_trace_modes(args.token_trace_modes),
+            max_rows_per_shard=args.token_trace_max_rows_per_shard,
+        )
 
     device = torch.device(args.device if torch.cuda.is_available() or not args.device.startswith("cuda") else "cpu")
     dtype = getattr(torch, args.dtype)
@@ -2254,8 +3849,13 @@ def main() -> None:
     selected_task_ids = sorted(_parse_ids(args.task_ids)) if args.task_ids else None
     if selected_task_ids is None and args.task_id is not None:
         selected_task_ids = [args.task_id]
+    selected_episode_ids = sorted(_parse_ids(args.episode_ids)) if args.episode_ids else list(range(args.episodes))
+    if any(ep < 0 or ep >= args.episodes for ep in selected_episode_ids):
+        raise ValueError("--episode-ids entries must be in [0, --episodes)")
 
-    env_kwargs = {"task": args.task, "control_mode": args.control_mode}
+    _set_global_seed(args.seed)
+
+    env_kwargs = {"task": args.task, "control_mode": args.control_mode, "init_states": args.init_states}
     if selected_task_ids is not None:
         env_kwargs["task_ids"] = selected_task_ids
     env_cfg = LiberoEnv(**env_kwargs)
@@ -2265,23 +3865,43 @@ def main() -> None:
         from lerobot.policies.pi05.modeling_pi05 import PI05Policy
 
         PolicyClass = PI05Policy
+        if args.pi05_disable_compile:
+            os.environ["TORCH_COMPILE_DISABLE"] = "1"
+            torch.compile = _identity_torch_compile
     else:
         PolicyClass = PI0FastPolicy
-    policy = PolicyClass.from_pretrained(args.policy).to(device=device, dtype=dtype).eval()
+    policy_config = PreTrainedConfig.from_pretrained(args.policy)
+    if hasattr(policy_config, "device"):
+        policy_config.device = str(device)
+    if hasattr(policy_config, "dtype"):
+        policy_config.dtype = args.dtype
+    if args.disable_gradient_checkpointing and hasattr(policy_config, "gradient_checkpointing"):
+        policy_config.gradient_checkpointing = False
+    if args.num_inference_steps is not None and hasattr(policy_config, "num_inference_steps"):
+        policy_config.num_inference_steps = int(args.num_inference_steps)
+    policy = PolicyClass.from_pretrained(args.policy, config=policy_config).to(device=device, dtype=dtype).eval()
+    if args.disable_gradient_checkpointing and hasattr(policy.model, "gradient_checkpointing_disable"):
+        policy.model.gradient_checkpointing_disable()
+        policy.eval()
     if args.num_inference_steps is not None and hasattr(policy.config, "num_inference_steps"):
         policy.config.num_inference_steps = int(args.num_inference_steps)
     token_adapter = PI0FastTokenLogitAdapter(policy) if args.enable_fast_token_hooks else None
+    rename_map = _parse_rename_map(args.rename_map)
+    preprocessor_overrides = {"device_processor": {"device": str(device)}}
+    if rename_map:
+        preprocessor_overrides["rename_observations_processor"] = {"rename_map": rename_map}
     policy_preprocessor, policy_postprocessor = make_pre_post_processors(
         policy.config,
         args.policy,
-        preprocessor_overrides={"device_processor": {"device": str(device)}},
+        preprocessor_overrides=preprocessor_overrides,
     )
     env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=env_cfg, policy_cfg=policy.config)
     env_map = make_env(env_cfg, n_envs=1, use_async_envs=False)
     task_ids = selected_task_ids if selected_task_ids is not None else sorted(env_map[args.task])
 
-    modes = [m.strip() for m in args.modes.split(",") if m.strip()]
     adaptive_prefix_checkpoints = [int(part.strip()) for part in args.adaptive_prefix_checkpoints.split(",") if part.strip()]
+    adaptive_checkpoint_stable_checks = parse_checkpoint_stable_checks(args.adaptive_checkpoint_stable_checks)
+    adaptive_stability_risk_gate = _adaptive_stability_risk_gate_from_args(args)
     ngram_drafter = None
     block_drafter = None
     block_token_map = None
@@ -2297,12 +3917,15 @@ def main() -> None:
     medusa_head = None
     medusa_token_map = None
     medusa_summary = None
+    pattern_drafter = None
     if any(mode.startswith("ngram_sd") or mode.startswith("ngram_extend") or mode.startswith("ngram_traj_tail") for mode in modes):
+        if token_adapter is None:
+            token_adapter = PI0FastTokenLogitAdapter(policy)
         records = load_trace_records(args.ngram_data_dir)
         train_task_ids = _parse_ids(args.ngram_train_task_ids)
         stop_token_ids = tuple(int(part.strip()) for part in args.ngram_stop_token_ids.split(",") if part.strip())
-        if token_adapter is not None and not stop_token_ids:
-            stop_token_ids = (token_adapter.action_end_token_id,)
+        if not stop_token_ids:
+            stop_token_ids = (_adapter_action_end_token_id(token_adapter),)
         ngram_drafter = NgramFastTokenDrafter(
             NgramDraftConfig(
                 max_context=args.ngram_max_context,
@@ -2312,8 +3935,140 @@ def main() -> None:
             )
         )
         ngram_drafter.fit(record for record in records if record.task_id in train_task_ids)
+    if any(mode.startswith("pattern_sd") for mode in modes):
         if token_adapter is None:
             token_adapter = PI0FastTokenLogitAdapter(policy)
+        pattern_second_order_max_accel = (
+            None if args.pattern_second_order_max_accel < 0 else args.pattern_second_order_max_accel
+        )
+        pattern_action_trend_max_abs = (
+            None if args.pattern_action_trend_max_abs < 0 else args.pattern_action_trend_max_abs
+        )
+        pattern_action_delta_max_abs = (
+            None if args.pattern_action_delta_max_abs < 0 else args.pattern_action_delta_max_abs
+        )
+        pattern_action_delta_ngram_max_abs = (
+            None if args.pattern_action_delta_ngram_max_abs < 0 else args.pattern_action_delta_ngram_max_abs
+        )
+        pattern_chunk_position_delta_max_abs = (
+            None if args.pattern_chunk_position_delta_max_abs < 0 else args.pattern_chunk_position_delta_max_abs
+        )
+        pattern_chunk_delta_template_max_delta_mismatch = (
+            None
+            if args.pattern_chunk_delta_template_max_delta_mismatch < 0
+            else args.pattern_chunk_delta_template_max_delta_mismatch
+        )
+        pattern_chunk_delta_template_max_abs = (
+            None if args.pattern_chunk_delta_template_max_abs < 0 else args.pattern_chunk_delta_template_max_abs
+        )
+        pattern_drafter = PatternFastTokenDrafter(
+            PatternDraftConfig(
+                lookahead=args.pattern_lookahead,
+                action_dim=args.pattern_action_dim,
+                max_period=args.pattern_max_period,
+                min_period_repeats=args.pattern_min_period_repeats,
+                repeat_token_min_run=args.pattern_repeat_token_min_run,
+                enable_linear_action_extrapolation=args.pattern_linear_action_extrapolation,
+                enable_second_order_action_extrapolation=args.pattern_second_order_action_extrapolation,
+                second_order_max_accel=pattern_second_order_max_accel,
+                enable_action_trend_regression=args.pattern_action_trend_regression,
+                action_trend_history=args.pattern_action_trend_history,
+                action_trend_top_k=args.pattern_action_trend_top_k,
+                action_trend_max_abs=pattern_action_trend_max_abs,
+                enable_action_prefix_lookup=args.pattern_action_prefix_lookup,
+                action_prefix_history_size=args.pattern_action_prefix_history_size,
+                action_prefix_top_k=args.pattern_action_prefix_top_k,
+                action_prefix_min_prefix=args.pattern_action_prefix_min_prefix,
+                action_prefix_max_mismatches=args.pattern_action_prefix_max_mismatches,
+                enable_action_vector_suffix_lookup=args.pattern_action_vector_suffix_lookup,
+                action_vector_suffix_history_size=args.pattern_action_vector_suffix_history_size,
+                action_vector_suffix_top_k=args.pattern_action_vector_suffix_top_k,
+                action_vector_suffix_min_prefix=args.pattern_action_vector_suffix_min_prefix,
+                action_vector_suffix_min_count=args.pattern_action_vector_suffix_min_count,
+                action_vector_suffix_max_prefix_delta=args.pattern_action_vector_suffix_max_prefix_delta,
+                enable_action_vector_transition=args.pattern_action_vector_transition,
+                action_vector_transition_history_size=args.pattern_action_vector_transition_history_size,
+                action_vector_transition_top_k=args.pattern_action_vector_transition_top_k,
+                action_vector_transition_min_count=args.pattern_action_vector_transition_min_count,
+                action_vector_transition_max_prev_delta=args.pattern_action_vector_transition_max_prev_delta,
+                action_vector_transition_max_prefix_delta=args.pattern_action_vector_transition_max_prefix_delta,
+                enable_action_repeat_vector=args.pattern_action_repeat_vector,
+                action_repeat_min_repeats=args.pattern_action_repeat_min_repeats,
+                action_repeat_max_delta=args.pattern_action_repeat_max_delta,
+                enable_chunk_length_stop=args.pattern_chunk_length_stop,
+                chunk_length_stop_history_size=args.pattern_chunk_length_stop_history_size,
+                chunk_length_stop_min_count=args.pattern_chunk_length_stop_min_count,
+                enable_action_context_tree=args.pattern_action_context_tree,
+                action_context_tree_history_size=args.pattern_action_context_tree_history_size,
+                action_context_tree_max_context=args.pattern_action_context_tree_max_context,
+                action_context_tree_top_k=args.pattern_action_context_tree_top_k,
+                action_context_tree_min_count=args.pattern_action_context_tree_min_count,
+                enable_action_transition_histogram=args.pattern_action_transition_histogram,
+                action_transition_history_size=args.pattern_action_transition_history_size,
+                action_transition_top_k=args.pattern_action_transition_top_k,
+                action_transition_min_count=args.pattern_action_transition_min_count,
+                enable_action_delta_histogram=args.pattern_action_delta_histogram,
+                action_delta_history=args.pattern_action_delta_history,
+                action_delta_top_k=args.pattern_action_delta_top_k,
+                action_delta_min_count=args.pattern_action_delta_min_count,
+                action_delta_max_abs=pattern_action_delta_max_abs,
+                enable_action_delta_ngram=args.pattern_action_delta_ngram,
+                action_delta_ngram_history_size=args.pattern_action_delta_ngram_history_size,
+                action_delta_ngram_min_context=args.pattern_action_delta_ngram_min_context,
+                action_delta_ngram_max_context=args.pattern_action_delta_ngram_max_context,
+                action_delta_ngram_top_k=args.pattern_action_delta_ngram_top_k,
+                action_delta_ngram_min_count=args.pattern_action_delta_ngram_min_count,
+                action_delta_ngram_max_abs=pattern_action_delta_ngram_max_abs,
+                enable_chunk_position_delta=args.pattern_chunk_position_delta,
+                chunk_position_delta_history_size=args.pattern_chunk_position_delta_history_size,
+                chunk_position_delta_top_k=args.pattern_chunk_position_delta_top_k,
+                chunk_position_delta_min_count=args.pattern_chunk_position_delta_min_count,
+                chunk_position_delta_max_abs=pattern_chunk_position_delta_max_abs,
+                enable_chunk_delta_template=args.pattern_chunk_delta_template,
+                chunk_delta_template_history_size=args.pattern_chunk_delta_template_history_size,
+                chunk_delta_template_top_k=args.pattern_chunk_delta_template_top_k,
+                chunk_delta_template_min_prefix_deltas=args.pattern_chunk_delta_template_min_prefix_deltas,
+                chunk_delta_template_max_delta_mismatch=pattern_chunk_delta_template_max_delta_mismatch,
+                chunk_delta_template_max_abs=pattern_chunk_delta_template_max_abs,
+                enable_previous_chunk_position=args.pattern_previous_chunk_position,
+                previous_chunk_history_size=args.pattern_previous_chunk_history_size,
+                enable_chunk_prefix_retrieval=args.pattern_chunk_prefix_retrieval,
+                chunk_prefix_history_size=args.pattern_chunk_prefix_history_size,
+                chunk_prefix_top_k=args.pattern_chunk_prefix_top_k,
+                chunk_prefix_min_matches=args.pattern_chunk_prefix_min_matches,
+                chunk_prefix_max_mismatches=args.pattern_chunk_prefix_max_mismatches,
+                enable_action_token_neighborhood=args.pattern_action_token_neighborhood,
+                action_token_neighborhood_radius=args.pattern_action_token_neighborhood_radius,
+                action_token_neighborhood_top_k=args.pattern_action_token_neighborhood_top_k,
+                enable_position_mode_histogram=args.pattern_position_mode_histogram,
+                position_mode_history_size=args.pattern_position_mode_history_size,
+                position_mode_top_k=args.pattern_position_mode_top_k,
+                position_mode_min_count=args.pattern_position_mode_min_count,
+                enable_global_position_mode=args.pattern_global_position_mode,
+                global_position_history_size=args.pattern_global_position_history_size,
+                global_position_top_k=args.pattern_global_position_top_k,
+                global_position_min_count=args.pattern_global_position_min_count,
+                enable_action_dimension_mode=args.pattern_action_dimension_mode,
+                action_dimension_mode_history_size=args.pattern_action_dimension_mode_history_size,
+                action_dimension_mode_top_k=args.pattern_action_dimension_mode_top_k,
+                action_dimension_mode_min_count=args.pattern_action_dimension_mode_min_count,
+                enable_hold_action_token=args.pattern_hold_action_token,
+                enable_ngram_continuation=args.pattern_ngram_continuation,
+                ngram_min_context=args.pattern_ngram_min_context,
+                ngram_max_context=args.pattern_ngram_max_context,
+                ngram_history_size=args.pattern_ngram_history_size,
+                min_source_agreement=args.pattern_min_source_agreement,
+                source_priority=parse_source_priority(args.pattern_source_priority),
+                enable_source_cooldown=args.pattern_source_cooldown,
+                source_cooldown_after=args.pattern_source_cooldown_after,
+                source_cooldown_steps=args.pattern_source_cooldown_steps,
+                enable_source_acceptance_bias=args.pattern_source_acceptance_bias,
+                source_acceptance_bias_history_size=args.pattern_source_acceptance_bias_history_size,
+                source_acceptance_bias_min_observations=args.pattern_source_acceptance_bias_min_observations,
+                vocab_size=int(token_adapter.model._paligemma_tokenizer.vocab_size),
+                stop_token_ids=(_adapter_action_end_token_id(token_adapter),),
+            )
+        )
     if any(mode.startswith("block_sd") for mode in modes):
         if not args.block_checkpoint:
             raise SystemExit("block_sd modes require --block-checkpoint")
@@ -2441,6 +4196,15 @@ def main() -> None:
         smooth_position_delta=args.smooth_position_delta,
         smooth_rotation_delta=args.smooth_rotation_delta,
     )
+    target_eos_constrained_extra_token_ids = _load_token_id_file(
+        args.target_eos_constrained_extra_token_id_file
+    )
+    if target_eos_constrained_extra_token_ids:
+        logger.info(
+            "Loaded %d extra constrained target_eos token ids from %s",
+            len(target_eos_constrained_extra_token_ids),
+            args.target_eos_constrained_extra_token_id_file,
+        )
 
     all_results: list[EpisodeResult] = []
     for task_id in task_ids:
@@ -2453,7 +4217,14 @@ def main() -> None:
                 cfg = guard_cfg
             controller = ChunkExecutionController(ChunkGuard(cfg))
             drafter = RetrievalChunkDrafter() if "retrieval" in mode or mode.startswith("exact_fast_sd") else None
-            for ep in range(args.episodes):
+            if (
+                token_adapter is not None
+                and mode.startswith("target_eos")
+                and "_charstop" in mode
+                and hasattr(token_adapter, "prepare_action_char_length_lookup")
+            ):
+                token_adapter.prepare_action_char_length_lookup(device=device)
+            for ep in selected_episode_ids:
                 seed = args.seed + ep
                 logger.info("=== task_id=%d mode=%s episode=%d seed=%d ===", task_id, mode, ep, seed)
                 result = run_episode(
@@ -2474,6 +4245,7 @@ def main() -> None:
                     drafter=drafter,
                     token_adapter=token_adapter,
                     ngram_drafter=ngram_drafter,
+                    pattern_drafter=pattern_drafter,
                     block_drafter=block_drafter,
                     block_token_map=block_token_map,
                     block_gate=block_gate,
@@ -2522,6 +4294,27 @@ def main() -> None:
                     block_draft_after_known_token=args.block_draft_after_known_token,
                     ngram_lookahead=args.ngram_lookahead,
                     ngram_reuse_full_blocks=args.ngram_reuse_full_blocks,
+                    pattern_lookahead=args.pattern_lookahead,
+                    pattern_reuse_full_blocks=args.pattern_reuse_full_blocks,
+                    pattern_min_verify_margin=args.pattern_min_verify_margin,
+                    pattern_emit_bonus_token=args.pattern_emit_bonus_token,
+                    pattern_defer_correction_token=args.pattern_defer_correction_token,
+                    pattern_verify_from_scratch=args.pattern_verify_from_scratch,
+                    pattern_replay_accepted_cache=args.pattern_replay_accepted_cache,
+                    pattern_resync_accepted_cache=args.pattern_resync_accepted_cache,
+                    pattern_diagnose_verify_alignment=args.pattern_diagnose_verify_alignment,
+                    pattern_dynamic_lookahead=args.pattern_dynamic_lookahead,
+                    pattern_min_lookahead=args.pattern_min_lookahead,
+                    pattern_lookahead_growth=args.pattern_lookahead_growth,
+                    pattern_lookahead_shrink=args.pattern_lookahead_shrink,
+                    pattern_tree_width=args.pattern_tree_width,
+                    pattern_tree_branch_width=args.pattern_tree_branch_width,
+                    pattern_dynamic_tree_width=args.pattern_dynamic_tree_width,
+                    pattern_min_tree_width=args.pattern_min_tree_width,
+                    pattern_tree_width_growth=args.pattern_tree_width_growth,
+                    pattern_tree_width_shrink=args.pattern_tree_width_shrink,
+                    pattern_tree_anchor_target_token=args.pattern_tree_anchor_target_token,
+                    pattern_tree_anchor_target_continuation=args.pattern_tree_anchor_target_continuation,
                     trajectory_head=trajectory_head,
                     trajectory_tail_blend=args.trajectory_tail_blend,
                     trajectory_project_smooth=args.trajectory_project_smooth,
@@ -2539,11 +4332,77 @@ def main() -> None:
                     adaptive_stable_checks=args.adaptive_stable_checks,
                     adaptive_early_stable_checks=args.adaptive_early_stable_checks or None,
                     adaptive_early_max_stable_checkpoint=args.adaptive_early_max_stable_checkpoint or None,
+                    adaptive_checkpoint_stable_checks=adaptive_checkpoint_stable_checks,
                     adaptive_skip_unproductive_checks=args.adaptive_skip_unproductive_checks,
                     adaptive_skip_unproductive_after_checkpoint=args.adaptive_skip_unproductive_after_checkpoint,
                     adaptive_continue_to_action_end_on_unstable=args.adaptive_continue_to_action_end_on_unstable,
+                    adaptive_stability_target_eos_after_step=(
+                        None
+                        if args.adaptive_stability_target_eos_after_step < 0
+                        else args.adaptive_stability_target_eos_after_step
+                    ),
+                    adaptive_stability_target_eos_max_fallbacks=args.adaptive_stability_target_eos_max_fallbacks,
+                    adaptive_stability_continue_to_action_end_after_step=(
+                        None
+                        if args.adaptive_stability_continue_to_action_end_after_step < 0
+                        else args.adaptive_stability_continue_to_action_end_after_step
+                    ),
+                    adaptive_stability_continue_to_action_end_max_fallbacks=(
+                        args.adaptive_stability_continue_to_action_end_max_fallbacks
+                    ),
+                    adaptive_stability_risk_after_step=(
+                        None
+                        if args.adaptive_stability_risk_after_step < 0 or not adaptive_stability_risk_gate
+                        else args.adaptive_stability_risk_after_step
+                    ),
+                    adaptive_stability_risk_max_rejections=args.adaptive_stability_risk_max_rejections,
+                    adaptive_stability_risk_gate=adaptive_stability_risk_gate,
+                    adaptive_stability_risk_target_eos_fallback=(
+                        args.adaptive_stability_risk_target_eos_fallback
+                    ),
+                    adaptive_validate_label_all_stability_stops=args.adaptive_validate_label_all_stability_stops,
+                    adaptive_validate_stability_stops_only=args.adaptive_validate_stability_stops_only,
                     adaptive_prefix_gate=adaptive_prefix_gate,
                     adaptive_prefix_gate_threshold=args.adaptive_prefix_gate_threshold,
+                    target_eos_constrained_action_vocab_size=args.target_eos_constrained_action_vocab_size,
+                    target_eos_constrained_text_vocab_size=args.target_eos_constrained_text_vocab_size,
+                    target_eos_constrained_full_head_margin=(
+                        None
+                        if args.target_eos_constrained_full_head_margin < 0
+                        else args.target_eos_constrained_full_head_margin
+                    ),
+                    target_eos_constrained_no_force_prefix=args.target_eos_constrained_no_force_prefix,
+                    target_eos_constrained_structural_token_radius=args.target_eos_constrained_structural_token_radius,
+                    target_eos_constrained_full_head_prefix_tokens=args.target_eos_constrained_full_head_prefix_tokens,
+                    target_eos_constrained_extra_token_ids=target_eos_constrained_extra_token_ids,
+                    target_eos_action_char_min_chars=(
+                        None if args.target_eos_action_char_min_chars < 0 else args.target_eos_action_char_min_chars
+                    ),
+                    target_eos_action_char_plateau_tokens=args.target_eos_action_char_plateau_tokens,
+                    target_eos_action_char_stable_checks=args.target_eos_action_char_stable_checks,
+                    target_eos_action_char_stable_tolerance=args.target_eos_action_char_stable_tolerance,
+                    target_eos_action_char_stable_max_chars=args.target_eos_action_char_stable_max_chars,
+                    target_eos_action_char_plateau_reject_eos_restart=(
+                        args.target_eos_action_char_plateau_reject_eos_restart
+                    ),
+                    target_eos_action_char_restart_continue=args.target_eos_action_char_restart_continue,
+                    target_eos_action_char_restart_reset=args.target_eos_action_char_restart_reset,
+                    target_eos_action_char_restart_reset_low_text_tokens=(
+                        args.target_eos_action_char_restart_reset_low_text_tokens
+                    ),
+                    target_eos_action_char_plateau_low_text_tail_tokens=(
+                        args.target_eos_action_char_plateau_low_text_tail_tokens
+                    ),
+                    target_eos_action_char_strict_target_stop=(
+                        args.target_eos_action_char_strict_target_stop
+                    ),
+                    target_eos_action_char_reset_requires_action_end=(
+                        args.target_eos_action_char_reset_requires_action_end
+                    ),
+                    target_eos_action_char_target_confirm_tokens=(
+                        args.target_eos_action_char_target_confirm_tokens
+                    ),
+                    token_trace_sink=token_trace_sink,
                     device=str(device),
                     use_amp=args.use_amp,
                     amp_dtype=amp_dtype,
@@ -2560,6 +4419,9 @@ def main() -> None:
                     result.model_calls_per_step,
                 )
 
+    if token_trace_sink is not None:
+        token_trace_sink.flush()
+
     summary = summarize(all_results, baseline_mode=args.summary_baseline_mode)
     summary["config"] = {
         "policy": args.policy,
@@ -2567,11 +4429,53 @@ def main() -> None:
         "dtype": args.dtype,
         "use_amp": args.use_amp,
         "amp_dtype": args.amp_dtype or (args.dtype if amp_dtype is not None else None),
+        "disable_gradient_checkpointing": args.disable_gradient_checkpointing,
+        "target_eos_constrained_action_vocab_size": args.target_eos_constrained_action_vocab_size,
+        "target_eos_constrained_text_vocab_size": args.target_eos_constrained_text_vocab_size,
+        "target_eos_constrained_full_head_margin": args.target_eos_constrained_full_head_margin,
+        "target_eos_constrained_no_force_prefix": args.target_eos_constrained_no_force_prefix,
+        "target_eos_constrained_structural_token_radius": args.target_eos_constrained_structural_token_radius,
+        "target_eos_constrained_full_head_prefix_tokens": args.target_eos_constrained_full_head_prefix_tokens,
+        "target_eos_constrained_extra_token_id_file": None
+        if args.target_eos_constrained_extra_token_id_file is None
+        else str(args.target_eos_constrained_extra_token_id_file),
+        "target_eos_constrained_extra_token_count": len(target_eos_constrained_extra_token_ids),
+        "target_eos_action_char_min_chars": args.target_eos_action_char_min_chars,
+        "target_eos_action_char_plateau_tokens": args.target_eos_action_char_plateau_tokens,
+        "target_eos_action_char_stable_checks": args.target_eos_action_char_stable_checks,
+        "target_eos_action_char_stable_tolerance": args.target_eos_action_char_stable_tolerance,
+        "target_eos_action_char_stable_max_chars": args.target_eos_action_char_stable_max_chars,
+        "target_eos_action_char_plateau_reject_eos_restart": (
+            args.target_eos_action_char_plateau_reject_eos_restart
+        ),
+        "target_eos_action_char_restart_continue": args.target_eos_action_char_restart_continue,
+        "target_eos_action_char_restart_reset": args.target_eos_action_char_restart_reset,
+        "target_eos_action_char_restart_reset_low_text_tokens": (
+            args.target_eos_action_char_restart_reset_low_text_tokens
+        ),
+        "target_eos_action_char_plateau_low_text_tail_tokens": (
+            args.target_eos_action_char_plateau_low_text_tail_tokens
+        ),
+        "target_eos_action_char_strict_target_stop": args.target_eos_action_char_strict_target_stop,
+        "target_eos_action_char_reset_requires_action_end": (
+            args.target_eos_action_char_reset_requires_action_end
+        ),
+        "target_eos_action_char_target_confirm_tokens": args.target_eos_action_char_target_confirm_tokens,
         "num_inference_steps": args.num_inference_steps,
         "task": args.task,
         "task_id": args.task_id,
         "task_ids": task_ids,
+        "init_states": args.init_states,
+        "control_mode": args.control_mode,
+        "rename_map": rename_map,
+        "episode_ids": selected_episode_ids,
         "summary_baseline_mode": args.summary_baseline_mode,
+        "token_trace_output_dir": None
+        if args.token_trace_output_dir is None
+        else str(args.token_trace_output_dir),
+        "token_trace_modes": None if token_trace_sink is None or token_trace_sink.modes is None else sorted(token_trace_sink.modes),
+        "token_trace_rows": 0 if token_trace_sink is None else token_trace_sink.total_rows,
+        "token_trace_shards": 0 if token_trace_sink is None else token_trace_sink.shards_written,
         "guard": dataclass_dict(guard_cfg),
         "medusa_checkpoint": args.medusa_checkpoint,
         "medusa_summary": medusa_summary,
@@ -2621,14 +4525,165 @@ def main() -> None:
         "block_resync_accepted_cache": args.block_resync_accepted_cache,
         "block_draft_after_known_token": args.block_draft_after_known_token,
         "block_compile_draft": args.block_compile_draft,
+        "pattern_lookahead": args.pattern_lookahead,
+        "pattern_action_dim": args.pattern_action_dim,
+        "pattern_max_period": args.pattern_max_period,
+        "pattern_min_period_repeats": args.pattern_min_period_repeats,
+        "pattern_repeat_token_min_run": args.pattern_repeat_token_min_run,
+        "pattern_linear_action_extrapolation": args.pattern_linear_action_extrapolation,
+        "pattern_second_order_action_extrapolation": args.pattern_second_order_action_extrapolation,
+        "pattern_second_order_max_accel": None
+        if args.pattern_second_order_max_accel < 0
+        else args.pattern_second_order_max_accel,
+        "pattern_action_trend_regression": args.pattern_action_trend_regression,
+        "pattern_action_trend_history": args.pattern_action_trend_history,
+        "pattern_action_trend_top_k": args.pattern_action_trend_top_k,
+        "pattern_action_trend_max_abs": None
+        if args.pattern_action_trend_max_abs < 0
+        else args.pattern_action_trend_max_abs,
+        "pattern_action_prefix_lookup": args.pattern_action_prefix_lookup,
+        "pattern_action_prefix_history_size": args.pattern_action_prefix_history_size,
+        "pattern_action_prefix_top_k": args.pattern_action_prefix_top_k,
+        "pattern_action_prefix_min_prefix": args.pattern_action_prefix_min_prefix,
+        "pattern_action_prefix_max_mismatches": args.pattern_action_prefix_max_mismatches,
+        "pattern_action_vector_suffix_lookup": args.pattern_action_vector_suffix_lookup,
+        "pattern_action_vector_suffix_history_size": args.pattern_action_vector_suffix_history_size,
+        "pattern_action_vector_suffix_top_k": args.pattern_action_vector_suffix_top_k,
+        "pattern_action_vector_suffix_min_prefix": args.pattern_action_vector_suffix_min_prefix,
+        "pattern_action_vector_suffix_min_count": args.pattern_action_vector_suffix_min_count,
+        "pattern_action_vector_suffix_max_prefix_delta": args.pattern_action_vector_suffix_max_prefix_delta,
+        "pattern_action_vector_transition": args.pattern_action_vector_transition,
+        "pattern_action_vector_transition_history_size": args.pattern_action_vector_transition_history_size,
+        "pattern_action_vector_transition_top_k": args.pattern_action_vector_transition_top_k,
+        "pattern_action_vector_transition_min_count": args.pattern_action_vector_transition_min_count,
+        "pattern_action_vector_transition_max_prev_delta": args.pattern_action_vector_transition_max_prev_delta,
+        "pattern_action_vector_transition_max_prefix_delta": args.pattern_action_vector_transition_max_prefix_delta,
+        "pattern_action_repeat_vector": args.pattern_action_repeat_vector,
+        "pattern_action_repeat_min_repeats": args.pattern_action_repeat_min_repeats,
+        "pattern_action_repeat_max_delta": args.pattern_action_repeat_max_delta,
+        "pattern_chunk_length_stop": args.pattern_chunk_length_stop,
+        "pattern_chunk_length_stop_history_size": args.pattern_chunk_length_stop_history_size,
+        "pattern_chunk_length_stop_min_count": args.pattern_chunk_length_stop_min_count,
+        "pattern_action_context_tree": args.pattern_action_context_tree,
+        "pattern_action_context_tree_history_size": args.pattern_action_context_tree_history_size,
+        "pattern_action_context_tree_max_context": args.pattern_action_context_tree_max_context,
+        "pattern_action_context_tree_top_k": args.pattern_action_context_tree_top_k,
+        "pattern_action_context_tree_min_count": args.pattern_action_context_tree_min_count,
+        "pattern_action_transition_histogram": args.pattern_action_transition_histogram,
+        "pattern_action_transition_history_size": args.pattern_action_transition_history_size,
+        "pattern_action_transition_top_k": args.pattern_action_transition_top_k,
+        "pattern_action_transition_min_count": args.pattern_action_transition_min_count,
+        "pattern_action_delta_histogram": args.pattern_action_delta_histogram,
+        "pattern_action_delta_history": args.pattern_action_delta_history,
+        "pattern_action_delta_top_k": args.pattern_action_delta_top_k,
+        "pattern_action_delta_min_count": args.pattern_action_delta_min_count,
+        "pattern_action_delta_max_abs": None
+        if args.pattern_action_delta_max_abs < 0
+        else args.pattern_action_delta_max_abs,
+        "pattern_action_delta_ngram": args.pattern_action_delta_ngram,
+        "pattern_action_delta_ngram_history_size": args.pattern_action_delta_ngram_history_size,
+        "pattern_action_delta_ngram_min_context": args.pattern_action_delta_ngram_min_context,
+        "pattern_action_delta_ngram_max_context": args.pattern_action_delta_ngram_max_context,
+        "pattern_action_delta_ngram_top_k": args.pattern_action_delta_ngram_top_k,
+        "pattern_action_delta_ngram_min_count": args.pattern_action_delta_ngram_min_count,
+        "pattern_action_delta_ngram_max_abs": None
+        if args.pattern_action_delta_ngram_max_abs < 0
+        else args.pattern_action_delta_ngram_max_abs,
+        "pattern_chunk_position_delta": args.pattern_chunk_position_delta,
+        "pattern_chunk_position_delta_history_size": args.pattern_chunk_position_delta_history_size,
+        "pattern_chunk_position_delta_top_k": args.pattern_chunk_position_delta_top_k,
+        "pattern_chunk_position_delta_min_count": args.pattern_chunk_position_delta_min_count,
+        "pattern_chunk_position_delta_max_abs": None
+        if args.pattern_chunk_position_delta_max_abs < 0
+        else args.pattern_chunk_position_delta_max_abs,
+        "pattern_chunk_delta_template": args.pattern_chunk_delta_template,
+        "pattern_chunk_delta_template_history_size": args.pattern_chunk_delta_template_history_size,
+        "pattern_chunk_delta_template_top_k": args.pattern_chunk_delta_template_top_k,
+        "pattern_chunk_delta_template_min_prefix_deltas": args.pattern_chunk_delta_template_min_prefix_deltas,
+        "pattern_chunk_delta_template_max_delta_mismatch": None
+        if args.pattern_chunk_delta_template_max_delta_mismatch < 0
+        else args.pattern_chunk_delta_template_max_delta_mismatch,
+        "pattern_chunk_delta_template_max_abs": None
+        if args.pattern_chunk_delta_template_max_abs < 0
+        else args.pattern_chunk_delta_template_max_abs,
+        "pattern_previous_chunk_position": args.pattern_previous_chunk_position,
+        "pattern_previous_chunk_history_size": args.pattern_previous_chunk_history_size,
+        "pattern_chunk_prefix_retrieval": args.pattern_chunk_prefix_retrieval,
+        "pattern_chunk_prefix_history_size": args.pattern_chunk_prefix_history_size,
+        "pattern_chunk_prefix_top_k": args.pattern_chunk_prefix_top_k,
+        "pattern_chunk_prefix_min_matches": args.pattern_chunk_prefix_min_matches,
+        "pattern_chunk_prefix_max_mismatches": args.pattern_chunk_prefix_max_mismatches,
+        "pattern_action_token_neighborhood": args.pattern_action_token_neighborhood,
+        "pattern_action_token_neighborhood_radius": args.pattern_action_token_neighborhood_radius,
+        "pattern_action_token_neighborhood_top_k": args.pattern_action_token_neighborhood_top_k,
+        "pattern_position_mode_histogram": args.pattern_position_mode_histogram,
+        "pattern_position_mode_history_size": args.pattern_position_mode_history_size,
+        "pattern_position_mode_top_k": args.pattern_position_mode_top_k,
+        "pattern_position_mode_min_count": args.pattern_position_mode_min_count,
+        "pattern_global_position_mode": args.pattern_global_position_mode,
+        "pattern_global_position_history_size": args.pattern_global_position_history_size,
+        "pattern_global_position_top_k": args.pattern_global_position_top_k,
+        "pattern_global_position_min_count": args.pattern_global_position_min_count,
+        "pattern_action_dimension_mode": args.pattern_action_dimension_mode,
+        "pattern_action_dimension_mode_history_size": args.pattern_action_dimension_mode_history_size,
+        "pattern_action_dimension_mode_top_k": args.pattern_action_dimension_mode_top_k,
+        "pattern_action_dimension_mode_min_count": args.pattern_action_dimension_mode_min_count,
+        "pattern_hold_action_token": args.pattern_hold_action_token,
+        "pattern_ngram_continuation": args.pattern_ngram_continuation,
+        "pattern_ngram_min_context": args.pattern_ngram_min_context,
+        "pattern_ngram_max_context": args.pattern_ngram_max_context,
+        "pattern_ngram_history_size": args.pattern_ngram_history_size,
+        "pattern_min_source_agreement": args.pattern_min_source_agreement,
+        "pattern_source_priority": list(parse_source_priority(args.pattern_source_priority)),
+        "pattern_source_cooldown": args.pattern_source_cooldown,
+        "pattern_source_cooldown_after": args.pattern_source_cooldown_after,
+        "pattern_source_cooldown_steps": args.pattern_source_cooldown_steps,
+        "pattern_source_acceptance_bias": args.pattern_source_acceptance_bias,
+        "pattern_source_acceptance_bias_history_size": args.pattern_source_acceptance_bias_history_size,
+        "pattern_source_acceptance_bias_min_observations": args.pattern_source_acceptance_bias_min_observations,
+        "pattern_reuse_full_blocks": args.pattern_reuse_full_blocks,
+        "pattern_min_verify_margin": args.pattern_min_verify_margin,
+        "pattern_emit_bonus_token": args.pattern_emit_bonus_token,
+        "pattern_defer_correction_token": args.pattern_defer_correction_token,
+        "pattern_verify_from_scratch": args.pattern_verify_from_scratch,
+        "pattern_replay_accepted_cache": args.pattern_replay_accepted_cache,
+        "pattern_resync_accepted_cache": args.pattern_resync_accepted_cache,
+        "pattern_diagnose_verify_alignment": args.pattern_diagnose_verify_alignment,
+        "pattern_dynamic_lookahead": args.pattern_dynamic_lookahead,
+        "pattern_min_lookahead": args.pattern_min_lookahead,
+        "pattern_lookahead_growth": args.pattern_lookahead_growth,
+        "pattern_lookahead_shrink": args.pattern_lookahead_shrink,
+        "pattern_tree_width": args.pattern_tree_width,
+        "pattern_tree_branch_width": args.pattern_tree_branch_width,
+        "pattern_dynamic_tree_width": args.pattern_dynamic_tree_width,
+        "pattern_min_tree_width": args.pattern_min_tree_width,
+        "pattern_tree_width_growth": args.pattern_tree_width_growth,
+        "pattern_tree_width_shrink": args.pattern_tree_width_shrink,
+        "pattern_tree_anchor_target_token": args.pattern_tree_anchor_target_token,
+        "pattern_tree_anchor_target_continuation": args.pattern_tree_anchor_target_continuation,
         "adaptive_prefix_checkpoints": adaptive_prefix_checkpoints,
         "adaptive_stable_tolerance": args.adaptive_stable_tolerance,
         "adaptive_stable_checks": args.adaptive_stable_checks,
         "adaptive_early_stable_checks": args.adaptive_early_stable_checks,
         "adaptive_early_max_stable_checkpoint": args.adaptive_early_max_stable_checkpoint,
+        "adaptive_checkpoint_stable_checks": adaptive_checkpoint_stable_checks,
         "adaptive_skip_unproductive_checks": args.adaptive_skip_unproductive_checks,
         "adaptive_skip_unproductive_after_checkpoint": args.adaptive_skip_unproductive_after_checkpoint,
         "adaptive_continue_to_action_end_on_unstable": args.adaptive_continue_to_action_end_on_unstable,
+        "adaptive_stability_target_eos_after_step": args.adaptive_stability_target_eos_after_step,
+        "adaptive_stability_target_eos_max_fallbacks": args.adaptive_stability_target_eos_max_fallbacks,
+        "adaptive_stability_continue_to_action_end_after_step": (
+            args.adaptive_stability_continue_to_action_end_after_step
+        ),
+        "adaptive_stability_continue_to_action_end_max_fallbacks": (
+            args.adaptive_stability_continue_to_action_end_max_fallbacks
+        ),
+        "adaptive_stability_risk_after_step": args.adaptive_stability_risk_after_step,
+        "adaptive_stability_risk_max_rejections": args.adaptive_stability_risk_max_rejections,
+        "adaptive_stability_risk_gate": adaptive_stability_risk_gate,
+        "adaptive_stability_risk_target_eos_fallback": args.adaptive_stability_risk_target_eos_fallback,
+        "adaptive_validate_label_all_stability_stops": args.adaptive_validate_label_all_stability_stops,
+        "adaptive_validate_stability_stops_only": args.adaptive_validate_stability_stops_only,
         "adaptive_prefix_gate_checkpoint": args.adaptive_prefix_gate_checkpoint,
         "adaptive_prefix_gate_threshold": args.adaptive_prefix_gate_threshold,
         "adaptive_prefix_gate_summary": adaptive_prefix_gate_summary,

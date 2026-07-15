@@ -30,6 +30,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from lerobot.configs.policies import PreTrainedConfig  # noqa: E402
 from scripts.run_pi0fast_chunk_eval import (  # noqa: E402
     _ensure_libero_config,
     _env_step,
@@ -39,6 +40,12 @@ from scripts.run_pi0fast_chunk_eval import (  # noqa: E402
 )
 from serving.pi0fast_serving_runtime import merge_prepared_pi0fast_batches  # noqa: E402
 from serving.pi0fast_token_hooks import PI0FastTokenLogitAdapter  # noqa: E402
+
+OBS_IMAGES = "observation.images"
+OBS_IMAGE = "observation.image"
+OBS_STATE = "observation.state"
+OBS_STR = "observation"
+OBS_ENV_STATE = "observation.environment_state"
 
 
 def parse_args() -> argparse.Namespace:
@@ -57,6 +64,69 @@ def parse_args() -> argparse.Namespace:
         default="public",
         help="public uses policy.predict_action_chunk; action_end uses greedy FAST-token decode that stops on '|'.",
     )
+    parser.add_argument(
+        "--action-end-constrained-vocab",
+        action="store_true",
+        help="For PI0-FAST action_end, restrict each LM head projection to the FAST-action/text candidate set.",
+    )
+    parser.add_argument(
+        "--action-end-constrained-action-vocab-size",
+        type=int,
+        default=None,
+        help="Optional FAST action-vocab candidate size for constrained action_end decode.",
+    )
+    parser.add_argument(
+        "--action-end-constrained-text-vocab-size",
+        type=int,
+        default=None,
+        help="Optional low text-vocab candidate size for constrained action_end decode.",
+    )
+    parser.add_argument(
+        "--action-end-constrained-full-head-margin",
+        type=float,
+        default=None,
+        help="If set, fall back to the full LM head when the constrained top-1/top-2 margin is below this value.",
+    )
+    parser.add_argument(
+        "--action-end-constrained-structural-token-radius",
+        type=int,
+        default=512,
+        help="Include tokens within this radius of the action-end token in constrained action_end decode.",
+    )
+    parser.add_argument(
+        "--action-end-constrained-prefill-action-prefix",
+        action="store_true",
+        help="Experimentally prefill the fixed 'Action: ' target prefix as causal FAST tokens.",
+    )
+    parser.add_argument(
+        "--action-end-stop-on-action-chars",
+        action="store_true",
+        help="Stop action_end decode once enough decoded FAST action characters have been emitted.",
+    )
+    parser.add_argument(
+        "--action-end-action-char-min-chars",
+        type=int,
+        default=-1,
+        help="Minimum decoded FAST-character count before char-stop plateau logic may stop; negative uses the full action target.",
+    )
+    parser.add_argument(
+        "--action-end-action-char-target-chars",
+        type=int,
+        default=-1,
+        help="Override the decoded FAST-character stop target; negative uses the full action horizon.",
+    )
+    parser.add_argument("--action-end-action-char-plateau-tokens", type=int, default=0)
+    parser.add_argument("--action-end-action-char-stable-checks", type=int, default=0)
+    parser.add_argument("--action-end-action-char-stable-tolerance", type=float, default=0.0)
+    parser.add_argument("--action-end-action-char-stable-max-chars", type=int, default=0)
+    parser.add_argument("--action-end-action-char-plateau-reject-eos-restart", action="store_true")
+    parser.add_argument("--action-end-action-char-restart-continue", action="store_true")
+    parser.add_argument("--action-end-action-char-restart-reset", action="store_true")
+    parser.add_argument("--action-end-action-char-restart-reset-low-text-tokens", type=int, default=0)
+    parser.add_argument("--action-end-action-char-plateau-low-text-tail-tokens", type=int, default=0)
+    parser.add_argument("--action-end-action-char-strict-target-stop", action="store_true")
+    parser.add_argument("--action-end-action-char-reset-requires-action-end", action="store_true")
+    parser.add_argument("--action-end-action-char-target-confirm-tokens", type=int, default=0)
     parser.add_argument(
         "--max-decoding-steps",
         default="default",
@@ -83,13 +153,67 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
+    parser.add_argument(
+        "--disable-gradient-checkpointing",
+        action="store_true",
+        help="Disable gradient checkpointing in the policy config and loaded model for serving-style latency.",
+    )
+    parser.add_argument(
+        "--fast-libero-preprocess",
+        action="store_true",
+        help="For LIBERO observations, convert uint8 images to float CHW tensors on the target device.",
+    )
+    parser.add_argument(
+        "--attn-implementation",
+        choices=["default", "eager", "sdpa", "flash_attention_2"],
+        default="default",
+        help="Override the PI0-FAST language model attention implementation for serving benchmarks.",
+    )
+    parser.add_argument(
+        "--decode-attn-implementation",
+        choices=["default", "eager", "sdpa", "flash_attention_2"],
+        default="default",
+        help="For constrained action_end, optionally switch only one-token decode forwards to this attention backend after SDPA prefill.",
+    )
+    parser.add_argument(
+        "--compile-language-model-forward",
+        action="store_true",
+        help="Experimental: torch.compile the PI0-FAST language model forward method after loading; validate token exactness separately.",
+    )
+    parser.add_argument("--compile-mode", default="reduce-overhead")
+    parser.add_argument(
+        "--action-end-profile",
+        action="store_true",
+        help="Record synchronized internal timings for the action_end constrained decode path.",
+    )
     parser.add_argument("--target-latency-ms", type=float, default=250.0)
     parser.add_argument("--libero-config-path", default=os.environ.get("LIBERO_CONFIG_PATH"))
     parser.add_argument("--output", type=Path, default=Path("outputs/pi0fast_system_components/summary.json"))
     args = parser.parse_args()
     if args.policy is None:
-        args.policy = "lerobot/pi05_libero_finetuned_v044" if args.policy_kind == "pi05" else "lerobot/pi0fast-libero"
+        args.policy = (
+            "lerobot/pi05_libero_finetuned_v044"
+            if args.policy_kind == "pi05"
+            else "lerobot/pi0fast-libero-v044"
+        )
     return args
+
+
+def load_dotenv_token() -> None:
+    env_path = Path(".env")
+    if not env_path.exists():
+        return
+    for raw_line in env_path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key in {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_HUB_TOKEN"} and value:
+            os.environ.setdefault("HF_TOKEN", value)
+            os.environ.setdefault("HUGGING_FACE_HUB_TOKEN", value)
+            os.environ.setdefault("HUGGINGFACE_HUB_TOKEN", value)
 
 
 def sync_if_cuda(device: torch.device) -> None:
@@ -157,6 +281,87 @@ def clone_batch_for_replicas(batch: Any, replicas: int) -> Any:
     return copy.deepcopy(batch)
 
 
+def nested_numpy_to_torch(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: nested_numpy_to_torch(item) for key, item in value.items()}
+    if isinstance(value, np.ndarray):
+        return torch.from_numpy(value)
+    return value
+
+
+def fast_libero_preprocess_observation(observations: dict[str, Any], *, device: torch.device) -> dict[str, Any]:
+    """LeRobot-compatible LIBERO observation conversion with GPU image casting.
+
+    LeRobot's generic env utility first expands uint8 images to CPU float32
+    tensors and later copies them to the policy device.  For serving latency,
+    copying uint8 and doing the CHW/float conversion on the target device avoids
+    a larger CPU allocation/copy while preserving the policy input contract.
+    """
+
+    out: dict[str, Any] = {}
+    pixels = observations.get("pixels")
+    if pixels is not None:
+        imgs = (
+            {f"{OBS_IMAGES}.{key}": img for key, img in pixels.items()}
+            if isinstance(pixels, dict)
+            else {OBS_IMAGE: pixels}
+        )
+        for key, img in imgs.items():
+            img_tensor = torch.as_tensor(img, device=device)
+            if img_tensor.ndim == 3:
+                img_tensor = img_tensor.unsqueeze(0)
+            if img_tensor.ndim != 4:
+                raise ValueError(f"Expected LIBERO image tensor with 4 dims, got {tuple(img_tensor.shape)}")
+            _, h, w, c = img_tensor.shape
+            if not (c < h and c < w):
+                raise ValueError(f"Expected channel-last image tensor, got {tuple(img_tensor.shape)}")
+            if img_tensor.dtype != torch.uint8:
+                raise ValueError(f"Expected uint8 LIBERO image tensor, got {img_tensor.dtype}")
+            img_tensor = img_tensor.permute(0, 3, 1, 2).contiguous()
+            out[key] = img_tensor.to(dtype=torch.float32).div_(255.0)
+
+    if "environment_state" in observations:
+        env_state = torch.from_numpy(observations["environment_state"]).float()
+        if env_state.dim() == 1:
+            env_state = env_state.unsqueeze(0)
+        out[OBS_ENV_STATE] = env_state
+
+    if "agent_pos" in observations:
+        agent_pos = torch.from_numpy(observations["agent_pos"]).float()
+        if agent_pos.dim() == 1:
+            agent_pos = agent_pos.unsqueeze(0)
+        out[OBS_STATE] = agent_pos
+
+    if "robot_state" in observations:
+        out[f"{OBS_STR}.robot_state"] = nested_numpy_to_torch(observations["robot_state"])
+
+    if "policy" in observations:
+        out[f"{OBS_STR}.policy"] = observations["policy"]
+
+    if "camera_obs" in observations:
+        out[f"{OBS_STR}.camera_obs"] = observations["camera_obs"]
+
+    handled = {"pixels", "environment_state", "agent_pos", "robot_state", "policy", "camera_obs"}
+    for key, value in observations.items():
+        if key in handled:
+            continue
+        target = f"{OBS_STR}.{key}"
+        if target in out:
+            continue
+        if isinstance(value, np.ndarray):
+            tensor = torch.from_numpy(value).float()
+            if tensor.dim() == 1:
+                tensor = tensor.unsqueeze(0)
+            out[target] = tensor
+        elif torch.is_tensor(value):
+            tensor = value.float()
+            if tensor.dim() == 1:
+                tensor = tensor.unsqueeze(0)
+            out[target] = tensor
+
+    return out
+
+
 def collect_distinct_reset_batch(
     *,
     env,
@@ -182,6 +387,30 @@ def set_kv_mode(policy, mode: str) -> bool | None:
         return None
     policy.config.use_kv_cache = desired
     return desired
+
+
+def pi0fast_language_model(policy):
+    try:
+        return policy.model.paligemma_with_expert.paligemma.model.language_model
+    except AttributeError:
+        return None
+
+
+def set_pi0fast_attn_implementation(policy, implementation: str) -> str | None:
+    language_model = pi0fast_language_model(policy)
+    if language_model is None or not hasattr(language_model, "config"):
+        return None
+    if implementation != "default":
+        language_model.config._attn_implementation = implementation
+    return getattr(language_model.config, "_attn_implementation", None)
+
+
+def compile_pi0fast_language_model_forward(policy, mode: str) -> bool:
+    language_model = pi0fast_language_model(policy)
+    if language_model is None:
+        return False
+    language_model.forward = torch.compile(language_model.forward, mode=mode)
+    return True
 
 
 def summarize(values: list[float]) -> dict[str, float]:
@@ -231,17 +460,59 @@ def pi05_recommendation(rows: list[dict[str, Any]], target_latency_ms: float) ->
         for row in rows
         if row.get("decode_path") == "public"
         and not row.get("errors")
-        and row.get("single_inference", {}).get("mean_ms", float("inf")) <= target_latency_ms
+        and request_latency_ms(row) <= target_latency_ms
     ]
     if not candidates:
         return None
-    best = min(candidates, key=lambda row: row["single_inference"]["mean_ms"])
+    best = min(candidates, key=request_latency_ms)
     return {
         "num_inference_steps": best.get("num_inference_steps"),
         "single_mean_ms": best["single_inference"]["mean_ms"],
+        "full_request_mean_ms": best.get("full_request", {}).get("mean_ms"),
         "target_latency_ms": float(target_latency_ms),
         "meets_target": True,
     }
+
+
+def request_latency_ms(row: dict[str, Any]) -> float:
+    full_request = row.get("full_request")
+    if isinstance(full_request, dict) and "mean_ms" in full_request:
+        return float(full_request["mean_ms"])
+    return float(row.get("single_inference", {}).get("mean_ms", float("inf")))
+
+
+def policy_action_horizon(policy: Any) -> int:
+    """Return the number of control actions emitted by one policy request."""
+
+    for attr in ("n_action_steps", "chunk_size"):
+        value = getattr(policy.config, attr, None)
+        if value:
+            return int(value)
+    return 1
+
+
+def pi0fast_recommendation(rows: list[dict[str, Any]], target_latency_ms: float) -> dict[str, Any] | None:
+    candidates: list[dict[str, Any]] = []
+    for row in rows:
+        if row.get("decode_path") != "action_end" or row.get("errors"):
+            continue
+        single = row.get("single_inference", {})
+        if request_latency_ms(row) <= target_latency_ms:
+            candidates.append(
+                {
+                    "path": "single_request",
+                    "batch_size": 1,
+                    "chunk_mean_ms": request_latency_ms(row),
+                    "per_request_mean_ms": request_latency_ms(row),
+                    "single_inference_mean_ms": single.get("mean_ms", 0.0),
+                    "per_action_mean_ms": single.get("per_action_mean_ms", 0.0),
+                    "actions_per_request": row.get("actions_per_request", 1),
+                }
+            )
+    if not candidates:
+        return None
+    best = min(candidates, key=lambda item: item["per_request_mean_ms"])
+    return {**best, "target_latency_ms": float(target_latency_ms), "meets_target": True}
 
 
 def predict_chunk(
@@ -252,6 +523,7 @@ def predict_chunk(
     decode_path: str,
     device: torch.device,
     autocast_dtype: torch.dtype | None = None,
+    action_end_kwargs: dict[str, Any] | None = None,
 ) -> tuple[Any, dict[str, Any] | None]:
     if autocast_dtype is not None and device.type == "cuda":
         cast_context = torch.autocast(device_type=device.type, dtype=autocast_dtype)
@@ -261,17 +533,21 @@ def predict_chunk(
         if decode_path == "action_end":
             if token_adapter is None:
                 raise ValueError("action_end decode path requires PI0FastTokenLogitAdapter")
-            trace = token_adapter.predict_action_chunk_action_end(batch)
+            trace = token_adapter.predict_action_chunk_action_end(batch, **(action_end_kwargs or {}))
             row_counts = (trace.stats or {}).get("row_token_counts")
             if row_counts:
-                return trace.actions, {"row_counts": [float(value) for value in row_counts]}
-            return trace.actions, {"row_counts": [float(trace.token_count)]}
+                return trace.actions, {
+                    "row_counts": [float(value) for value in row_counts],
+                    "stats": trace.stats or {},
+                }
+            return trace.actions, {"row_counts": [float(trace.token_count)], "stats": trace.stats or {}}
         raw = policy.predict_action_chunk(batch) if hasattr(policy, "predict_action_chunk") else policy.select_action(batch)
     return raw, None
 
 
 def main() -> None:
     args = parse_args()
+    load_dotenv_token()
     _ensure_libero_config(args.libero_config_path)
     (
         make_env,
@@ -289,8 +565,55 @@ def main() -> None:
     kv_modes = parse_csv_strings(args.kv_modes)
 
     load_start = time.perf_counter()
-    policy = PolicyClass.from_pretrained(args.policy).to(device=device, dtype=dtype).eval()
+    policy_config = PreTrainedConfig.from_pretrained(args.policy)
+    if hasattr(policy_config, "device"):
+        policy_config.device = str(device)
+    if hasattr(policy_config, "dtype"):
+        policy_config.dtype = args.dtype
+    if args.disable_gradient_checkpointing and hasattr(policy_config, "gradient_checkpointing"):
+        policy_config.gradient_checkpointing = False
+    policy = PolicyClass.from_pretrained(args.policy, config=policy_config).to(device=device, dtype=dtype).eval()
+    if args.disable_gradient_checkpointing and hasattr(policy.model, "gradient_checkpointing_disable"):
+        policy.model.gradient_checkpointing_disable()
+        policy.eval()
     token_adapter = PI0FastTokenLogitAdapter(policy) if args.decode_path == "action_end" else None
+    if token_adapter is not None:
+        token_adapter._profile_action_end_decode = bool(args.action_end_profile)
+    active_attn_implementation = set_pi0fast_attn_implementation(policy, args.attn_implementation)
+    compiled_language_model_forward = False
+    if args.compile_language_model_forward:
+        compiled_language_model_forward = compile_pi0fast_language_model_forward(policy, args.compile_mode)
+    action_end_kwargs: dict[str, Any] = {}
+    if args.decode_path == "action_end":
+        action_end_kwargs = {
+            "constrained_action_vocab": bool(args.action_end_constrained_vocab),
+            "constrained_action_vocab_size": args.action_end_constrained_action_vocab_size,
+            "constrained_text_vocab_size": args.action_end_constrained_text_vocab_size,
+            "constrained_full_head_margin": args.action_end_constrained_full_head_margin,
+            "constrained_structural_token_radius": args.action_end_constrained_structural_token_radius,
+            "constrained_prefill_action_prefix": bool(args.action_end_constrained_prefill_action_prefix),
+            "decode_attn_implementation": args.decode_attn_implementation,
+            "stop_on_action_chars": bool(args.action_end_stop_on_action_chars),
+            "action_char_target_chars": (
+                None if args.action_end_action_char_target_chars < 0 else args.action_end_action_char_target_chars
+            ),
+            "action_char_min_chars": (
+                None if args.action_end_action_char_min_chars < 0 else args.action_end_action_char_min_chars
+            ),
+            "action_char_plateau_tokens": args.action_end_action_char_plateau_tokens,
+            "action_char_stable_checks": args.action_end_action_char_stable_checks,
+            "action_char_stable_tolerance": args.action_end_action_char_stable_tolerance,
+            "action_char_stable_max_chars": args.action_end_action_char_stable_max_chars,
+            "action_char_plateau_reject_eos_restart": args.action_end_action_char_plateau_reject_eos_restart,
+            "action_char_restart_continue": args.action_end_action_char_restart_continue,
+            "action_char_restart_reset": args.action_end_action_char_restart_reset,
+            "action_char_restart_reset_low_text_tokens": args.action_end_action_char_restart_reset_low_text_tokens,
+            "action_char_plateau_low_text_tail_tokens": args.action_end_action_char_plateau_low_text_tail_tokens,
+            "action_char_strict_target_stop": args.action_end_action_char_strict_target_stop,
+            "action_char_reset_requires_action_end": args.action_end_action_char_reset_requires_action_end,
+            "action_char_target_confirm_tokens": args.action_end_action_char_target_confirm_tokens,
+        }
+    actions_per_request = policy_action_horizon(policy)
     sync_if_cuda(device)
     load_ms = (time.perf_counter() - load_start) * 1000.0
     inference_autocast_dtype = dtype if args.policy_kind == "pi05" and dtype in (torch.bfloat16, torch.float16) else None
@@ -302,6 +625,11 @@ def main() -> None:
     )
     env_cfg = LiberoEnv(task=args.task, task_ids=[args.task_id], control_mode=args.control_mode)
     env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=env_cfg, policy_cfg=policy.config)
+    preprocess_observation_fn = (
+        (lambda observation: fast_libero_preprocess_observation(observation, device=device))
+        if args.fast_libero_preprocess
+        else preprocess_observation
+    )
     env_map = make_env(env_cfg, n_envs=1, use_async_envs=False)
     env = env_map[args.task][args.task_id]
 
@@ -314,6 +642,14 @@ def main() -> None:
         "policy_use_kv_cache_initial": getattr(policy.config, "use_kv_cache", None),
         "policy_max_decoding_steps_initial": getattr(policy.config, "max_decoding_steps", None),
         "policy_num_inference_steps_initial": getattr(policy.config, "num_inference_steps", None),
+        "policy_gradient_checkpointing_initial": getattr(policy.config, "gradient_checkpointing", None),
+        "disable_gradient_checkpointing": bool(args.disable_gradient_checkpointing),
+        "language_model_attn_implementation": active_attn_implementation,
+        "compile_language_model_forward": bool(args.compile_language_model_forward),
+        "compiled_language_model_forward": bool(compiled_language_model_forward),
+        "compile_mode": args.compile_mode,
+        "action_end_profile": bool(args.action_end_profile),
+        "actions_per_request": actions_per_request,
         "recommendation": None,
         "rows": rows,
     }
@@ -322,7 +658,13 @@ def main() -> None:
         observation, _info = env.reset(seed=[args.seed])
 
         for _ in range(args.warmup):
-            batch = _prepare_observation(observation, env, env_preprocessor, policy_preprocessor, preprocess_observation)
+            batch = _prepare_observation(
+                observation,
+                env,
+                env_preprocessor,
+                policy_preprocessor,
+                preprocess_observation_fn,
+            )
             with torch.inference_mode():
                 raw_action, _token_count = predict_chunk(
                     policy=policy,
@@ -331,6 +673,7 @@ def main() -> None:
                     decode_path=args.decode_path,
                     device=device,
                     autocast_dtype=inference_autocast_dtype,
+                    action_end_kwargs=action_end_kwargs,
                 )
             try:
                 action = _to_numpy_action(policy_postprocessor(raw_action))[0]
@@ -359,7 +702,9 @@ def main() -> None:
                     preprocess_ms: list[float] = []
                     single_ms: list[float] = []
                     single_token_counts: list[float] = []
+                    action_end_stats: list[dict[str, Any]] = []
                     postprocess_ms: list[float] = []
+                    full_request_ms: list[float] = []
                     batch_ms: dict[int, list[float]] = {size: [] for size in batch_sizes if size > 1}
                     batch_token_counts: dict[int, list[float]] = {size: [] for size in batch_sizes if size > 1}
                     errors: list[str] = []
@@ -372,7 +717,7 @@ def main() -> None:
                                 env,
                                 env_preprocessor,
                                 policy_preprocessor,
-                                preprocess_observation,
+                                preprocess_observation_fn,
                             ),
                         )
                         preprocess_ms.append(prep_ms)
@@ -387,13 +732,17 @@ def main() -> None:
                                     decode_path=args.decode_path,
                                     device=device,
                                     autocast_dtype=inference_autocast_dtype,
+                                    action_end_kwargs=action_end_kwargs,
                                 ),
                         )
                         single_ms.append(infer_ms)
                         extend_token_counts(single_token_counts, token_info)
+                        if token_info and isinstance(token_info.get("stats"), dict):
+                            action_end_stats.append(token_info["stats"])
 
                         processed, post_ms = timed_ms(device, lambda: policy_postprocessor(raw_action))
                         postprocess_ms.append(post_ms)
+                        full_request_ms.append(float(prep_ms) + float(infer_ms) + float(post_ms))
                         action = _to_numpy_action(processed)[0]
 
                         for batch_size in batch_sizes:
@@ -404,7 +753,7 @@ def main() -> None:
                                     env=env,
                                     env_preprocessor=env_preprocessor,
                                     policy_preprocessor=policy_preprocessor,
-                                    preprocess_observation=preprocess_observation,
+                                    preprocess_observation=preprocess_observation_fn,
                                     batch_size=batch_size,
                                     seed_base=args.seed + 10_000 + step * 100 + batch_size * 10,
                                 )
@@ -421,6 +770,7 @@ def main() -> None:
                                             decode_path=args.decode_path,
                                             device=device,
                                             autocast_dtype=inference_autocast_dtype,
+                                            action_end_kwargs=action_end_kwargs,
                                         ),
                                     )
                                 batch_ms[batch_size].append(batched_ms)
@@ -442,6 +792,7 @@ def main() -> None:
                         "decode_path": args.decode_path,
                         "kv_mode": mode,
                         "active_use_kv_cache": active_kv,
+                        "actions_per_request": actions_per_request,
                         "preprocess": summarize(preprocess_ms),
                         "single_inference": summarize(single_ms),
                         "single_token_count_mean": float(np.mean(single_token_counts)) if single_token_counts else None,
@@ -449,15 +800,43 @@ def main() -> None:
                             single_token_counts,
                             args.action_token_warn_threshold,
                         ),
+                        "action_end_stats": action_end_stats,
                         "postprocess": summarize(postprocess_ms),
+                        "full_request": summarize(full_request_ms),
                         "batch_inference": {},
                         "batch_source": args.batch_source,
                         "errors": errors,
                     }
+                    row["single_inference"]["per_action_mean_ms"] = (
+                        row["single_inference"]["mean_ms"] / actions_per_request
+                        if actions_per_request
+                        else row["single_inference"]["mean_ms"]
+                    )
+                    row["single_inference"]["meets_target_per_request"] = (
+                        row["single_inference"]["mean_ms"] <= args.target_latency_ms
+                    )
+                    row["single_inference"]["meets_target_per_action"] = (
+                        row["single_inference"]["per_action_mean_ms"] <= args.target_latency_ms
+                    )
+                    row["full_request"]["meets_target_per_request"] = (
+                        row["full_request"]["mean_ms"] <= args.target_latency_ms
+                    )
+                    row["full_request"]["per_action_mean_ms"] = (
+                        row["full_request"]["mean_ms"] / actions_per_request
+                        if actions_per_request
+                        else row["full_request"]["mean_ms"]
+                    )
                     for batch_size, values in batch_ms.items():
                         stats = summarize(values)
                         single_mean = row["single_inference"]["mean_ms"]
                         stats["per_request_mean_ms"] = stats["mean_ms"] / batch_size if batch_size else 0.0
+                        stats["meets_target_per_request"] = stats["per_request_mean_ms"] <= args.target_latency_ms
+                        stats["per_action_mean_ms"] = (
+                            stats["per_request_mean_ms"] / actions_per_request
+                            if actions_per_request
+                            else stats["per_request_mean_ms"]
+                        )
+                        stats["meets_target_per_action"] = stats["per_action_mean_ms"] <= args.target_latency_ms
                         stats["throughput_speedup_vs_serial"] = (
                             (single_mean * batch_size) / stats["mean_ms"] if stats["mean_ms"] > 0 else 0.0
                         )
@@ -472,6 +851,8 @@ def main() -> None:
                     rows.append(row)
                     if args.policy_kind == "pi05":
                         summary["recommendation"] = pi05_recommendation(rows, args.target_latency_ms)
+                    elif args.policy_kind == "pi0fast":
+                        summary["recommendation"] = pi0fast_recommendation(rows, args.target_latency_ms)
     finally:
         try:
             env.close()

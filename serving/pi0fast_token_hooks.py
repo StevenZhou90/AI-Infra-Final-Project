@@ -10,13 +10,14 @@ draft/verify checks without vendoring or forking LeRobot.
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 import torch.nn.functional as F
 
-from serving.kv_cache_manager import clone_kv, trim_kv
+from serving.kv_cache_manager import clone_kv, repeat_kv_batch, select_kv_batch, trim_kv
 from serving.pi0fast_block_gate import block_gate_features
 from serving.pi0fast_prefix_gate import PREFIX_GATE_FEATURES, action_feature_values
 
@@ -58,6 +59,76 @@ class PI0FastTokenLogitAdapter:
         self.policy = policy
         self.model = policy.model
 
+    def _canonical_lookup_device(self, device: torch.device | str | None) -> torch.device:
+        if device is None:
+            return torch.device("cpu")
+        lookup_device = torch.device(device)
+        if lookup_device.type == "cuda" and lookup_device.index is None and torch.cuda.is_available():
+            lookup_device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        return lookup_device
+
+    def prepare_action_char_length_lookup(self, device: torch.device | str | None = None) -> torch.Tensor:
+        """Return a cached PaliGemma-token -> FAST decoded-character length table."""
+
+        lookup_device = self._canonical_lookup_device(device)
+        cpu_lookup = getattr(self, "_action_char_length_lookup_cpu", None)
+        if cpu_lookup is None:
+            paligemma_vocab_size = int(self.model._paligemma_tokenizer.vocab_size)
+            tokenizer_vocab_size = int(getattr(self.policy.action_tokenizer, "vocab_size", 0) or 0)
+            raw_action_limit = min(paligemma_vocab_size, max(tokenizer_vocab_size, 65_536))
+
+            raw_lengths = torch.zeros((raw_action_limit,), dtype=torch.int16)
+            bpe_tokenizer = self.policy.action_tokenizer.bpe_tokenizer
+            for raw_id in range(raw_action_limit):
+                try:
+                    raw_lengths[raw_id] = len(bpe_tokenizer.decode(raw_id))
+                except Exception:
+                    raw_lengths[raw_id] = 0
+
+            paligemma_ids = torch.arange(paligemma_vocab_size, dtype=torch.long)
+            try:
+                raw_ids = self.policy._paligemma_tokens_to_act_tokens(paligemma_ids).detach().cpu().long()
+            except Exception:
+                raw_ids = (
+                    paligemma_vocab_size
+                    - 1
+                    - int(getattr(self.policy.config, "fast_skip_tokens", 0))
+                    - paligemma_ids
+                )
+            valid = (raw_ids >= 0) & (raw_ids < raw_action_limit)
+            cpu_lookup = torch.zeros((paligemma_vocab_size,), dtype=torch.int16)
+            cpu_lookup[valid] = raw_lengths.index_select(0, raw_ids[valid])
+
+            action_end_token_id = self._action_end_token_id()
+            if 0 <= action_end_token_id < paligemma_vocab_size:
+                cpu_lookup[action_end_token_id] = 0
+            for special_id in (
+                getattr(self.model._paligemma_tokenizer, "eos_token_id", None),
+                getattr(self.model._paligemma_tokenizer, "bos_token_id", None),
+            ):
+                if special_id is not None and 0 <= int(special_id) < paligemma_vocab_size:
+                    cpu_lookup[int(special_id)] = 0
+            for token_id in self.model._paligemma_tokenizer.encode("Action: ", add_special_tokens=False):
+                if 0 <= int(token_id) < paligemma_vocab_size:
+                    cpu_lookup[int(token_id)] = 0
+
+            self._action_char_length_lookup_cpu = cpu_lookup
+            self._action_char_length_raw_limit = int(raw_action_limit)
+
+        if lookup_device.type == "cpu":
+            return cpu_lookup
+
+        cache = getattr(self, "_action_char_length_lookup_device_cache", None)
+        if cache is None:
+            cache = {}
+            self._action_char_length_lookup_device_cache = cache
+        key = str(lookup_device)
+        device_lookup = cache.get(key)
+        if device_lookup is None or device_lookup.device != lookup_device:
+            device_lookup = cpu_lookup.to(device=lookup_device, non_blocking=True)
+            cache[key] = device_lookup
+        return device_lookup
+
     @torch.no_grad()
     def predict_action_chunk_with_trace(
         self,
@@ -97,12 +168,31 @@ class PI0FastTokenLogitAdapter:
                 early_stop_action_end=early_stop_action_end,
             )
 
-        actions = self._detokenize_generated_actions(token_ids)
+        if bool(getattr(self, "_profile_action_end_decode", False)):
+            device = token_ids.device
+            if device.type == "cuda" and torch.cuda.is_available():
+                torch.cuda.synchronize(device)
+            profile_start = time.perf_counter()
+            actions = self._detokenize_generated_actions(token_ids)
+            if device.type == "cuda" and torch.cuda.is_available():
+                torch.cuda.synchronize(device)
+            profile = getattr(self, "_last_action_end_profile", None)
+            if isinstance(profile, dict):
+                segments = profile.setdefault("segments_ms", {})
+                segments["detokenize"] = float((time.perf_counter() - profile_start) * 1000.0)
+                counts = profile.setdefault("counts", {})
+                counts["detokenize"] = int(counts.get("detokenize", 0)) + 1
+        else:
+            actions = self._detokenize_generated_actions(token_ids)
         return PI0FastGenerationTrace(
             actions=actions,
             token_ids=token_ids,
             logits=logits,
             hidden_states=hidden_states,
+            stats={
+                "action_end_token_id": self._action_end_token_id(),
+                "early_stop_action_end": int(bool(early_stop_action_end)),
+            },
         )
 
     @torch.no_grad()
@@ -111,6 +201,32 @@ class PI0FastTokenLogitAdapter:
         batch: dict[str, torch.Tensor],
         temperature: float | None = None,
         max_decoding_steps: int | None = None,
+        constrained_action_vocab: bool = False,
+        constrained_action_vocab_size: int | None = None,
+        constrained_text_vocab_size: int | None = None,
+        constrained_full_head_margin: float | None = None,
+        constrained_force_action_prefix: bool = True,
+        constrained_prefill_action_prefix: bool = False,
+        constrained_structural_token_radius: int = 512,
+        constrained_full_head_prefix_tokens: int = 0,
+        constrained_extra_token_ids: torch.Tensor | list[int] | None = None,
+        decode_attn_implementation: str | None = None,
+        force_action_prefix: bool = False,
+        stop_on_action_chars: bool = False,
+        action_char_target_chars: int | None = None,
+        action_char_min_chars: int | None = None,
+        action_char_plateau_tokens: int = 0,
+        action_char_stable_checks: int = 0,
+        action_char_stable_tolerance: float = 0.0,
+        action_char_stable_max_chars: int = 0,
+        action_char_plateau_reject_eos_restart: bool = False,
+        action_char_restart_continue: bool = False,
+        action_char_restart_reset: bool = False,
+        action_char_restart_reset_low_text_tokens: int = 0,
+        action_char_plateau_low_text_tail_tokens: int = 0,
+        action_char_strict_target_stop: bool = False,
+        action_char_reset_requires_action_end: bool = False,
+        action_char_target_confirm_tokens: int = 0,
     ) -> PI0FastGenerationTrace:
         """Serving-oriented greedy decode that stops on the FAST action-end token.
 
@@ -125,7 +241,44 @@ class PI0FastTokenLogitAdapter:
         decode_temperature = self.policy.config.temperature if temperature is None else temperature
         max_steps = max_decoding_steps or self.policy.config.max_decoding_steps
 
-        if self.policy.config.use_kv_cache:
+        if constrained_action_vocab and not self.policy.config.use_kv_cache:
+            raise ValueError("Constrained PI0-FAST action-vocab decode requires KV cache")
+
+        if constrained_action_vocab:
+            token_ids = self.sample_actions_fast_kv_cache_action_end_constrained(
+                images,
+                img_masks,
+                tokens,
+                masks,
+                max_decoding_steps=max_steps,
+                temperature=decode_temperature,
+                action_vocab_size=constrained_action_vocab_size,
+                text_vocab_size=constrained_text_vocab_size,
+                full_head_margin=constrained_full_head_margin,
+                force_action_prefix=constrained_force_action_prefix,
+                prefill_action_prefix=constrained_prefill_action_prefix,
+                structural_token_radius=constrained_structural_token_radius,
+                full_head_prefix_tokens=constrained_full_head_prefix_tokens,
+                extra_token_ids=constrained_extra_token_ids,
+                decode_attn_implementation=decode_attn_implementation,
+                stop_on_action_chars=stop_on_action_chars,
+                action_char_target_chars=action_char_target_chars,
+                action_char_min_chars=action_char_min_chars,
+                action_char_plateau_tokens=action_char_plateau_tokens,
+                action_char_stable_checks=action_char_stable_checks,
+                action_char_stable_tolerance=action_char_stable_tolerance,
+                action_char_stable_max_chars=action_char_stable_max_chars,
+                action_char_plateau_reject_eos_restart=action_char_plateau_reject_eos_restart,
+                action_char_restart_continue=action_char_restart_continue,
+                action_char_restart_reset=action_char_restart_reset,
+                action_char_restart_reset_low_text_tokens=action_char_restart_reset_low_text_tokens,
+                action_char_plateau_low_text_tail_tokens=action_char_plateau_low_text_tail_tokens,
+                action_char_strict_target_stop=action_char_strict_target_stop,
+                action_char_reset_requires_action_end=action_char_reset_requires_action_end,
+                action_char_target_confirm_tokens=action_char_target_confirm_tokens,
+            )
+            mode = "action_end_constrained_charstop_no_logits" if stop_on_action_chars else "action_end_constrained_no_logits"
+        elif self.policy.config.use_kv_cache:
             token_ids = self.sample_actions_fast_kv_cache_action_end(
                 images,
                 img_masks,
@@ -133,7 +286,24 @@ class PI0FastTokenLogitAdapter:
                 masks,
                 max_decoding_steps=max_steps,
                 temperature=decode_temperature,
+                force_action_prefix=force_action_prefix,
+                stop_on_action_chars=stop_on_action_chars,
+                action_char_target_chars=action_char_target_chars,
+                action_char_min_chars=action_char_min_chars,
+                action_char_plateau_tokens=action_char_plateau_tokens,
+                action_char_stable_checks=action_char_stable_checks,
+                action_char_stable_tolerance=action_char_stable_tolerance,
+                action_char_stable_max_chars=action_char_stable_max_chars,
+                action_char_plateau_reject_eos_restart=action_char_plateau_reject_eos_restart,
+                action_char_restart_continue=action_char_restart_continue,
+                action_char_restart_reset=action_char_restart_reset,
+                action_char_restart_reset_low_text_tokens=action_char_restart_reset_low_text_tokens,
+                action_char_plateau_low_text_tail_tokens=action_char_plateau_low_text_tail_tokens,
+                action_char_strict_target_stop=action_char_strict_target_stop,
+                action_char_reset_requires_action_end=action_char_reset_requires_action_end,
+                action_char_target_confirm_tokens=action_char_target_confirm_tokens,
             )
+            mode = "action_end_prefix_no_logits" if force_action_prefix else "action_end_no_logits"
         else:
             token_ids, _logits, _hidden = self.sample_actions_fast_with_logits(
                 images,
@@ -144,6 +314,7 @@ class PI0FastTokenLogitAdapter:
                 temperature=decode_temperature,
                 early_stop_action_end=True,
             )
+            mode = "action_end_no_logits"
 
         actions = self._detokenize_generated_actions(token_ids)
         empty_logits = torch.empty((token_ids.shape[0], 0, 0), dtype=torch.float32, device=token_ids.device)
@@ -152,10 +323,103 @@ class PI0FastTokenLogitAdapter:
             token_ids=token_ids,
             logits=empty_logits,
             stats={
-                "mode": "action_end_no_logits",
+                "mode": mode,
                 "emitted_tokens": int(token_ids.shape[1]),
                 "row_token_counts": getattr(self, "_last_action_end_row_token_counts", None),
                 "stopped_on_action_end": int(token_ids.shape[1]) < int(max_steps),
+                "action_end_token_id": self._action_end_token_id(),
+                "constrained_action_vocab": int(bool(constrained_action_vocab)),
+                "constrained_candidate_size": int(getattr(self, "_last_constrained_candidate_size", 0)),
+                "constrained_action_vocab_size": int(getattr(self, "_last_constrained_action_vocab_size", 0)),
+                "constrained_text_vocab_size": int(getattr(self, "_last_constrained_text_vocab_size", 0)),
+                "constrained_structural_token_radius": int(
+                    getattr(self, "_last_constrained_structural_token_radius", 0)
+                ),
+                "constrained_force_action_prefix": int(bool(getattr(self, "_last_constrained_force_action_prefix", False))),
+                "constrained_prefill_action_prefix_tokens": int(
+                    getattr(self, "_last_constrained_prefill_action_prefix_tokens", 0)
+                ),
+                "constrained_full_head_margin": float(getattr(self, "_last_constrained_full_head_margin", -1.0)),
+                "constrained_full_head_prefix_tokens": int(
+                    getattr(self, "_last_constrained_full_head_prefix_tokens", 0)
+                ),
+                "decode_attn_implementation": str(getattr(self, "_last_decode_attn_implementation", "")),
+                "decode_attn_trimmed_language_tokens": int(
+                    getattr(self, "_last_decode_attn_trimmed_language_tokens", 0)
+                ),
+                "constrained_extra_token_count": int(getattr(self, "_last_constrained_extra_token_count", 0)),
+                "constrained_full_head_prefix_calls": int(
+                    getattr(self, "_last_constrained_full_head_prefix_calls", 0)
+                ),
+                "constrained_full_head_fallbacks": int(getattr(self, "_last_constrained_full_head_fallbacks", 0)),
+                "constrained_restricted_head_calls": int(getattr(self, "_last_constrained_restricted_head_calls", 0)),
+                "constrained_full_head_fallback_rate": float(
+                    getattr(self, "_last_constrained_full_head_fallback_rate", 0.0)
+                ),
+                "constrained_margin_min": float(getattr(self, "_last_constrained_margin_min", 0.0)),
+                "constrained_margin_mean": float(getattr(self, "_last_constrained_margin_mean", 0.0)),
+                "forced_action_prefix": int(bool(force_action_prefix)),
+                "forced_action_prefix_tokens": int(getattr(self, "_last_forced_action_prefix_token_count", 0)),
+                "stop_on_action_chars": int(bool(stop_on_action_chars)),
+                "action_char_target": int(getattr(self, "_last_action_char_target", 0)),
+                "action_char_min_chars": int(getattr(self, "_last_action_char_min_chars", 0)),
+                "action_char_plateau_tokens": int(getattr(self, "_last_action_char_plateau_tokens", 0)),
+                "action_char_stable_checks": int(getattr(self, "_last_action_char_stable_checks", 0)),
+                "action_char_stable_tolerance": float(getattr(self, "_last_action_char_stable_tolerance", 0.0)),
+                "action_char_stable_max_chars": int(getattr(self, "_last_action_char_stable_max_chars", 0)),
+                "action_char_plateau_reject_eos_restart": int(
+                    bool(getattr(self, "_last_action_char_plateau_reject_eos_restart", False))
+                ),
+                "action_char_restart_continue": int(
+                    bool(getattr(self, "_last_action_char_restart_continue", False))
+                ),
+                "action_char_restart_reset": int(bool(getattr(self, "_last_action_char_restart_reset", False))),
+                "action_char_restart_reset_low_text_tokens": int(
+                    getattr(self, "_last_action_char_restart_reset_low_text_tokens", 0)
+                ),
+                "action_char_plateau_low_text_tail_tokens": int(
+                    getattr(self, "_last_action_char_plateau_low_text_tail_tokens", 0)
+                ),
+                "action_char_strict_target_stop": int(
+                    bool(getattr(self, "_last_action_char_strict_target_stop", False))
+                ),
+                "action_char_reset_requires_action_end": int(
+                    bool(getattr(self, "_last_action_char_reset_requires_action_end", False))
+                ),
+                "action_char_target_confirm_tokens": int(
+                    getattr(self, "_last_action_char_target_confirm_tokens", 0)
+                ),
+                "action_char_stop_count": int(getattr(self, "_last_action_char_stop_count", 0)),
+                "action_char_plateau_stop_count": int(getattr(self, "_last_action_char_plateau_stop_count", 0)),
+                "action_char_plateau_stability_block_count": int(
+                    getattr(self, "_last_action_char_plateau_stability_block_count", 0)
+                ),
+                "action_char_plateau_eos_restart_block_count": int(
+                    getattr(self, "_last_action_char_plateau_eos_restart_block_count", 0)
+                ),
+                "action_char_restart_fallback_count": int(
+                    getattr(self, "_last_action_char_restart_fallback_count", 0)
+                ),
+                "action_char_restart_continue_count": int(
+                    getattr(self, "_last_action_char_restart_continue_count", 0)
+                ),
+                "action_char_restart_reset_count": int(getattr(self, "_last_action_char_restart_reset_count", 0)),
+                "action_char_reset_requires_action_end_block_count": int(
+                    getattr(self, "_last_action_char_reset_requires_action_end_block_count", 0)
+                ),
+                "action_char_target_confirm_block_count": int(
+                    getattr(self, "_last_action_char_target_confirm_block_count", 0)
+                ),
+                "action_char_plateau_low_text_tail_block_count": int(
+                    getattr(self, "_last_action_char_plateau_low_text_tail_block_count", 0)
+                ),
+                "action_char_count_mean": float(getattr(self, "_last_action_char_count_mean", 0.0)),
+                "action_char_stable_snapshot_count_mean": float(
+                    getattr(self, "_last_action_char_stable_snapshot_count_mean", 0.0)
+                ),
+                "action_char_stable_count_mean": float(getattr(self, "_last_action_char_stable_count_mean", 0.0)),
+                "action_char_lookup_raw_limit": int(getattr(self, "_action_char_length_raw_limit", 0)),
+                "action_end_profile": getattr(self, "_last_action_end_profile", None),
             },
         )
 
@@ -306,8 +570,26 @@ class PI0FastTokenLogitAdapter:
         drafter: Any,
         lookahead: int = 8,
         reuse_full_blocks: bool = False,
+        min_verify_margin: float = 0.0,
         verify_from_scratch: bool = False,
+        emit_bonus_token: bool = False,
+        defer_correction_token: bool = False,
+        dynamic_lookahead: bool = False,
+        min_lookahead: int = 1,
+        lookahead_growth: int = 1,
+        lookahead_shrink: int = 4,
+        tree_width: int = 1,
+        tree_branch_width: int = 4,
+        dynamic_tree_width: bool = False,
+        min_tree_width: int = 1,
+        tree_width_growth: int = 1,
+        tree_width_shrink: int = 1,
+        tree_anchor_target_token: bool = False,
+        tree_anchor_target_continuation: bool = False,
         early_stop_action_end: bool = False,
+        replay_accepted_cache: bool = False,
+        resync_accepted_cache: bool = False,
+        diagnose_verify_alignment: bool = False,
     ) -> PI0FastGenerationTrace:
         """Return a PI0-FAST action chunk decoded with exact n-gram speculation."""
 
@@ -324,8 +606,26 @@ class PI0FastTokenLogitAdapter:
             lookahead=lookahead,
             temperature=0.0,
             reuse_full_blocks=reuse_full_blocks,
+            min_verify_margin=min_verify_margin,
             verify_from_scratch=verify_from_scratch,
+            emit_bonus_token=emit_bonus_token,
+            defer_correction_token=defer_correction_token,
+            dynamic_lookahead=dynamic_lookahead,
+            min_lookahead=min_lookahead,
+            lookahead_growth=lookahead_growth,
+            lookahead_shrink=lookahead_shrink,
+            tree_width=tree_width,
+            tree_branch_width=tree_branch_width,
+            dynamic_tree_width=dynamic_tree_width,
+            min_tree_width=min_tree_width,
+            tree_width_growth=tree_width_growth,
+            tree_width_shrink=tree_width_shrink,
+            tree_anchor_target_token=tree_anchor_target_token,
+            tree_anchor_target_continuation=tree_anchor_target_continuation,
             early_stop_action_end=early_stop_action_end,
+            replay_accepted_cache=replay_accepted_cache,
+            resync_accepted_cache=resync_accepted_cache,
+            diagnose_verify_alignment=diagnose_verify_alignment,
         )
         actions = self._detokenize_generated_actions(token_ids)
         return PI0FastGenerationTrace(actions=actions, token_ids=token_ids, logits=logits, stats=stats)
@@ -511,28 +811,72 @@ class PI0FastTokenLogitAdapter:
         batch: dict[str, torch.Tensor],
         cutoff_tokens: int,
         early_stop_action_end: bool = True,
+        collect_logits: bool = False,
+        force_action_prefix: bool = False,
     ) -> PI0FastGenerationTrace:
         """Decode a bounded FAST-token prefix, then append action-end if needed."""
 
         self.policy.eval()
         images, img_masks = self.policy._preprocess_images(batch)
         tokens, masks = self._language_tokens(batch)
-        token_ids, logits, hidden_states = self.sample_actions_fast_kv_cache_with_logits(
-            images,
-            img_masks,
-            tokens,
-            masks,
-            max_decoding_steps=cutoff_tokens,
-            temperature=0.0,
-            return_hidden_states=False,
-            early_stop_action_end=early_stop_action_end,
-        )
+        if collect_logits or not self.policy.config.use_kv_cache:
+            if force_action_prefix:
+                raise ValueError("Forced PI0-FAST action prefix is only supported on the no-logits cutoff path")
+            if self.policy.config.use_kv_cache:
+                token_ids, logits, hidden_states = self.sample_actions_fast_kv_cache_with_logits(
+                    images,
+                    img_masks,
+                    tokens,
+                    masks,
+                    max_decoding_steps=cutoff_tokens,
+                    temperature=0.0,
+                    return_hidden_states=False,
+                    early_stop_action_end=early_stop_action_end,
+                )
+            else:
+                token_ids, logits, hidden_states = self.sample_actions_fast_with_logits(
+                    images,
+                    img_masks,
+                    tokens,
+                    masks,
+                    max_decoding_steps=cutoff_tokens,
+                    temperature=0.0,
+                    return_hidden_states=False,
+                    early_stop_action_end=early_stop_action_end,
+                )
+            mode = "prefix_cutoff_with_logits"
+        else:
+            token_ids = self.sample_actions_fast_kv_cache_action_end(
+                images,
+                img_masks,
+                tokens,
+                masks,
+                max_decoding_steps=cutoff_tokens,
+                temperature=0.0,
+                force_action_prefix=force_action_prefix,
+            )
+            logits = torch.empty((token_ids.shape[0], 0, 0), dtype=torch.float32, device=token_ids.device)
+            hidden_states = None
+            mode = "prefix_cutoff_prefix_no_logits" if force_action_prefix else "prefix_cutoff_no_logits"
         action_end = self._action_end_token_id()
-        if token_ids.shape[1] == 0 or int(token_ids[0, -1].item()) != action_end:
-            eos = torch.tensor([[action_end]], dtype=token_ids.dtype, device=token_ids.device)
+        pre_append_tokens = int(token_ids.shape[1])
+        ended = token_ids.shape[1] > 0 and bool(torch.all(token_ids[:, -1] == action_end))
+        forced_end = int(not ended)
+        if forced_end:
+            eos = torch.full((token_ids.shape[0], 1), action_end, dtype=token_ids.dtype, device=token_ids.device)
             token_ids = torch.cat([token_ids, eos], dim=1)
         actions = self._detokenize_generated_actions(token_ids)
-        stats = {"cutoff_tokens": int(cutoff_tokens), "emitted_tokens": int(token_ids.shape[1])}
+        stats = {
+            "mode": mode,
+            "cutoff_tokens": int(cutoff_tokens),
+            "emitted_tokens": int(token_ids.shape[1]),
+            "pre_append_tokens": pre_append_tokens,
+            "forced_action_end": forced_end,
+            "stopped_on_action_end": int(ended),
+            "row_token_counts": getattr(self, "_last_action_end_row_token_counts", None),
+            "forced_action_prefix": int(bool(force_action_prefix)),
+            "forced_action_prefix_tokens": int(getattr(self, "_last_forced_action_prefix_token_count", 0)),
+        }
         return PI0FastGenerationTrace(
             actions=actions,
             token_ids=token_ids,
@@ -550,10 +894,13 @@ class PI0FastTokenLogitAdapter:
         stable_checks: int = 1,
         early_stable_checks: int | None = None,
         early_max_stable_checkpoint: int | None = None,
+        checkpoint_stable_checks: dict[int, int] | None = None,
         max_stable_checkpoint: int | None = None,
         skip_unproductive_checks: bool = False,
         skip_unproductive_after_checkpoint: int = 0,
         continue_to_action_end_on_unstable: bool = False,
+        stability_continue_to_action_end: bool = False,
+        stability_risk_gate: dict[str, Any] | None = None,
         prefix_gate: Any | None = None,
         prefix_gate_threshold: float = 0.98,
         early_stop_action_end: bool = True,
@@ -610,6 +957,8 @@ class PI0FastTokenLogitAdapter:
         stable_count = 0
         action_snapshots = 0
         checked: list[dict[str, Any]] = []
+        continuing_after_stability_stop: dict[str, float] | None = None
+        stability_risk_gate_rejections = 0
 
         def candidate_trace() -> tuple[torch.Tensor, torch.Tensor]:
             token_ids = torch.tensor([generated_tokens], dtype=torch.long, device=device)
@@ -618,9 +967,15 @@ class PI0FastTokenLogitAdapter:
                 token_ids = torch.cat([token_ids, eos], dim=1)
             return token_ids, self._detokenize_generated_actions(token_ids)
 
-        def gate_probability(checkpoint: int, token_ids: torch.Tensor, actions: torch.Tensor) -> float | None:
-            if prefix_gate is None:
-                return None
+        def candidate_feature_row(
+            checkpoint: int,
+            token_ids: torch.Tensor,
+            actions: torch.Tensor,
+            *,
+            max_delta: float | None,
+            stable_count: int,
+            required_stable_checks: int,
+        ) -> dict[str, float]:
             steps = min(token_ids.shape[1], len(logits_by_step))
             if steps:
                 logits = torch.cat(logits_by_step[:steps], dim=1).float()
@@ -644,6 +999,23 @@ class PI0FastTokenLogitAdapter:
                 **token_stats,
                 **action_feature_values(actions.detach().float().cpu().numpy()),
             }
+            row.update(
+                {
+                    "checkpoint": float(checkpoint),
+                    "token_count": float(token_ids.shape[1]),
+                    "max_delta": 0.0 if max_delta is None else float(max_delta),
+                    "stable_count": float(stable_count),
+                    "required_stable_checks": float(required_stable_checks),
+                }
+            )
+            return row
+
+        def prefixed_feature_stats(row: dict[str, float]) -> dict[str, float]:
+            return {f"stability_stop_{key}": float(value) for key, value in row.items()}
+
+        def gate_probability(row: dict[str, float]) -> float | None:
+            if prefix_gate is None:
+                return None
             features = torch.tensor(
                 [[float(row.get(name, 0.0)) for name in PREFIX_GATE_FEATURES]],
                 dtype=torch.float32,
@@ -651,6 +1023,54 @@ class PI0FastTokenLogitAdapter:
             )
             with torch.no_grad():
                 return float(prefix_gate.probability(features).item())
+
+        def risk_gate_clauses() -> list[dict[str, float]]:
+            if not stability_risk_gate:
+                return []
+            clauses = stability_risk_gate.get("clauses")
+            if isinstance(clauses, list):
+                return [clause for clause in clauses if isinstance(clause, dict)]
+            return [stability_risk_gate]
+
+        def risk_gate_rejects_clause(row: dict[str, float], clause: dict[str, float]) -> bool:
+            checks = {
+                "min_checkpoint": ("checkpoint", ">="),
+                "max_checkpoint": ("checkpoint", "<="),
+                "min_token_count": ("token_count", ">="),
+                "max_token_count": ("token_count", "<="),
+                "max_logprob_mean": ("logprob_mean", "<="),
+                "min_entropy_mean": ("entropy_mean", ">="),
+                "min_action_abs_max": ("action_abs_max", ">="),
+                "max_action_abs_max": ("action_abs_max", "<="),
+                "min_position_span": ("position_span", ">="),
+                "max_position_span": ("position_span", "<="),
+                "min_rotation_span": ("rotation_span", ">="),
+                "max_rotation_span": ("rotation_span", "<="),
+                "min_max_step_delta": ("max_step_delta", ">="),
+                "max_max_step_delta": ("max_step_delta", "<="),
+            }
+            matched = False
+            for threshold_name, (feature_name, op) in checks.items():
+                if threshold_name not in clause:
+                    continue
+                matched = True
+                value = float(row.get(feature_name, 0.0))
+                threshold = float(clause[threshold_name])
+                if op == ">=" and value < threshold:
+                    return False
+                if op == "<=" and value > threshold:
+                    return False
+            return matched
+
+        def risk_gate_rejects(row: dict[str, float]) -> bool:
+            return any(risk_gate_rejects_clause(row, clause) for clause in risk_gate_clauses())
+
+        def risk_gate_stats() -> dict[str, float]:
+            if stability_risk_gate_rejections <= 0:
+                return {}
+            return {
+                "stability_risk_gate_rejections": float(stability_risk_gate_rejections),
+            }
 
         while len(generated_tokens) < max_decoding_steps:
             next_token = torch.argmax(prev_logits[:, -1], dim=-1, keepdim=True)
@@ -665,7 +1085,15 @@ class PI0FastTokenLogitAdapter:
                     "checked": checked,
                     "stopped_on_stability": False,
                     "stopped_on_action_end": True,
+                    **risk_gate_stats(),
                 }
+                if continuing_after_stability_stop is not None:
+                    stats.update(
+                        {
+                            "continued_after_stability_stop": True,
+                            **continuing_after_stability_stop,
+                        }
+                    )
                 return PI0FastGenerationTrace(actions=actions, token_ids=token_ids, logits=torch.cat(logits_by_step, dim=1), stats=stats)
 
             while checkpoint_idx < len(checkpoints) and len(generated_tokens) >= checkpoints[checkpoint_idx]:
@@ -716,9 +1144,38 @@ class PI0FastTokenLogitAdapter:
                     and checkpoint <= early_max_stable_checkpoint
                 ):
                     required_stable_checks = early_stable_checks
+                if checkpoint_stable_checks and checkpoint in checkpoint_stable_checks:
+                    required_stable_checks = checkpoint_stable_checks[checkpoint]
                 can_stop_at_checkpoint = max_stable_checkpoint is None or checkpoint <= max_stable_checkpoint
-                if stable_count >= required_stable_checks and can_stop_at_checkpoint:
-                    gate_prob = gate_probability(checkpoint, token_ids, actions)
+                if (
+                    stable_count >= required_stable_checks
+                    and can_stop_at_checkpoint
+                    and continuing_after_stability_stop is None
+                ):
+                    feature_row = candidate_feature_row(
+                        checkpoint,
+                        token_ids,
+                        actions,
+                        max_delta=max_delta,
+                        stable_count=stable_count,
+                        required_stable_checks=required_stable_checks,
+                    )
+                    feature_stats = prefixed_feature_stats(feature_row)
+                    if stability_continue_to_action_end:
+                        checked[-1]["continued_to_action_end"] = True
+                        continuing_after_stability_stop = {
+                            "stability_continue_checkpoint": float(checkpoint),
+                            "stability_continue_required_checks": float(required_stable_checks),
+                            "stability_continue_stable_count": float(stable_count),
+                            **feature_stats,
+                        }
+                        continue
+                    if risk_gate_rejects(feature_row):
+                        stability_risk_gate_rejections += 1
+                        checked[-1]["risk_gate_rejected"] = True
+                        checked[-1]["risk_gate_rejection_index"] = stability_risk_gate_rejections
+                        continue
+                    gate_prob = gate_probability(feature_row)
                     if gate_prob is not None and gate_prob < prefix_gate_threshold:
                         checked[-1]["gate_probability"] = gate_prob
                         checked[-1]["gate_rejected"] = True
@@ -731,6 +1188,11 @@ class PI0FastTokenLogitAdapter:
                         "checked": checked,
                         "stopped_on_stability": True,
                         "stopped_on_action_end": False,
+                        "stable_stop_checkpoint": float(checkpoint),
+                        "stable_stop_required_checks": float(required_stable_checks),
+                        "stable_stop_stable_count": float(stable_count),
+                        **risk_gate_stats(),
+                        **feature_stats,
                     }
                     return PI0FastGenerationTrace(
                         actions=actions,
@@ -739,8 +1201,7 @@ class PI0FastTokenLogitAdapter:
                         stats=stats,
                     )
 
-            next_token_emb = self.model.paligemma_with_expert.embed_language_tokens(next_token)
-            next_token_emb = next_token_emb * math.sqrt(next_token_emb.shape[-1])
+            next_token_emb = self._embed_decode_language_tokens(next_token)
             next_token_emb = next_token_emb.to(dtype=prefix_embs.dtype)
             current_pad_mask = torch.cat(
                 [current_pad_mask, torch.ones((bsize, 1), dtype=torch.bool, device=device)],
@@ -758,7 +1219,7 @@ class PI0FastTokenLogitAdapter:
             )
             prev_logits = lm_head(step_out[:, -1:, :])
 
-        if continue_to_action_end_on_unstable:
+        if continue_to_action_end_on_unstable or continuing_after_stability_stop is not None:
             max_action_tokens = int(self.model.config.max_action_tokens)
             while len(generated_tokens) < max_action_tokens:
                 next_token = torch.argmax(prev_logits[:, -1], dim=-1, keepdim=True)
@@ -774,7 +1235,15 @@ class PI0FastTokenLogitAdapter:
                         "stopped_on_stability": False,
                         "stopped_on_action_end": True,
                         "continued_on_unstable": True,
+                        **risk_gate_stats(),
                     }
+                    if continuing_after_stability_stop is not None:
+                        stats.update(
+                            {
+                                "continued_after_stability_stop": True,
+                                **continuing_after_stability_stop,
+                            }
+                        )
                     return PI0FastGenerationTrace(
                         actions=actions,
                         token_ids=token_ids,
@@ -782,8 +1251,7 @@ class PI0FastTokenLogitAdapter:
                         stats=stats,
                     )
 
-                next_token_emb = self.model.paligemma_with_expert.embed_language_tokens(next_token)
-                next_token_emb = next_token_emb * math.sqrt(next_token_emb.shape[-1])
+                next_token_emb = self._embed_decode_language_tokens(next_token)
                 next_token_emb = next_token_emb.to(dtype=prefix_embs.dtype)
                 current_pad_mask = torch.cat(
                     [current_pad_mask, torch.ones((bsize, 1), dtype=torch.bool, device=device)],
@@ -813,7 +1281,15 @@ class PI0FastTokenLogitAdapter:
                 "stopped_on_stability": False,
                 "stopped_on_action_end": False,
                 "continued_on_unstable": True,
+                **risk_gate_stats(),
             }
+            if continuing_after_stability_stop is not None:
+                stats.update(
+                    {
+                        "continued_after_stability_stop": True,
+                        **continuing_after_stability_stop,
+                    }
+                )
             return PI0FastGenerationTrace(
                 actions=actions,
                 token_ids=token_ids,
@@ -828,6 +1304,7 @@ class PI0FastTokenLogitAdapter:
             "checked": checked,
             "stopped_on_stability": False,
             "stopped_on_action_end": False,
+            **risk_gate_stats(),
         }
         return PI0FastGenerationTrace(actions=actions, token_ids=token_ids, logits=torch.cat(logits_by_step, dim=1), stats=stats)
 
@@ -895,8 +1372,7 @@ class PI0FastTokenLogitAdapter:
                 break
 
             if t < max_decoding_steps - 1:
-                next_token_emb = self.model.paligemma_with_expert.embed_language_tokens(next_token)
-                next_token_emb = next_token_emb * math.sqrt(next_token_emb.shape[-1])
+                next_token_emb = self._embed_decode_language_tokens(next_token)
                 next_token_emb = next_token_emb.to(dtype=prefix_embs.dtype)
                 prefix_embs = torch.cat([prefix_embs, next_token_emb], dim=1)
                 prefix_pad_masks = torch.cat(
@@ -973,8 +1449,7 @@ class PI0FastTokenLogitAdapter:
             return generated[:, :1], torch.cat(logits_by_step, dim=1), hidden
 
         for t in range(1, max_decoding_steps):
-            next_token_emb = self.model.paligemma_with_expert.embed_language_tokens(next_token)
-            next_token_emb = next_token_emb * math.sqrt(next_token_emb.shape[-1])
+            next_token_emb = self._embed_decode_language_tokens(next_token)
             next_token_emb = next_token_emb.to(dtype=prefix_embs.dtype)
             current_pad_mask = torch.cat(
                 [current_pad_mask, torch.ones((bsize, 1), dtype=torch.bool, device=device)],
@@ -1015,6 +1490,22 @@ class PI0FastTokenLogitAdapter:
         masks,
         max_decoding_steps: int | None = None,
         temperature: float = 0.0,
+        force_action_prefix: bool = False,
+        stop_on_action_chars: bool = False,
+        action_char_target_chars: int | None = None,
+        action_char_min_chars: int | None = None,
+        action_char_plateau_tokens: int = 0,
+        action_char_stable_checks: int = 0,
+        action_char_stable_tolerance: float = 0.0,
+        action_char_stable_max_chars: int = 0,
+        action_char_plateau_reject_eos_restart: bool = False,
+        action_char_restart_continue: bool = False,
+        action_char_restart_reset: bool = False,
+        action_char_restart_reset_low_text_tokens: int = 0,
+        action_char_plateau_low_text_tail_tokens: int = 0,
+        action_char_strict_target_stop: bool = False,
+        action_char_reset_requires_action_end: bool = False,
+        action_char_target_confirm_tokens: int = 0,
     ) -> torch.Tensor:
         """KV-cache FAST decode with per-row action-end compaction.
 
@@ -1029,6 +1520,91 @@ class PI0FastTokenLogitAdapter:
         device = tokens.device
         lm_head = self.model.paligemma_with_expert.paligemma.lm_head
         action_end_token_id = self._action_end_token_id()
+        action_char_target = 0
+        if stop_on_action_chars:
+            if temperature != 0.0:
+                raise ValueError("PI0-FAST action-char stop currently supports greedy temperature=0 only")
+            action_dim = self.policy.config.output_features[self._action_key()].shape[0]
+            action_char_target = int(self.policy.config.n_action_steps) * int(action_dim)
+            if action_char_target_chars is not None:
+                action_char_target = int(action_char_target_chars)
+            action_char_target = max(0, int(action_char_target))
+        action_char_min_chars = int(action_char_target if action_char_min_chars is None else action_char_min_chars)
+        action_char_min_chars = max(0, int(action_char_min_chars))
+        action_char_plateau_tokens = max(0, int(action_char_plateau_tokens))
+        action_char_stable_checks = max(0, int(action_char_stable_checks))
+        action_char_stable_tolerance = max(0.0, float(action_char_stable_tolerance))
+        action_char_stable_max_chars = max(0, int(action_char_stable_max_chars))
+        action_char_plateau_reject_eos_restart = bool(action_char_plateau_reject_eos_restart)
+        action_char_restart_continue = bool(action_char_restart_continue)
+        action_char_restart_reset = bool(action_char_restart_reset)
+        action_char_restart_reset_low_text_tokens = max(0, int(action_char_restart_reset_low_text_tokens))
+        action_char_plateau_low_text_tail_tokens = max(0, int(action_char_plateau_low_text_tail_tokens))
+        action_char_strict_target_stop = bool(action_char_strict_target_stop)
+        action_char_reset_requires_action_end = bool(action_char_reset_requires_action_end)
+        action_char_target_confirm_tokens = max(0, int(action_char_target_confirm_tokens))
+        self._last_action_char_target = int(action_char_target)
+        self._last_action_char_min_chars = int(action_char_min_chars if stop_on_action_chars else 0)
+        self._last_action_char_plateau_tokens = int(action_char_plateau_tokens if stop_on_action_chars else 0)
+        self._last_action_char_stable_checks = int(action_char_stable_checks if stop_on_action_chars else 0)
+        self._last_action_char_stable_tolerance = float(action_char_stable_tolerance if stop_on_action_chars else 0.0)
+        self._last_action_char_stable_max_chars = int(action_char_stable_max_chars if stop_on_action_chars else 0)
+        self._last_action_char_plateau_reject_eos_restart = bool(
+            action_char_plateau_reject_eos_restart if stop_on_action_chars else False
+        )
+        self._last_action_char_restart_continue = bool(action_char_restart_continue if stop_on_action_chars else False)
+        self._last_action_char_restart_reset = bool(action_char_restart_reset if stop_on_action_chars else False)
+        self._last_action_char_restart_reset_low_text_tokens = int(
+            action_char_restart_reset_low_text_tokens if stop_on_action_chars else 0
+        )
+        self._last_action_char_plateau_low_text_tail_tokens = int(
+            action_char_plateau_low_text_tail_tokens if stop_on_action_chars else 0
+        )
+        self._last_action_char_strict_target_stop = bool(
+            action_char_strict_target_stop if stop_on_action_chars else False
+        )
+        self._last_action_char_reset_requires_action_end = bool(
+            action_char_reset_requires_action_end if stop_on_action_chars else False
+        )
+        self._last_action_char_target_confirm_tokens = int(
+            action_char_target_confirm_tokens if stop_on_action_chars else 0
+        )
+        self._last_action_char_stop_count = 0
+        self._last_action_char_plateau_stop_count = 0
+        self._last_action_char_plateau_stability_block_count = 0
+        self._last_action_char_plateau_eos_restart_block_count = 0
+        self._last_action_char_restart_fallback_count = 0
+        self._last_action_char_restart_continue_count = 0
+        self._last_action_char_restart_reset_count = 0
+        self._last_action_char_reset_requires_action_end_block_count = 0
+        self._last_action_char_target_confirm_block_count = 0
+        self._last_action_char_plateau_low_text_tail_block_count = 0
+        self._last_action_char_count_mean = 0.0
+        self._last_action_char_stable_snapshot_count_mean = 0.0
+        self._last_action_char_stable_count_mean = 0.0
+        action_char_lookup = self.prepare_action_char_length_lookup(device) if stop_on_action_chars else None
+        action_char_prefix_tokens = torch.as_tensor(
+            self.model._paligemma_tokenizer.encode("Action: ", add_special_tokens=False),
+            dtype=torch.long,
+            device=device,
+        ) if stop_on_action_chars else torch.empty((0,), dtype=torch.long, device=device)
+        action_char_prefix_low_token_ids = tuple(
+            int(token_id)
+            for token_id in action_char_prefix_tokens.detach().cpu().tolist()
+            if 0 <= int(token_id) < 8192
+        )
+        prefix_tokens = None
+        if force_action_prefix:
+            if temperature != 0.0:
+                raise ValueError("Forced PI0-FAST action prefix currently supports greedy temperature=0 only")
+            prefix_tokens = torch.as_tensor(
+                self.model._paligemma_tokenizer.encode("Action: ", add_special_tokens=False),
+                dtype=torch.long,
+                device=device,
+            )
+            if prefix_tokens.numel() == 0:
+                raise RuntimeError("Could not resolve PI0-FAST Action prefix tokens")
+        self._last_forced_action_prefix_token_count = int(prefix_tokens.numel()) if prefix_tokens is not None else 0
 
         bos_token = torch.full(
             (bsize, 1),
@@ -1057,17 +1633,289 @@ class PI0FastTokenLogitAdapter:
             use_cache=True,
             adarms_cond=[None, None],
         )
-        next_token = self._select_next_token(lm_head(prefix_out[:, -1:, :]), temperature)
-        generated = torch.full((bsize, max_decoding_steps), action_end_token_id, dtype=torch.long, device=device)
-        generated[:, 0] = next_token.squeeze(-1)
+        generated_width = int(max_decoding_steps) + (1 if stop_on_action_chars else 0)
+        generated = torch.full((bsize, generated_width), action_end_token_id, dtype=torch.long, device=device)
         current_pad_mask = prefix_pad_masks
         active_indices = torch.arange(bsize, dtype=torch.long, device=device)
-        emitted_lengths = torch.ones((bsize,), dtype=torch.long, device=device)
+        emitted_lengths = torch.zeros((bsize,), dtype=torch.long, device=device)
+        action_char_counts = torch.zeros((bsize,), dtype=torch.long, device=device)
+        last_action_char_increment_lengths = torch.zeros((bsize,), dtype=torch.long, device=device)
+        action_stable_counts = torch.zeros((bsize,), dtype=torch.long, device=device)
+        action_stable_snapshot_counts = torch.zeros((bsize,), dtype=torch.long, device=device)
+        target_reached_lengths = torch.zeros((bsize,), dtype=torch.long, device=device)
+        previous_action_snapshots: list[torch.Tensor | None] = [None] * bsize
+        stopped_by_chars = torch.zeros((bsize,), dtype=torch.bool, device=device)
+        stopped_by_char_plateau = torch.zeros((bsize,), dtype=torch.bool, device=device)
+        stopped_by_restart_fallback = torch.zeros((bsize,), dtype=torch.bool, device=device)
+        restarted_with_count_reset = torch.zeros((bsize,), dtype=torch.bool, device=device)
+        reset_requires_action_end = torch.zeros((bsize,), dtype=torch.bool, device=device)
+        pending_restart_reset = torch.zeros((bsize,), dtype=torch.bool, device=device)
+        post_restart_action_char_counts = torch.zeros((bsize,), dtype=torch.long, device=device)
+        post_restart_last_action_char_increment_lengths = torch.zeros((bsize,), dtype=torch.long, device=device)
+        restart_low_text_counts = torch.zeros((bsize,), dtype=torch.long, device=device)
+        action_char_low_text_tail_counts = torch.zeros((bsize,), dtype=torch.long, device=device)
+        blocked_by_char_plateau_stability = torch.zeros((bsize,), dtype=torch.bool, device=device)
+        blocked_by_char_plateau_eos_restart = torch.zeros((bsize,), dtype=torch.bool, device=device)
+        blocked_by_char_plateau_low_text_tail = torch.zeros((bsize,), dtype=torch.bool, device=device)
+        blocked_by_reset_requires_action_end = torch.zeros((bsize,), dtype=torch.bool, device=device)
+        blocked_by_target_confirmation = torch.zeros((bsize,), dtype=torch.bool, device=device)
+        plateau_tail_seen_eos = torch.zeros((bsize,), dtype=torch.bool, device=device)
+        plateau_tail_eos_restart = torch.zeros((bsize,), dtype=torch.bool, device=device)
+        eos_token_id = int(getattr(self.model._paligemma_tokenizer, "eos_token_id", -1) or -1)
+        bos_token_id = int(getattr(self.model._paligemma_tokenizer, "bos_token_id", -1) or -1)
+        has_restart_guard_tokens = eos_token_id >= 0 or bos_token_id >= 0
 
-        finished = next_token.squeeze(-1) == action_end_token_id
-        if bool(torch.all(finished)):
+        def token_ids_with_action_end(row_idx: int) -> torch.Tensor:
+            length = max(int(emitted_lengths[row_idx].item()), 1)
+            token_ids = generated[row_idx : row_idx + 1, :length]
+            if int(token_ids[0, -1].item()) != action_end_token_id:
+                eos = torch.full((1, 1), action_end_token_id, dtype=token_ids.dtype, device=token_ids.device)
+                token_ids = torch.cat([token_ids, eos], dim=1)
+            return token_ids
+
+        def record_action_stability(row_indices: torch.Tensor) -> None:
+            if action_char_stable_checks <= 0:
+                return
+            for row_idx in row_indices.detach().cpu().tolist():
+                token_ids = token_ids_with_action_end(int(row_idx))
+                actions = self._detokenize_generated_actions(token_ids).detach().float().cpu()
+                previous = previous_action_snapshots[int(row_idx)]
+                if previous is None:
+                    action_stable_counts[int(row_idx)] = 0
+                else:
+                    max_delta = float(torch.max(torch.abs(actions - previous)).item())
+                    if max_delta <= action_char_stable_tolerance:
+                        action_stable_counts[int(row_idx)] += 1
+                    else:
+                        action_stable_counts[int(row_idx)] = 0
+                previous_action_snapshots[int(row_idx)] = actions
+                action_stable_snapshot_counts[int(row_idx)] += 1
+
+        def record_action_chars(selected: torch.Tensor) -> torch.Tensor:
+            if action_char_lookup is None:
+                return torch.zeros_like(selected, dtype=torch.bool)
+            increments = action_char_lookup.index_select(0, selected).to(dtype=action_char_counts.dtype)
+            low_text = selected < 8192
+            if eos_token_id >= 0:
+                low_text = low_text & (selected != int(eos_token_id))
+            if bos_token_id >= 0:
+                low_text = low_text & (selected != int(bos_token_id))
+            for token_id in action_char_prefix_low_token_ids:
+                low_text = low_text & (selected != token_id)
+            restarted = torch.zeros_like(selected, dtype=torch.bool)
+            if action_char_plateau_reject_eos_restart and has_restart_guard_tokens:
+                selected_is_eos = selected == int(eos_token_id) if eos_token_id >= 0 else torch.zeros_like(selected, dtype=torch.bool)
+                selected_is_bos = selected == int(bos_token_id) if bos_token_id >= 0 else torch.zeros_like(selected, dtype=torch.bool)
+                restarted = selected_is_bos | (plateau_tail_seen_eos[active_indices] & ~selected_is_eos)
+                if action_char_restart_reset and bool(torch.any(restarted)):
+                    restart_rows = active_indices[restarted]
+                    if action_char_restart_reset_low_text_tokens > 0:
+                        pending_restart_reset[restart_rows] = True
+                        post_restart_action_char_counts[restart_rows] = 0
+                        post_restart_last_action_char_increment_lengths[restart_rows] = 0
+                        restart_low_text_counts[restart_rows] = 0
+                        plateau_tail_seen_eos[restart_rows] = False
+                        plateau_tail_eos_restart[restart_rows] = False
+                    else:
+                        action_char_counts[restart_rows] = 0
+                        last_action_char_increment_lengths[restart_rows] = 0
+                        target_reached_lengths[restart_rows] = 0
+                        action_stable_counts[restart_rows] = 0
+                        action_stable_snapshot_counts[restart_rows] = 0
+                        plateau_tail_seen_eos[restart_rows] = False
+                        plateau_tail_eos_restart[restart_rows] = False
+                        restarted_with_count_reset[restart_rows] = True
+                        if action_char_reset_requires_action_end:
+                            reset_requires_action_end[restart_rows] = True
+                        for row_idx in restart_rows.detach().cpu().tolist():
+                            previous_action_snapshots[int(row_idx)] = None
+                else:
+                    plateau_tail_eos_restart[active_indices] |= restarted
+            action_char_counts[active_indices] += increments
+            pending_rows = pending_restart_reset[active_indices]
+            if bool(torch.any(pending_rows)):
+                pending_global_rows = active_indices[pending_rows]
+                post_restart_action_char_counts[pending_global_rows] += increments[pending_rows]
+                restart_low_text_counts[pending_global_rows] += low_text[pending_rows].to(
+                    dtype=restart_low_text_counts.dtype
+                )
+            incremented = increments > 0
+            if bool(torch.any(incremented)):
+                incremented_rows = active_indices[incremented]
+                last_action_char_increment_lengths[incremented_rows] = emitted_lengths[incremented_rows]
+                action_char_low_text_tail_counts[incremented_rows] = 0
+                pending_incremented = incremented & pending_restart_reset[active_indices]
+                if bool(torch.any(pending_incremented)):
+                    pending_incremented_rows = active_indices[pending_incremented]
+                    post_restart_last_action_char_increment_lengths[pending_incremented_rows] = emitted_lengths[
+                        pending_incremented_rows
+                    ]
+                if action_char_plateau_reject_eos_restart and has_restart_guard_tokens:
+                    safe_rows = incremented_rows[~plateau_tail_eos_restart[incremented_rows]]
+                    plateau_tail_seen_eos[safe_rows] = False
+                else:
+                    plateau_tail_seen_eos[incremented_rows] = False
+                    plateau_tail_eos_restart[incremented_rows] = False
+                record_action_stability(incremented_rows)
+            if bool(torch.any(~incremented)):
+                tail_rows = active_indices[~incremented]
+                action_char_low_text_tail_counts[tail_rows] += low_text[~incremented].to(
+                    dtype=action_char_low_text_tail_counts.dtype
+                )
+            if action_char_restart_reset and action_char_restart_reset_low_text_tokens > 0:
+                should_reset = (
+                    pending_restart_reset[active_indices]
+                    & (restart_low_text_counts[active_indices] >= int(action_char_restart_reset_low_text_tokens))
+                )
+                if bool(torch.any(should_reset)):
+                    reset_rows = active_indices[should_reset]
+                    action_char_counts[reset_rows] = post_restart_action_char_counts[reset_rows]
+                    last_action_char_increment_lengths[reset_rows] = post_restart_last_action_char_increment_lengths[
+                        reset_rows
+                    ]
+                    target_reached_lengths[reset_rows] = 0
+                    action_stable_counts[reset_rows] = 0
+                    action_stable_snapshot_counts[reset_rows] = 0
+                    plateau_tail_seen_eos[reset_rows] = False
+                    plateau_tail_eos_restart[reset_rows] = False
+                    pending_restart_reset[reset_rows] = False
+                    restarted_with_count_reset[reset_rows] = True
+                    if action_char_reset_requires_action_end:
+                        reset_requires_action_end[reset_rows] = True
+                    for row_idx in reset_rows.detach().cpu().tolist():
+                        previous_action_snapshots[int(row_idx)] = None
+            if action_char_plateau_reject_eos_restart and has_restart_guard_tokens:
+                selected_is_eos = selected == int(eos_token_id) if eos_token_id >= 0 else torch.zeros_like(selected, dtype=torch.bool)
+                not_incremented = ~incremented
+                if bool(torch.any(not_incremented)):
+                    tail_rows = active_indices[not_incremented]
+                    plateau_tail_seen_eos[tail_rows] |= selected_is_eos[not_incremented]
+            if action_char_strict_target_stop:
+                reached_target = action_char_counts[active_indices] > int(action_char_target)
+            else:
+                reached_target = action_char_counts[active_indices] >= int(action_char_target)
+            if action_char_target <= 0:
+                reached_target = torch.zeros_like(reached_target, dtype=torch.bool)
+            if action_char_target_confirm_tokens > 0 and bool(torch.any(reached_target)):
+                first_reached = reached_target & (target_reached_lengths[active_indices] <= 0)
+                if bool(torch.any(first_reached)):
+                    first_rows = active_indices[first_reached]
+                    target_reached_lengths[first_rows] = emitted_lengths[first_rows]
+                confirmed = (
+                    emitted_lengths[active_indices] - target_reached_lengths[active_indices]
+                    >= int(action_char_target_confirm_tokens)
+                )
+                blocked = reached_target & ~confirmed
+                blocked_by_target_confirmation[active_indices] |= blocked
+                reached_target = reached_target & confirmed
+            restart_fallback = torch.zeros_like(reached_target, dtype=torch.bool)
+            if action_char_plateau_reject_eos_restart and has_restart_guard_tokens:
+                restart_tainted = plateau_tail_eos_restart[active_indices]
+                if action_char_restart_continue or action_char_restart_reset:
+                    restart_fallback = torch.zeros_like(reached_target, dtype=torch.bool)
+                else:
+                    restart_fallback = restart_tainted
+                reached_target = reached_target & ~restart_tainted
+            plateau_candidate = torch.zeros_like(reached_target, dtype=torch.bool)
+            if action_char_plateau_tokens > 0:
+                plateau_candidate = (
+                    (action_char_counts[active_indices] >= int(action_char_min_chars))
+                    & (last_action_char_increment_lengths[active_indices] > 0)
+                    & (
+                        emitted_lengths[active_indices] - last_action_char_increment_lengths[active_indices]
+                        >= int(action_char_plateau_tokens)
+                    )
+                )
+            plateau = plateau_candidate
+            if action_char_plateau_reject_eos_restart and has_restart_guard_tokens:
+                blocked = plateau_candidate & plateau_tail_eos_restart[active_indices]
+                blocked_by_char_plateau_eos_restart[active_indices] |= blocked
+                plateau = plateau & ~plateau_tail_eos_restart[active_indices]
+            if action_char_plateau_low_text_tail_tokens > 0:
+                blocked = plateau & (
+                    action_char_low_text_tail_counts[active_indices]
+                    >= int(action_char_plateau_low_text_tail_tokens)
+                )
+                blocked_by_char_plateau_low_text_tail[active_indices] |= blocked
+                plateau = plateau & ~blocked
+            if action_char_stable_checks > 0:
+                stable_guard = plateau
+                if action_char_stable_max_chars > 0:
+                    stable_guard = stable_guard & (
+                        action_char_counts[active_indices] < int(action_char_stable_max_chars)
+                    )
+                stable_enough = action_stable_counts[active_indices] >= int(action_char_stable_checks)
+                blocked = stable_guard & ~stable_enough
+                blocked_by_char_plateau_stability[active_indices] |= blocked
+                plateau = plateau & (~stable_guard | stable_enough)
+            if action_char_reset_requires_action_end:
+                require_action_end = reset_requires_action_end[active_indices]
+                blocked = (reached_target | plateau) & require_action_end
+                blocked_by_reset_requires_action_end[active_indices] |= blocked
+                reached_target = reached_target & ~require_action_end
+                plateau = plateau & ~require_action_end
+            reached = reached_target | plateau
+            stopped_by_chars[active_indices] |= reached
+            stopped_by_char_plateau[active_indices] |= plateau
+            stopped_by_restart_fallback[active_indices] |= restart_fallback
+            return reached | restart_fallback
+
+        def finish_return(max_len: int, *, append_action_end: bool | None = None) -> torch.Tensor:
             self._last_action_end_row_token_counts = emitted_lengths.detach().cpu().tolist()
-            return generated[:, :1]
+            if stop_on_action_chars:
+                self._last_action_char_stop_count = int(stopped_by_chars.sum().item())
+                self._last_action_char_plateau_stop_count = int(stopped_by_char_plateau.sum().item())
+                self._last_action_char_plateau_stability_block_count = int(
+                    blocked_by_char_plateau_stability.sum().item()
+                )
+                self._last_action_char_plateau_eos_restart_block_count = int(
+                    blocked_by_char_plateau_eos_restart.sum().item()
+                )
+                self._last_action_char_plateau_low_text_tail_block_count = int(
+                    blocked_by_char_plateau_low_text_tail.sum().item()
+                )
+                self._last_action_char_restart_fallback_count = int(stopped_by_restart_fallback.sum().item())
+                self._last_action_char_restart_continue_count = (
+                    int(plateau_tail_eos_restart.sum().item()) if action_char_restart_continue else 0
+                )
+                self._last_action_char_restart_reset_count = int(restarted_with_count_reset.sum().item())
+                self._last_action_char_reset_requires_action_end_block_count = int(
+                    blocked_by_reset_requires_action_end.sum().item()
+                )
+                self._last_action_char_target_confirm_block_count = int(
+                    blocked_by_target_confirmation.sum().item()
+                )
+                self._last_action_char_count_mean = float(action_char_counts.float().mean().item())
+                self._last_action_char_stable_snapshot_count_mean = float(
+                    action_stable_snapshot_counts.float().mean().item()
+                )
+                self._last_action_char_stable_count_mean = float(action_stable_counts.float().mean().item())
+                if append_action_end is None:
+                    append_action_end = True
+                width = int(max_len) + (1 if append_action_end else 0)
+                return generated[:, : min(width, generated_width)]
+            return generated[:, : int(max_len)]
+
+        if prefix_tokens is not None:
+            next_token = prefix_tokens[0].view(1, 1).expand(bsize, 1)
+            generated[:, 0] = next_token.squeeze(-1)
+            emitted_lengths[:] = 1
+            loop_start = 1
+        else:
+            next_token = self._select_next_token(lm_head(prefix_out[:, -1:, :]), temperature)
+            generated[:, 0] = next_token.squeeze(-1)
+            emitted_lengths[:] = 1
+            loop_start = 1
+
+        selected = next_token.squeeze(-1)
+        finished_by_chars = record_action_chars(selected)
+        finished_by_action_end = selected == action_end_token_id
+        if action_char_plateau_reject_eos_restart and has_restart_guard_tokens and not action_char_restart_continue:
+            finished_by_action_end = finished_by_action_end & ~plateau_tail_eos_restart[active_indices]
+        finished = finished_by_action_end | finished_by_chars
+        if bool(torch.all(finished)):
+            append_action_end = bool(torch.any(finished_by_chars & ~finished_by_action_end).item())
+            return finish_return(1, append_action_end=append_action_end)
         keep = torch.nonzero(~finished, as_tuple=False).flatten()
         if keep.numel() != bsize:
             past_key_values = past_key_values.batch_select_indices(keep)
@@ -1075,9 +1923,8 @@ class PI0FastTokenLogitAdapter:
             next_token = next_token[keep]
             active_indices = active_indices[keep]
 
-        for t in range(1, max_decoding_steps):
-            next_token_emb = self.model.paligemma_with_expert.embed_language_tokens(next_token)
-            next_token_emb = next_token_emb * math.sqrt(next_token_emb.shape[-1])
+        for t in range(loop_start, max_decoding_steps):
+            next_token_emb = self._embed_decode_language_tokens(next_token)
             next_token_emb = next_token_emb.to(dtype=prefix_embs.dtype)
             active_bsize = int(active_indices.numel())
             current_pad_mask = torch.cat(
@@ -1097,15 +1944,22 @@ class PI0FastTokenLogitAdapter:
                 use_cache=True,
                 adarms_cond=[None, None],
             )
-            next_token = self._select_next_token(lm_head(step_out[:, -1:, :]), temperature)
+            if prefix_tokens is not None and t < int(prefix_tokens.numel()):
+                next_token = prefix_tokens[t].view(1, 1).expand(active_bsize, 1)
+            else:
+                next_token = self._select_next_token(lm_head(step_out[:, -1:, :]), temperature)
             selected = next_token.squeeze(-1)
             generated[active_indices, t] = selected
             emitted_lengths[active_indices] = t + 1
-            finished = selected == action_end_token_id
+            finished_by_chars = record_action_chars(selected)
+            finished_by_action_end = selected == action_end_token_id
+            if action_char_plateau_reject_eos_restart and has_restart_guard_tokens and not action_char_restart_continue:
+                finished_by_action_end = finished_by_action_end & ~plateau_tail_eos_restart[active_indices]
+            finished = finished_by_action_end | finished_by_chars
             if bool(torch.all(finished)):
                 max_len = int(emitted_lengths.max().item())
-                self._last_action_end_row_token_counts = emitted_lengths.detach().cpu().tolist()
-                return generated[:, :max_len]
+                append_action_end = bool(torch.any(finished_by_chars & ~finished_by_action_end).item())
+                return finish_return(max_len, append_action_end=append_action_end)
             if bool(torch.any(finished)):
                 keep = torch.nonzero(~finished, as_tuple=False).flatten()
                 past_key_values = past_key_values.batch_select_indices(keep)
@@ -1114,7 +1968,795 @@ class PI0FastTokenLogitAdapter:
                 active_indices = active_indices[keep]
 
         self._last_action_end_row_token_counts = emitted_lengths.detach().cpu().tolist()
+        if stop_on_action_chars:
+            self._last_action_char_stop_count = int(stopped_by_chars.sum().item())
+            self._last_action_char_plateau_stop_count = int(stopped_by_char_plateau.sum().item())
+            self._last_action_char_plateau_stability_block_count = int(
+                blocked_by_char_plateau_stability.sum().item()
+            )
+            self._last_action_char_plateau_eos_restart_block_count = int(
+                blocked_by_char_plateau_eos_restart.sum().item()
+            )
+            self._last_action_char_plateau_low_text_tail_block_count = int(
+                blocked_by_char_plateau_low_text_tail.sum().item()
+            )
+            self._last_action_char_restart_fallback_count = int(stopped_by_restart_fallback.sum().item())
+            self._last_action_char_restart_continue_count = (
+                int(plateau_tail_eos_restart.sum().item()) if action_char_restart_continue else 0
+            )
+            self._last_action_char_restart_reset_count = int(restarted_with_count_reset.sum().item())
+            self._last_action_char_reset_requires_action_end_block_count = int(
+                blocked_by_reset_requires_action_end.sum().item()
+            )
+            self._last_action_char_target_confirm_block_count = int(
+                blocked_by_target_confirmation.sum().item()
+            )
+            self._last_action_char_count_mean = float(action_char_counts.float().mean().item())
+            self._last_action_char_stable_snapshot_count_mean = float(
+                action_stable_snapshot_counts.float().mean().item()
+            )
+            self._last_action_char_stable_count_mean = float(action_stable_counts.float().mean().item())
         return generated
+
+    @torch.no_grad()
+    def sample_actions_fast_kv_cache_action_end_constrained(
+        self,
+        images,
+        img_masks,
+        tokens,
+        masks,
+        max_decoding_steps: int | None = None,
+        temperature: float = 0.0,
+        action_vocab_size: int | None = None,
+        text_vocab_size: int | None = None,
+        full_head_margin: float | None = None,
+        force_action_prefix: bool = True,
+        prefill_action_prefix: bool = False,
+        structural_token_radius: int = 512,
+        full_head_prefix_tokens: int = 0,
+        extra_token_ids: torch.Tensor | list[int] | None = None,
+        decode_attn_implementation: str | None = None,
+        stop_on_action_chars: bool = False,
+        action_char_target_chars: int | None = None,
+        action_char_min_chars: int | None = None,
+        action_char_plateau_tokens: int = 0,
+        action_char_stable_checks: int = 0,
+        action_char_stable_tolerance: float = 0.0,
+        action_char_stable_max_chars: int = 0,
+        action_char_plateau_reject_eos_restart: bool = False,
+        action_char_restart_continue: bool = False,
+        action_char_restart_reset: bool = False,
+        action_char_restart_reset_low_text_tokens: int = 0,
+        action_char_plateau_low_text_tail_tokens: int = 0,
+        action_char_strict_target_stop: bool = False,
+        action_char_reset_requires_action_end: bool = False,
+        action_char_target_confirm_tokens: int = 0,
+    ) -> torch.Tensor:
+        """KV-cache FAST decode using the known PI0-FAST action-token support.
+
+        PI0-FAST action chunks are emitted as ``Action: `` followed by FAST BPE
+        action tokens and the ``|`` action-end marker.  This path avoids the
+        257k-way language-model head on every decode step: it forces the fixed
+        text prefix and computes argmax only over the FAST action-token IDs plus
+        the action-end token.  It is intended to be paired with validation
+        against the full-vocabulary target decode before use as a proof mode.
+        """
+
+        if temperature != 0.0:
+            raise ValueError("Constrained PI0-FAST decode currently supports greedy temperature=0 only")
+        if max_decoding_steps is None:
+            max_decoding_steps = self.model.config.max_action_tokens
+        bsize = tokens.shape[0]
+        device = tokens.device
+        lm_head = self.model.paligemma_with_expert.paligemma.lm_head
+        action_end_token_id = self._action_end_token_id()
+        paligemma = self.model.paligemma_with_expert.paligemma
+        language_model = getattr(getattr(paligemma, "model", None), "language_model", None)
+        language_model_config = getattr(language_model, "config", None)
+        original_attn_implementation = (
+            None if language_model_config is None else getattr(language_model_config, "_attn_implementation", None)
+        )
+        if decode_attn_implementation in (None, "", "default"):
+            decode_attn_implementation = None
+        else:
+            decode_attn_implementation = str(decode_attn_implementation)
+        trimmed_language_tokens = 0
+        if decode_attn_implementation == "flash_attention_2" and bsize == 1 and masks.dtype == torch.bool:
+            keep_language = masks[0]
+            if bool(torch.any(~keep_language)):
+                trimmed_language_tokens = int(torch.sum(~keep_language).item())
+                tokens = tokens[:, keep_language]
+                masks = masks[:, keep_language]
+
+        def set_decode_attn_implementation() -> None:
+            if decode_attn_implementation is not None and language_model_config is not None:
+                language_model_config._attn_implementation = decode_attn_implementation
+
+        def restore_attn_implementation() -> None:
+            if decode_attn_implementation is not None and language_model_config is not None:
+                language_model_config._attn_implementation = original_attn_implementation
+
+        profile_enabled = bool(getattr(self, "_profile_action_end_decode", False))
+        profile_segments_ms: dict[str, float] = {}
+        profile_counts: dict[str, int] = {}
+        self._last_action_end_profile = None
+
+        def profile_sync() -> None:
+            if profile_enabled and device.type == "cuda" and torch.cuda.is_available():
+                torch.cuda.synchronize(device)
+
+        def profile_add(name: str, elapsed_ms: float) -> None:
+            profile_segments_ms[name] = profile_segments_ms.get(name, 0.0) + float(elapsed_ms)
+            profile_counts[name] = profile_counts.get(name, 0) + 1
+
+        def profile_begin() -> float:
+            profile_sync()
+            return time.perf_counter()
+
+        def profile_end(name: str, start: float) -> None:
+            profile_sync()
+            profile_add(name, (time.perf_counter() - start) * 1000.0)
+
+        def finish_profile() -> None:
+            if not profile_enabled:
+                return
+            self._last_action_end_profile = {
+                "segments_ms": {key: float(value) for key, value in profile_segments_ms.items()},
+                "counts": {key: int(value) for key, value in profile_counts.items()},
+                "row_token_counts": emitted_lengths.detach().cpu().tolist(),
+                "restricted_head_calls": int(restricted_head_calls),
+                "full_head_fallbacks": int(full_head_fallbacks),
+            }
+
+        action_char_target = 0
+        if stop_on_action_chars:
+            action_dim = self.policy.config.output_features[self._action_key()].shape[0]
+            action_char_target = int(self.policy.config.n_action_steps) * int(action_dim)
+            if action_char_target_chars is not None:
+                action_char_target = int(action_char_target_chars)
+            action_char_target = max(0, int(action_char_target))
+        action_char_min_chars = int(action_char_target if action_char_min_chars is None else action_char_min_chars)
+        action_char_min_chars = max(0, int(action_char_min_chars))
+        action_char_plateau_tokens = max(0, int(action_char_plateau_tokens))
+        action_char_stable_checks = max(0, int(action_char_stable_checks))
+        action_char_stable_tolerance = max(0.0, float(action_char_stable_tolerance))
+        action_char_stable_max_chars = max(0, int(action_char_stable_max_chars))
+        action_char_plateau_reject_eos_restart = bool(action_char_plateau_reject_eos_restart)
+        action_char_restart_continue = bool(action_char_restart_continue)
+        action_char_restart_reset = bool(action_char_restart_reset)
+        action_char_restart_reset_low_text_tokens = max(0, int(action_char_restart_reset_low_text_tokens))
+        action_char_plateau_low_text_tail_tokens = max(0, int(action_char_plateau_low_text_tail_tokens))
+        action_char_strict_target_stop = bool(action_char_strict_target_stop)
+        action_char_reset_requires_action_end = bool(action_char_reset_requires_action_end)
+        action_char_target_confirm_tokens = max(0, int(action_char_target_confirm_tokens))
+        self._last_action_char_target = int(action_char_target)
+        self._last_action_char_min_chars = int(action_char_min_chars if stop_on_action_chars else 0)
+        self._last_action_char_plateau_tokens = int(action_char_plateau_tokens if stop_on_action_chars else 0)
+        self._last_action_char_stable_checks = int(action_char_stable_checks if stop_on_action_chars else 0)
+        self._last_action_char_stable_tolerance = float(action_char_stable_tolerance if stop_on_action_chars else 0.0)
+        self._last_action_char_stable_max_chars = int(action_char_stable_max_chars if stop_on_action_chars else 0)
+        self._last_action_char_plateau_reject_eos_restart = bool(
+            action_char_plateau_reject_eos_restart if stop_on_action_chars else False
+        )
+        self._last_action_char_restart_continue = bool(action_char_restart_continue if stop_on_action_chars else False)
+        self._last_action_char_restart_reset = bool(action_char_restart_reset if stop_on_action_chars else False)
+        self._last_action_char_restart_reset_low_text_tokens = int(
+            action_char_restart_reset_low_text_tokens if stop_on_action_chars else 0
+        )
+        self._last_action_char_plateau_low_text_tail_tokens = int(
+            action_char_plateau_low_text_tail_tokens if stop_on_action_chars else 0
+        )
+        self._last_action_char_strict_target_stop = bool(
+            action_char_strict_target_stop if stop_on_action_chars else False
+        )
+        self._last_action_char_reset_requires_action_end = bool(
+            action_char_reset_requires_action_end if stop_on_action_chars else False
+        )
+        self._last_action_char_target_confirm_tokens = int(
+            action_char_target_confirm_tokens if stop_on_action_chars else 0
+        )
+        self._last_action_char_stop_count = 0
+        self._last_action_char_plateau_stop_count = 0
+        self._last_action_char_plateau_stability_block_count = 0
+        self._last_action_char_plateau_eos_restart_block_count = 0
+        self._last_action_char_restart_fallback_count = 0
+        self._last_action_char_restart_continue_count = 0
+        self._last_action_char_restart_reset_count = 0
+        self._last_action_char_reset_requires_action_end_block_count = 0
+        self._last_action_char_target_confirm_block_count = 0
+        self._last_action_char_plateau_low_text_tail_block_count = 0
+        self._last_action_char_count_mean = 0.0
+        self._last_action_char_stable_snapshot_count_mean = 0.0
+        self._last_action_char_stable_count_mean = 0.0
+        action_char_lookup = self.prepare_action_char_length_lookup(device) if stop_on_action_chars else None
+        prefix_tokens = torch.as_tensor(
+            self.model._paligemma_tokenizer.encode("Action: ", add_special_tokens=False),
+            dtype=torch.long,
+            device=device,
+        )
+        if prefix_tokens.numel() == 0:
+            raise RuntimeError("Could not resolve PI0-FAST Action prefix tokens")
+        action_char_prefix_low_token_ids = tuple(
+            int(token_id)
+            for token_id in prefix_tokens.detach().cpu().tolist()
+            if 0 <= int(token_id) < 8192
+        )
+
+        # The public FAST tokenizer reports a 1024-token BPE vocab, but the
+        # PI0-FAST target occasionally emits nearby PaliGemma tokens that map
+        # to larger raw action-token IDs.  LeRobot's relaxed FAST decoder still
+        # consumes those IDs.  The target can also emit low text/special tokens
+        # inside the action chunk, so exact constrained decoding needs both a
+        # high FAST-action band and a small low-token band.
+        paligemma_vocab_size = int(self.model._paligemma_tokenizer.vocab_size)
+        if action_vocab_size is None:
+            action_vocab_size = max(int(getattr(self.policy.action_tokenizer, "vocab_size", 1024)), 8192)
+        if text_vocab_size is None:
+            text_vocab_size = 8192
+        action_vocab_size = max(int(getattr(self.policy.action_tokenizer, "vocab_size", 1024)), int(action_vocab_size))
+        text_vocab_size = min(paligemma_vocab_size, max(0, int(text_vocab_size)))
+        structural_token_radius = max(0, int(structural_token_radius))
+        full_head_prefix_tokens = max(0, int(full_head_prefix_tokens))
+        if extra_token_ids is None:
+            extra_candidate_ids = torch.empty((0,), dtype=torch.long, device=device)
+        elif torch.is_tensor(extra_token_ids):
+            extra_candidate_ids = extra_token_ids.to(device=device, dtype=torch.long).flatten()
+        else:
+            extra_candidate_ids = torch.as_tensor(
+                [int(token_id) for token_id in extra_token_ids],
+                dtype=torch.long,
+                device=device,
+            ).flatten()
+        extra_candidate_ids = extra_candidate_ids[
+            (extra_candidate_ids >= 0) & (extra_candidate_ids < paligemma_vocab_size)
+        ]
+        extra_candidate_ids = torch.unique(extra_candidate_ids)
+        extra_token_key = tuple(int(token_id) for token_id in extra_candidate_ids.detach().cpu().tolist())
+        candidate_cache_key = (
+            int(action_vocab_size),
+            int(text_vocab_size),
+            int(structural_token_radius),
+            extra_token_key,
+            str(device),
+            str(lm_head.weight.dtype),
+            int(lm_head.weight.data_ptr()),
+        )
+        cached = getattr(self, "_constrained_lm_head_cache", None)
+        if cached is None or cached.get("key") != candidate_cache_key:
+            action_token_ids = (
+                paligemma_vocab_size
+                - 1
+                - int(self.policy.config.fast_skip_tokens)
+                - torch.arange(action_vocab_size, dtype=torch.long, device=device)
+            )
+            action_token_ids = action_token_ids[(action_token_ids >= 0) & (action_token_ids < paligemma_vocab_size)]
+            text_token_ids = torch.arange(text_vocab_size, dtype=torch.long, device=device)
+            structural_start = max(0, action_end_token_id - structural_token_radius)
+            structural_end = min(paligemma_vocab_size, action_end_token_id + structural_token_radius + 1)
+            structural_token_ids = torch.arange(structural_start, structural_end, dtype=torch.long, device=device)
+            candidate_ids = torch.cat(
+                [
+                    text_token_ids,
+                    structural_token_ids,
+                    action_token_ids,
+                    extra_candidate_ids,
+                    prefix_tokens,
+                    torch.tensor([action_end_token_id], dtype=torch.long, device=device),
+                ],
+                dim=0,
+            )
+            candidate_ids = torch.unique(candidate_ids)
+            candidate_weight = lm_head.weight.index_select(0, candidate_ids).contiguous()
+            lm_head_bias = getattr(lm_head, "bias", None)
+            candidate_bias = (
+                None
+                if lm_head_bias is None
+                else lm_head_bias.index_select(0, candidate_ids).contiguous()
+            )
+            cached = {
+                "key": candidate_cache_key,
+                "candidate_ids": candidate_ids,
+                "candidate_weight": candidate_weight,
+                "candidate_bias": candidate_bias,
+                "candidate_size": int(candidate_ids.numel()),
+                "action_vocab_size": int(action_vocab_size),
+                "text_vocab_size": int(text_vocab_size),
+                "structural_token_radius": int(structural_token_radius),
+                "extra_token_count": int(extra_candidate_ids.numel()),
+            }
+            self._constrained_lm_head_cache = cached
+        candidate_ids = cached["candidate_ids"]
+        candidate_weight = cached["candidate_weight"]
+        candidate_bias = cached["candidate_bias"]
+        self._last_constrained_candidate_size = int(candidate_ids.numel())
+        self._last_constrained_action_vocab_size = int(cached["action_vocab_size"])
+        self._last_constrained_text_vocab_size = int(cached["text_vocab_size"])
+        self._last_constrained_structural_token_radius = int(cached["structural_token_radius"])
+        self._last_constrained_extra_token_count = int(cached["extra_token_count"])
+        self._last_constrained_force_action_prefix = int(bool(force_action_prefix))
+        self._last_constrained_prefill_action_prefix_tokens = (
+            int(prefix_tokens.numel()) if force_action_prefix and prefill_action_prefix else 0
+        )
+        self._last_forced_action_prefix_token_count = int(prefix_tokens.numel()) if force_action_prefix else 0
+        self._last_constrained_full_head_margin = float(full_head_margin) if full_head_margin is not None else -1.0
+        self._last_constrained_full_head_prefix_tokens = int(full_head_prefix_tokens)
+        self._last_decode_attn_implementation = (
+            str(decode_attn_implementation)
+            if decode_attn_implementation is not None
+            else str(original_attn_implementation)
+        )
+        self._last_decode_attn_trimmed_language_tokens = int(trimmed_language_tokens)
+        self._last_constrained_full_head_prefix_calls = 0
+        self._last_constrained_full_head_fallbacks = 0
+        self._last_constrained_restricted_head_calls = 0
+        self._last_constrained_full_head_fallback_rate = 0.0
+        self._last_constrained_margin_min = 0.0
+        self._last_constrained_margin_mean = 0.0
+        restricted_head_calls = 0
+        full_head_fallbacks = 0
+        full_head_prefix_calls = 0
+        margin_min = float("inf")
+        margin_sum = 0.0
+
+        def full_next(hidden: torch.Tensor) -> torch.Tensor:
+            return torch.argmax(lm_head(hidden)[:, -1, :], dim=-1, keepdim=True)
+
+        def constrained_next(hidden: torch.Tensor, token_position: int) -> torch.Tensor:
+            nonlocal full_head_prefix_calls
+            if token_position < full_head_prefix_tokens:
+                full_head_prefix_calls += int(hidden.shape[0])
+                return full_next(hidden)
+            return restricted_next(hidden)
+
+        def restricted_next(hidden: torch.Tensor) -> torch.Tensor:
+            nonlocal restricted_head_calls, full_head_fallbacks, margin_min, margin_sum
+            profile_start = profile_begin() if profile_enabled else 0.0
+            logits = F.linear(hidden, candidate_weight, candidate_bias)
+            step_logits = logits[:, -1, :].float()
+            restricted_head_calls += int(step_logits.shape[0])
+            local = torch.argmax(step_logits, dim=-1)
+            if full_head_margin is not None and step_logits.shape[-1] >= 2:
+                top_values, top_indices = torch.topk(step_logits, k=2, dim=-1)
+                margins = top_values[:, 0] - top_values[:, 1]
+                margin_min = min(margin_min, float(torch.min(margins).item()))
+                margin_sum += float(torch.sum(margins).item())
+                if bool(torch.any(margins < float(full_head_margin))):
+                    full_head_fallbacks += int(step_logits.shape[0])
+                    if profile_enabled:
+                        profile_end("restricted_head", profile_start)
+                    return full_next(hidden)
+            if profile_enabled:
+                profile_end("restricted_head", profile_start)
+            return candidate_ids.index_select(0, local).unsqueeze(-1)
+
+        def finish_constrained_stats() -> None:
+            self._last_constrained_full_head_prefix_calls = int(full_head_prefix_calls)
+            self._last_constrained_full_head_fallbacks = int(full_head_fallbacks)
+            self._last_constrained_restricted_head_calls = int(restricted_head_calls)
+            self._last_constrained_full_head_fallback_rate = (
+                float(full_head_fallbacks) / float(restricted_head_calls) if restricted_head_calls else 0.0
+            )
+            self._last_constrained_margin_min = float(margin_min if margin_min != float("inf") else 0.0)
+            self._last_constrained_margin_mean = (
+                float(margin_sum) / float(restricted_head_calls) if restricted_head_calls else 0.0
+            )
+
+        generated_width = int(max_decoding_steps) + (1 if stop_on_action_chars else 0)
+        generated = torch.full((bsize, generated_width), action_end_token_id, dtype=torch.long, device=device)
+        active_indices = torch.arange(bsize, dtype=torch.long, device=device)
+        emitted_lengths = torch.ones((bsize,), dtype=torch.long, device=device)
+        action_char_counts = torch.zeros((bsize,), dtype=torch.long, device=device)
+        last_action_char_increment_lengths = torch.zeros((bsize,), dtype=torch.long, device=device)
+        action_stable_counts = torch.zeros((bsize,), dtype=torch.long, device=device)
+        action_stable_snapshot_counts = torch.zeros((bsize,), dtype=torch.long, device=device)
+        target_reached_lengths = torch.zeros((bsize,), dtype=torch.long, device=device)
+        previous_action_snapshots: list[torch.Tensor | None] = [None] * bsize
+        stopped_by_chars = torch.zeros((bsize,), dtype=torch.bool, device=device)
+        stopped_by_char_plateau = torch.zeros((bsize,), dtype=torch.bool, device=device)
+        stopped_by_restart_fallback = torch.zeros((bsize,), dtype=torch.bool, device=device)
+        restarted_with_count_reset = torch.zeros((bsize,), dtype=torch.bool, device=device)
+        reset_requires_action_end = torch.zeros((bsize,), dtype=torch.bool, device=device)
+        pending_restart_reset = torch.zeros((bsize,), dtype=torch.bool, device=device)
+        post_restart_action_char_counts = torch.zeros((bsize,), dtype=torch.long, device=device)
+        post_restart_last_action_char_increment_lengths = torch.zeros((bsize,), dtype=torch.long, device=device)
+        restart_low_text_counts = torch.zeros((bsize,), dtype=torch.long, device=device)
+        action_char_low_text_tail_counts = torch.zeros((bsize,), dtype=torch.long, device=device)
+        blocked_by_char_plateau_stability = torch.zeros((bsize,), dtype=torch.bool, device=device)
+        blocked_by_char_plateau_eos_restart = torch.zeros((bsize,), dtype=torch.bool, device=device)
+        blocked_by_char_plateau_low_text_tail = torch.zeros((bsize,), dtype=torch.bool, device=device)
+        blocked_by_reset_requires_action_end = torch.zeros((bsize,), dtype=torch.bool, device=device)
+        blocked_by_target_confirmation = torch.zeros((bsize,), dtype=torch.bool, device=device)
+        plateau_tail_seen_eos = torch.zeros((bsize,), dtype=torch.bool, device=device)
+        plateau_tail_eos_restart = torch.zeros((bsize,), dtype=torch.bool, device=device)
+        eos_token_id = int(getattr(self.model._paligemma_tokenizer, "eos_token_id", -1) or -1)
+        bos_token_id = int(getattr(self.model._paligemma_tokenizer, "bos_token_id", -1) or -1)
+        has_restart_guard_tokens = eos_token_id >= 0 or bos_token_id >= 0
+
+        def token_ids_with_action_end(row_idx: int) -> torch.Tensor:
+            length = max(int(emitted_lengths[row_idx].item()), 1)
+            token_ids = generated[row_idx : row_idx + 1, :length]
+            if int(token_ids[0, -1].item()) != action_end_token_id:
+                eos = torch.full((1, 1), action_end_token_id, dtype=token_ids.dtype, device=token_ids.device)
+                token_ids = torch.cat([token_ids, eos], dim=1)
+            return token_ids
+
+        def record_action_stability(row_indices: torch.Tensor) -> None:
+            if action_char_stable_checks <= 0:
+                return
+            for row_idx in row_indices.detach().cpu().tolist():
+                token_ids = token_ids_with_action_end(int(row_idx))
+                actions = self._detokenize_generated_actions(token_ids).detach().float().cpu()
+                previous = previous_action_snapshots[int(row_idx)]
+                if previous is None:
+                    action_stable_counts[int(row_idx)] = 0
+                else:
+                    max_delta = float(torch.max(torch.abs(actions - previous)).item())
+                    if max_delta <= action_char_stable_tolerance:
+                        action_stable_counts[int(row_idx)] += 1
+                    else:
+                        action_stable_counts[int(row_idx)] = 0
+                previous_action_snapshots[int(row_idx)] = actions
+                action_stable_snapshot_counts[int(row_idx)] += 1
+
+        def record_action_chars(selected: torch.Tensor) -> torch.Tensor:
+            if action_char_lookup is None:
+                return torch.zeros_like(selected, dtype=torch.bool)
+            increments = action_char_lookup.index_select(0, selected).to(dtype=action_char_counts.dtype)
+            low_text = selected < 8192
+            if eos_token_id >= 0:
+                low_text = low_text & (selected != int(eos_token_id))
+            if bos_token_id >= 0:
+                low_text = low_text & (selected != int(bos_token_id))
+            for token_id in action_char_prefix_low_token_ids:
+                low_text = low_text & (selected != token_id)
+            restarted = torch.zeros_like(selected, dtype=torch.bool)
+            if action_char_plateau_reject_eos_restart and has_restart_guard_tokens:
+                selected_is_eos = selected == int(eos_token_id) if eos_token_id >= 0 else torch.zeros_like(selected, dtype=torch.bool)
+                selected_is_bos = selected == int(bos_token_id) if bos_token_id >= 0 else torch.zeros_like(selected, dtype=torch.bool)
+                restarted = selected_is_bos | (plateau_tail_seen_eos[active_indices] & ~selected_is_eos)
+                if action_char_restart_reset and bool(torch.any(restarted)):
+                    restart_rows = active_indices[restarted]
+                    if action_char_restart_reset_low_text_tokens > 0:
+                        pending_restart_reset[restart_rows] = True
+                        post_restart_action_char_counts[restart_rows] = 0
+                        post_restart_last_action_char_increment_lengths[restart_rows] = 0
+                        restart_low_text_counts[restart_rows] = 0
+                        plateau_tail_seen_eos[restart_rows] = False
+                        plateau_tail_eos_restart[restart_rows] = False
+                    else:
+                        action_char_counts[restart_rows] = 0
+                        last_action_char_increment_lengths[restart_rows] = 0
+                        target_reached_lengths[restart_rows] = 0
+                        action_stable_counts[restart_rows] = 0
+                        action_stable_snapshot_counts[restart_rows] = 0
+                        plateau_tail_seen_eos[restart_rows] = False
+                        plateau_tail_eos_restart[restart_rows] = False
+                        restarted_with_count_reset[restart_rows] = True
+                        if action_char_reset_requires_action_end:
+                            reset_requires_action_end[restart_rows] = True
+                        for row_idx in restart_rows.detach().cpu().tolist():
+                            previous_action_snapshots[int(row_idx)] = None
+                else:
+                    plateau_tail_eos_restart[active_indices] |= restarted
+            action_char_counts[active_indices] += increments
+            pending_rows = pending_restart_reset[active_indices]
+            if bool(torch.any(pending_rows)):
+                pending_global_rows = active_indices[pending_rows]
+                post_restart_action_char_counts[pending_global_rows] += increments[pending_rows]
+                restart_low_text_counts[pending_global_rows] += low_text[pending_rows].to(
+                    dtype=restart_low_text_counts.dtype
+                )
+            incremented = increments > 0
+            if bool(torch.any(incremented)):
+                incremented_rows = active_indices[incremented]
+                last_action_char_increment_lengths[incremented_rows] = emitted_lengths[incremented_rows]
+                action_char_low_text_tail_counts[incremented_rows] = 0
+                pending_incremented = incremented & pending_restart_reset[active_indices]
+                if bool(torch.any(pending_incremented)):
+                    pending_incremented_rows = active_indices[pending_incremented]
+                    post_restart_last_action_char_increment_lengths[pending_incremented_rows] = emitted_lengths[
+                        pending_incremented_rows
+                    ]
+                if action_char_plateau_reject_eos_restart and has_restart_guard_tokens:
+                    safe_rows = incremented_rows[~plateau_tail_eos_restart[incremented_rows]]
+                    plateau_tail_seen_eos[safe_rows] = False
+                else:
+                    plateau_tail_seen_eos[incremented_rows] = False
+                    plateau_tail_eos_restart[incremented_rows] = False
+                record_action_stability(incremented_rows)
+            if bool(torch.any(~incremented)):
+                tail_rows = active_indices[~incremented]
+                action_char_low_text_tail_counts[tail_rows] += low_text[~incremented].to(
+                    dtype=action_char_low_text_tail_counts.dtype
+                )
+            if action_char_restart_reset and action_char_restart_reset_low_text_tokens > 0:
+                should_reset = (
+                    pending_restart_reset[active_indices]
+                    & (restart_low_text_counts[active_indices] >= int(action_char_restart_reset_low_text_tokens))
+                )
+                if bool(torch.any(should_reset)):
+                    reset_rows = active_indices[should_reset]
+                    action_char_counts[reset_rows] = post_restart_action_char_counts[reset_rows]
+                    last_action_char_increment_lengths[reset_rows] = post_restart_last_action_char_increment_lengths[
+                        reset_rows
+                    ]
+                    target_reached_lengths[reset_rows] = 0
+                    action_stable_counts[reset_rows] = 0
+                    action_stable_snapshot_counts[reset_rows] = 0
+                    plateau_tail_seen_eos[reset_rows] = False
+                    plateau_tail_eos_restart[reset_rows] = False
+                    pending_restart_reset[reset_rows] = False
+                    restarted_with_count_reset[reset_rows] = True
+                    if action_char_reset_requires_action_end:
+                        reset_requires_action_end[reset_rows] = True
+                    for row_idx in reset_rows.detach().cpu().tolist():
+                        previous_action_snapshots[int(row_idx)] = None
+            if action_char_plateau_reject_eos_restart and has_restart_guard_tokens:
+                selected_is_eos = selected == int(eos_token_id) if eos_token_id >= 0 else torch.zeros_like(selected, dtype=torch.bool)
+                not_incremented = ~incremented
+                if bool(torch.any(not_incremented)):
+                    tail_rows = active_indices[not_incremented]
+                    plateau_tail_seen_eos[tail_rows] |= selected_is_eos[not_incremented]
+            if action_char_strict_target_stop:
+                reached_target = action_char_counts[active_indices] > int(action_char_target)
+            else:
+                reached_target = action_char_counts[active_indices] >= int(action_char_target)
+            if action_char_target <= 0:
+                reached_target = torch.zeros_like(reached_target, dtype=torch.bool)
+            if action_char_target_confirm_tokens > 0 and bool(torch.any(reached_target)):
+                first_reached = reached_target & (target_reached_lengths[active_indices] <= 0)
+                if bool(torch.any(first_reached)):
+                    first_rows = active_indices[first_reached]
+                    target_reached_lengths[first_rows] = emitted_lengths[first_rows]
+                confirmed = (
+                    emitted_lengths[active_indices] - target_reached_lengths[active_indices]
+                    >= int(action_char_target_confirm_tokens)
+                )
+                blocked = reached_target & ~confirmed
+                blocked_by_target_confirmation[active_indices] |= blocked
+                reached_target = reached_target & confirmed
+            restart_fallback = torch.zeros_like(reached_target, dtype=torch.bool)
+            if action_char_plateau_reject_eos_restart and has_restart_guard_tokens:
+                restart_tainted = plateau_tail_eos_restart[active_indices]
+                restart_fallback = (
+                    torch.zeros_like(reached_target, dtype=torch.bool)
+                    if action_char_restart_continue or action_char_restart_reset
+                    else restart_tainted
+                )
+                reached_target = reached_target & ~restart_tainted
+            plateau_candidate = torch.zeros_like(reached_target, dtype=torch.bool)
+            if action_char_plateau_tokens > 0:
+                plateau_candidate = (
+                    (action_char_counts[active_indices] >= int(action_char_min_chars))
+                    & (last_action_char_increment_lengths[active_indices] > 0)
+                    & (
+                        emitted_lengths[active_indices] - last_action_char_increment_lengths[active_indices]
+                        >= int(action_char_plateau_tokens)
+                    )
+                )
+            plateau = plateau_candidate
+            if action_char_plateau_reject_eos_restart and has_restart_guard_tokens:
+                blocked = plateau_candidate & plateau_tail_eos_restart[active_indices]
+                blocked_by_char_plateau_eos_restart[active_indices] |= blocked
+                plateau = plateau & ~plateau_tail_eos_restart[active_indices]
+            if action_char_plateau_low_text_tail_tokens > 0:
+                blocked = plateau & (
+                    action_char_low_text_tail_counts[active_indices]
+                    >= int(action_char_plateau_low_text_tail_tokens)
+                )
+                blocked_by_char_plateau_low_text_tail[active_indices] |= blocked
+                plateau = plateau & ~blocked
+            if action_char_stable_checks > 0:
+                stable_guard = plateau
+                if action_char_stable_max_chars > 0:
+                    stable_guard = stable_guard & (
+                        action_char_counts[active_indices] < int(action_char_stable_max_chars)
+                    )
+                stable_enough = action_stable_counts[active_indices] >= int(action_char_stable_checks)
+                blocked = stable_guard & ~stable_enough
+                blocked_by_char_plateau_stability[active_indices] |= blocked
+                plateau = plateau & (~stable_guard | stable_enough)
+            if action_char_reset_requires_action_end:
+                require_action_end = reset_requires_action_end[active_indices]
+                blocked = (reached_target | plateau) & require_action_end
+                blocked_by_reset_requires_action_end[active_indices] |= blocked
+                reached_target = reached_target & ~require_action_end
+                plateau = plateau & ~require_action_end
+            reached = reached_target | plateau
+            stopped_by_chars[active_indices] |= reached
+            stopped_by_char_plateau[active_indices] |= plateau
+            stopped_by_restart_fallback[active_indices] |= restart_fallback
+            return reached | restart_fallback
+
+        def finish_return(max_len: int, *, append_action_end: bool | None = None) -> torch.Tensor:
+            finish_constrained_stats()
+            finish_profile()
+            restore_attn_implementation()
+            self._last_action_end_row_token_counts = emitted_lengths.detach().cpu().tolist()
+            if stop_on_action_chars:
+                self._last_action_char_stop_count = int(stopped_by_chars.sum().item())
+                self._last_action_char_plateau_stop_count = int(stopped_by_char_plateau.sum().item())
+                self._last_action_char_plateau_stability_block_count = int(
+                    blocked_by_char_plateau_stability.sum().item()
+                )
+                self._last_action_char_plateau_eos_restart_block_count = int(
+                    blocked_by_char_plateau_eos_restart.sum().item()
+                )
+                self._last_action_char_plateau_low_text_tail_block_count = int(
+                    blocked_by_char_plateau_low_text_tail.sum().item()
+                )
+                self._last_action_char_restart_fallback_count = int(stopped_by_restart_fallback.sum().item())
+                self._last_action_char_restart_continue_count = (
+                    int(plateau_tail_eos_restart.sum().item()) if action_char_restart_continue else 0
+                )
+                self._last_action_char_restart_reset_count = int(restarted_with_count_reset.sum().item())
+                self._last_action_char_reset_requires_action_end_block_count = int(
+                    blocked_by_reset_requires_action_end.sum().item()
+                )
+                self._last_action_char_target_confirm_block_count = int(
+                    blocked_by_target_confirmation.sum().item()
+                )
+                self._last_action_char_count_mean = float(action_char_counts.float().mean().item())
+                self._last_action_char_stable_snapshot_count_mean = float(
+                    action_stable_snapshot_counts.float().mean().item()
+                )
+                self._last_action_char_stable_count_mean = float(action_stable_counts.float().mean().item())
+                if append_action_end is None:
+                    append_action_end = True
+                width = int(max_len) + (1 if append_action_end else 0)
+                return generated[:, : min(width, generated_width)]
+            return generated[:, : int(max_len)]
+
+        bos_token = torch.full(
+            (bsize, 1),
+            self.model._paligemma_tokenizer.bos_token_id,
+            dtype=torch.long,
+            device=device,
+        )
+        tokens_in = torch.cat([tokens, bos_token], dim=1)
+        masks_in = torch.cat([masks, torch.ones((bsize, 1), dtype=torch.bool, device=device)], dim=1)
+        prefill_prefix_tokens = None
+        prefill_prefix_masks = None
+        if force_action_prefix and prefill_action_prefix:
+            prefill_prefix_tokens = prefix_tokens.view(1, -1).expand(bsize, -1)
+            prefill_prefix_masks = torch.ones(
+                (bsize, int(prefix_tokens.numel())),
+                dtype=torch.bool,
+                device=device,
+            )
+        profile_start = profile_begin() if profile_enabled else 0.0
+        prefix_embs, prefix_pad_masks, prefix_att_masks, _total_t_images, _ = self.model.embed_prefix_fast(
+            images,
+            img_masks,
+            tokens_in,
+            masks_in,
+            fast_action_tokens=prefill_prefix_tokens,
+            fast_action_masks=prefill_prefix_masks,
+        )
+        if profile_enabled:
+            profile_end("prefix_embed", profile_start)
+        prefix_embs = self._match_model_precision(prefix_embs)
+        profile_start = profile_begin() if profile_enabled else 0.0
+        position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        att_4d = self.model._prepare_attention_masks_4d(prefix_att_masks, dtype=prefix_embs.dtype)
+        if profile_enabled:
+            profile_end("prefill_mask", profile_start)
+        profile_start = profile_begin() if profile_enabled else 0.0
+        (prefix_out, _), past_key_values = self.model.paligemma_with_expert.forward(
+            attention_mask=att_4d,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+            adarms_cond=[None, None],
+        )
+        if profile_enabled:
+            profile_end("prefill_forward", profile_start)
+
+        generated = torch.full((bsize, max_decoding_steps), action_end_token_id, dtype=torch.long, device=device)
+        prefilled_prefix_len = int(prefix_tokens.numel()) if prefill_prefix_tokens is not None else 0
+        if prefilled_prefix_len:
+            if prefilled_prefix_len >= int(max_decoding_steps):
+                return finish_return(int(max_decoding_steps), append_action_end=False)
+            generated[:, :prefilled_prefix_len] = prefix_tokens.view(1, -1).expand(bsize, -1)
+            emitted_lengths[:] = prefilled_prefix_len
+            next_token = constrained_next(prefix_out[:, -1:, :], prefilled_prefix_len)
+            initial_position = prefilled_prefix_len
+        elif force_action_prefix:
+            next_token = prefix_tokens[0].view(1, 1).expand(bsize, 1)
+            initial_position = 0
+        else:
+            next_token = constrained_next(prefix_out[:, -1:, :], 0)
+            initial_position = 0
+        generated[:, initial_position] = next_token.squeeze(-1)
+        current_pad_mask = prefix_pad_masks
+        selected = next_token.squeeze(-1)
+        emitted_lengths[active_indices] = initial_position + 1
+        profile_start = profile_begin() if profile_enabled else 0.0
+        finished_by_chars = record_action_chars(selected)
+        finished_by_action_end = selected == action_end_token_id
+        if action_char_plateau_reject_eos_restart and has_restart_guard_tokens and not action_char_restart_continue:
+            finished_by_action_end = finished_by_action_end & ~plateau_tail_eos_restart[active_indices]
+        finished = finished_by_action_end | finished_by_chars
+        if profile_enabled:
+            profile_end("stop_checks", profile_start)
+        if bool(torch.all(finished)):
+            append_action_end = bool(torch.any(finished_by_chars & ~finished_by_action_end).item())
+            return finish_return(initial_position + 1, append_action_end=append_action_end)
+        if bool(torch.any(finished)):
+            profile_start = profile_begin() if profile_enabled else 0.0
+            keep = torch.nonzero(~finished, as_tuple=False).flatten()
+            past_key_values = past_key_values.batch_select_indices(keep)
+            current_pad_mask = current_pad_mask[keep]
+            next_token = next_token[keep]
+            active_indices = active_indices[keep]
+            if profile_enabled:
+                profile_end("row_compact", profile_start)
+
+        set_decode_attn_implementation()
+        for t in range(initial_position + 1, max_decoding_steps):
+            profile_start = profile_begin() if profile_enabled else 0.0
+            next_token_emb = self._embed_decode_language_tokens(next_token)
+            next_token_emb = next_token_emb.to(dtype=prefix_embs.dtype)
+            if profile_enabled:
+                profile_end("decode_embed", profile_start)
+            active_bsize = int(active_indices.numel())
+            profile_start = profile_begin() if profile_enabled else 0.0
+            current_pad_mask = torch.cat(
+                [current_pad_mask, torch.ones((active_bsize, 1), dtype=torch.bool, device=device)],
+                dim=1,
+            )
+            current_position_ids = (torch.sum(current_pad_mask, dim=1, keepdim=True) - 1).long()
+            if decode_attn_implementation == "flash_attention_2" and bool(torch.all(current_pad_mask)):
+                step_att_mask = None
+            else:
+                step_att_mask = self.model._prepare_attention_masks_4d(
+                    current_pad_mask.unsqueeze(1),
+                    dtype=next_token_emb.dtype,
+                )
+            if profile_enabled:
+                profile_end("decode_mask", profile_start)
+            profile_start = profile_begin() if profile_enabled else 0.0
+            (step_out, _), past_key_values = self.model.paligemma_with_expert.forward(
+                attention_mask=step_att_mask,
+                position_ids=current_position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=[next_token_emb, None],
+                use_cache=True,
+                adarms_cond=[None, None],
+            )
+            if profile_enabled:
+                profile_end("decode_forward", profile_start)
+            if force_action_prefix and t < int(prefix_tokens.numel()):
+                next_token = prefix_tokens[t].view(1, 1).expand(active_bsize, 1)
+            else:
+                next_token = constrained_next(step_out[:, -1:, :], t)
+            selected = next_token.squeeze(-1)
+            generated[active_indices, t] = selected
+            emitted_lengths[active_indices] = t + 1
+            profile_start = profile_begin() if profile_enabled else 0.0
+            finished_by_chars = record_action_chars(selected)
+            finished_by_action_end = selected == action_end_token_id
+            if action_char_plateau_reject_eos_restart and has_restart_guard_tokens and not action_char_restart_continue:
+                finished_by_action_end = finished_by_action_end & ~plateau_tail_eos_restart[active_indices]
+            finished = finished_by_action_end | finished_by_chars
+            if profile_enabled:
+                profile_end("stop_checks", profile_start)
+            if bool(torch.all(finished)):
+                max_len = int(emitted_lengths.max().item())
+                append_action_end = bool(torch.any(finished_by_chars & ~finished_by_action_end).item())
+                return finish_return(max_len, append_action_end=append_action_end)
+            if bool(torch.any(finished)):
+                profile_start = profile_begin() if profile_enabled else 0.0
+                keep = torch.nonzero(~finished, as_tuple=False).flatten()
+                past_key_values = past_key_values.batch_select_indices(keep)
+                current_pad_mask = current_pad_mask[keep]
+                next_token = next_token[keep]
+                active_indices = active_indices[keep]
+                if profile_enabled:
+                    profile_end("row_compact", profile_start)
+
+        return finish_return(int(max_decoding_steps), append_action_end=False)
 
     @torch.no_grad()
     def sample_actions_fast_ngram_speculative(
@@ -1128,15 +2770,38 @@ class PI0FastTokenLogitAdapter:
         lookahead: int = 8,
         temperature: float = 0.0,
         reuse_full_blocks: bool = False,
+        min_verify_margin: float = 0.0,
         verify_from_scratch: bool = False,
+        emit_bonus_token: bool = False,
+        defer_correction_token: bool = False,
+        dynamic_lookahead: bool = False,
+        min_lookahead: int = 1,
+        lookahead_growth: int = 1,
+        lookahead_shrink: int = 4,
+        tree_width: int = 1,
+        tree_branch_width: int = 4,
+        dynamic_tree_width: bool = False,
+        min_tree_width: int = 1,
+        tree_width_growth: int = 1,
+        tree_width_shrink: int = 1,
+        tree_anchor_target_token: bool = False,
+        tree_anchor_target_continuation: bool = False,
         early_stop_action_end: bool = False,
+        replay_accepted_cache: bool = False,
+        resync_accepted_cache: bool = False,
+        diagnose_verify_alignment: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         """Greedy exact FAST-token decode with n-gram speculative verification.
 
         This is a conservative exact-SD path: accepted drafted tokens are added
         to the target KV cache, while mismatches fall back to the target token.
-        It does not emit the unprocessed bonus token, so the generated token
-        stream remains straightforward to reason about.
+        With ``emit_bonus_token`` enabled, a fully accepted block also emits the
+        verifier's next greedy token. That token is processed by the next
+        verify pass, matching standard greedy speculative decoding.
+        With ``defer_correction_token`` enabled, rejected-block correction
+        tokens use the same pending-token path instead of an immediate fallback
+        forward, so the next verifier pass can process the correction and draft
+        together.
         """
 
         if temperature != 0.0:
@@ -1146,6 +2811,9 @@ class PI0FastTokenLogitAdapter:
         bsize = tokens.shape[0]
         if bsize != 1:
             raise ValueError("ngram speculative PI0-FAST decode currently supports batch size 1")
+        if int(tree_width) > 1 and verify_from_scratch:
+            raise ValueError("PI0-FAST tree speculation requires cached verification; disable verify_from_scratch")
+        defer_correction_token = bool(defer_correction_token)
 
         device = tokens.device
         lm_head = self.model.paligemma_with_expert.paligemma.lm_head
@@ -1185,10 +2853,136 @@ class PI0FastTokenLogitAdapter:
         verify_forwards = 0
         fallback_forwards = 0
         replay_forwards = 0
+        resync_forwards = 0
         full_block_reuses = 0
+        margin_block_rejects = 0
+        verify_margin_checks = 0
+        verify_margin_min = float("inf")
+        verify_margin_sum = 0.0
+        bonus_tokens = 0
+        pending_verifies = 0
+        pending_corrections = 0
+        pending_processes = 0
+        pending_unprocessed_token: torch.Tensor | None = None
         drafted_tokens = 0
         accepted_tokens = 0
         debug_events: list[dict[str, Any]] = []
+        max_lookahead = max(1, int(lookahead))
+        current_lookahead = max_lookahead
+        min_dynamic_lookahead = max(1, min(int(min_lookahead), max_lookahead))
+        lookahead_values: list[int] = []
+        max_tree_width = max(1, int(tree_width))
+        current_tree_width = max(
+            1,
+            min(max_tree_width, int(min_tree_width) if dynamic_tree_width else max_tree_width),
+        )
+        tree_width_values: list[int] = []
+        max_tree_branch_width = max(1, int(tree_branch_width))
+        tree_verifies = 0
+        tree_candidates = 0
+        tree_accepted_tokens = 0
+        tree_anchor_verifies = 0
+        tree_anchor_candidates = 0
+        tree_anchor_accepted_tokens = 0
+        tree_first_token_checks = 0
+        tree_first_token_misses = 0
+        verify_alignment_blocks = 0
+        verify_alignment_checks = 0
+        verify_alignment_argmax_mismatches = 0
+        verify_alignment_blocks_with_mismatch = 0
+        verify_alignment_false_accepts = 0
+        verify_alignment_accept_disagreements = 0
+        verify_alignment_first_mismatch_min = float("inf")
+        verify_alignment_first_mismatch_sum = 0.0
+        verify_alignment_forwards = 0
+        verify_alignment_batched_accept_sum = 0
+        verify_alignment_step_accept_sum = 0
+        verify_alignment_correction_checks = 0
+        verify_alignment_correction_mismatches = 0
+        second_order_action_extrapolation_drafted_tokens = 0
+        second_order_action_extrapolation_accepted_tokens = 0
+        previous_chunk_position_drafted_tokens = 0
+        previous_chunk_position_accepted_tokens = 0
+        chunk_prefix_retrieval_drafted_tokens = 0
+        chunk_prefix_retrieval_accepted_tokens = 0
+        chunk_length_stop_drafted_tokens = 0
+        chunk_length_stop_accepted_tokens = 0
+        position_mode_histogram_drafted_tokens = 0
+        position_mode_histogram_accepted_tokens = 0
+        global_position_mode_drafted_tokens = 0
+        global_position_mode_accepted_tokens = 0
+        action_dimension_mode_drafted_tokens = 0
+        action_dimension_mode_accepted_tokens = 0
+        hold_action_token_drafted_tokens = 0
+        hold_action_token_accepted_tokens = 0
+        ngram_continuation_drafted_tokens = 0
+        ngram_continuation_accepted_tokens = 0
+        source_agreement_drafted_tokens = 0
+        source_agreement_accepted_tokens = 0
+        action_trend_regression_drafted_tokens = 0
+        action_trend_regression_accepted_tokens = 0
+        action_prefix_lookup_drafted_tokens = 0
+        action_prefix_lookup_accepted_tokens = 0
+        action_vector_transition_drafted_tokens = 0
+        action_vector_transition_accepted_tokens = 0
+        action_repeat_vector_drafted_tokens = 0
+        action_repeat_vector_accepted_tokens = 0
+        action_token_neighborhood_drafted_tokens = 0
+        action_token_neighborhood_accepted_tokens = 0
+        action_context_tree_drafted_tokens = 0
+        action_context_tree_accepted_tokens = 0
+        action_transition_histogram_drafted_tokens = 0
+        action_transition_histogram_accepted_tokens = 0
+        action_delta_histogram_drafted_tokens = 0
+        action_delta_histogram_accepted_tokens = 0
+        action_delta_ngram_drafted_tokens = 0
+        action_delta_ngram_accepted_tokens = 0
+        chunk_delta_template_drafted_tokens = 0
+        chunk_delta_template_accepted_tokens = 0
+        chunk_position_delta_drafted_tokens = 0
+        chunk_position_delta_accepted_tokens = 0
+
+        def source_count(sources: list[str], source: str, limit: int | None = None) -> int:
+            values = sources if limit is None else sources[: max(int(limit), 0)]
+            return sum(1 for value in values if value == source)
+
+        def last_draft_sources() -> list[str]:
+            if hasattr(drafter, "last_draft_sources"):
+                return [str(value) for value in drafter.last_draft_sources()]
+            return []
+
+        def last_many_sources() -> list[list[str]]:
+            if hasattr(drafter, "last_many_sources"):
+                return [[str(value) for value in row] for row in drafter.last_many_sources()]
+            return []
+
+        def record_source_feedback(sources: list[str], accepted: int) -> None:
+            if hasattr(drafter, "record_source_feedback"):
+                drafter.record_source_feedback(sources, accepted)
+
+        def record_source_miss() -> None:
+            if hasattr(drafter, "record_source_miss"):
+                drafter.record_source_miss()
+
+        def source_cooldown_stats() -> dict[str, Any]:
+            if hasattr(drafter, "source_cooldown_stats"):
+                return dict(drafter.source_cooldown_stats())
+            return {}
+
+        def update_dynamic_lookahead(*, accepted: int, drafted: int, miss: bool = False) -> None:
+            nonlocal current_lookahead
+            if not dynamic_lookahead:
+                return
+            if miss or accepted < drafted:
+                current_lookahead = max(
+                    min_dynamic_lookahead,
+                    current_lookahead - max(int(lookahead_shrink), 1),
+                )
+            else:
+                current_lookahead = min(
+                    max_lookahead,
+                    current_lookahead + max(int(lookahead_growth), 1),
+                )
 
         def advance_one(
             next_token: torch.Tensor,
@@ -1199,8 +2993,7 @@ class PI0FastTokenLogitAdapter:
             nonlocal current_pad_mask, past_key_values, target_forwards, fallback_forwards, replay_forwards
             logits_by_step.append(logits_for_token)
             generated_tokens.append(int(next_token.item()))
-            next_token_emb = self.model.paligemma_with_expert.embed_language_tokens(next_token)
-            next_token_emb = next_token_emb * math.sqrt(next_token_emb.shape[-1])
+            next_token_emb = self._embed_decode_language_tokens(next_token)
             next_token_emb = next_token_emb.to(dtype=prefix_embs.dtype)
             current_pad_mask = torch.cat(
                 [current_pad_mask, torch.ones((bsize, 1), dtype=torch.bool, device=device)],
@@ -1226,12 +3019,835 @@ class PI0FastTokenLogitAdapter:
                 replay_forwards += 1
             return lm_head(step_out[:, -1:, :])
 
+        def replay_one(next_token: torch.Tensor) -> torch.Tensor:
+            nonlocal current_pad_mask, past_key_values, target_forwards, replay_forwards
+            next_token_emb = self._embed_decode_language_tokens(next_token)
+            next_token_emb = next_token_emb.to(dtype=prefix_embs.dtype)
+            current_pad_mask = torch.cat(
+                [current_pad_mask, torch.ones((bsize, 1), dtype=torch.bool, device=device)],
+                dim=1,
+            )
+            current_position_ids = (torch.sum(current_pad_mask, dim=1, keepdim=True) - 1).long()
+            step_att_mask = self.model._prepare_attention_masks_4d(
+                current_pad_mask.unsqueeze(1),
+                dtype=next_token_emb.dtype,
+            )
+            (step_out, _), past_key_values = self._forward_prefix_language_model(
+                attention_mask=step_att_mask,
+                position_ids=current_position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=next_token_emb,
+                use_cache=True,
+                cache_position=torch.tensor([current_pad_mask.shape[1] - 1], device=device, dtype=torch.long),
+            )
+            target_forwards += 1
+            replay_forwards += 1
+            return lm_head(step_out[:, -1:, :])
+
+        def diagnostic_stepwise_logits(candidate_tokens: list[int], steps: int) -> torch.Tensor:
+            nonlocal verify_alignment_forwards
+            steps = max(int(steps), 1)
+            diag_past = clone_kv(past_key_values)
+            diag_pad = current_pad_mask.clone()
+            step_logits = [prev_logits.detach()]
+            for token in candidate_tokens[: steps - 1]:
+                token_tensor = torch.tensor([[int(token)]], dtype=torch.long, device=device)
+                token_emb = self._embed_decode_language_tokens(token_tensor)
+                token_emb = token_emb.to(dtype=prefix_embs.dtype)
+                diag_pad = torch.cat(
+                    [diag_pad, torch.ones((bsize, 1), dtype=torch.bool, device=device)],
+                    dim=1,
+                )
+                position_ids = (torch.sum(diag_pad, dim=1, keepdim=True) - 1).long()
+                att_mask = self.model._prepare_attention_masks_4d(
+                    diag_pad.unsqueeze(1),
+                    dtype=token_emb.dtype,
+                )
+                (step_out, _), diag_past = self._forward_prefix_language_model(
+                    attention_mask=att_mask,
+                    position_ids=position_ids,
+                    past_key_values=diag_past,
+                    inputs_embeds=token_emb,
+                    use_cache=True,
+                    cache_position=torch.tensor([diag_pad.shape[1] - 1], device=device, dtype=torch.long),
+                )
+                verify_alignment_forwards += 1
+                step_logits.append(lm_head(step_out[:, -1:, :]).detach())
+            return torch.cat(step_logits, dim=1)
+
+        def process_pending_one() -> torch.Tensor:
+            nonlocal pending_unprocessed_token, current_pad_mask, past_key_values
+            nonlocal target_forwards, fallback_forwards, pending_processes
+            if pending_unprocessed_token is None:
+                raise RuntimeError("No pending token to process")
+            token = pending_unprocessed_token
+            token_emb = self._embed_decode_language_tokens(token)
+            token_emb = token_emb.to(dtype=prefix_embs.dtype)
+            current_pad_mask = torch.cat(
+                [current_pad_mask, torch.ones((bsize, 1), dtype=torch.bool, device=device)],
+                dim=1,
+            )
+            current_position_ids = (torch.sum(current_pad_mask, dim=1, keepdim=True) - 1).long()
+            step_att_mask = self.model._prepare_attention_masks_4d(
+                current_pad_mask.unsqueeze(1),
+                dtype=token_emb.dtype,
+            )
+            (step_out, _), past_key_values = self._forward_prefix_language_model(
+                attention_mask=step_att_mask,
+                position_ids=current_position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=token_emb,
+                use_cache=True,
+                cache_position=torch.tensor([current_pad_mask.shape[1] - 1], device=device, dtype=torch.long),
+            )
+            pending_unprocessed_token = None
+            pending_processes += 1
+            target_forwards += 1
+            fallback_forwards += 1
+            return lm_head(step_out[:, -1:, :])
+
+        def resync_from_generated() -> torch.Tensor:
+            nonlocal current_pad_mask, past_key_values, target_forwards, resync_forwards
+            if not generated_tokens:
+                raise RuntimeError("Cannot resync pattern_sd cache before any generated token")
+            full_fast_tokens = torch.tensor([generated_tokens], dtype=torch.long, device=device)
+            full_fast_masks = torch.ones_like(full_fast_tokens, dtype=torch.bool)
+            full_embs, full_pad_masks, full_att_masks, _total_t_images, _num_fast_embs = self.model.embed_prefix_fast(
+                images,
+                img_masks,
+                tokens,
+                masks,
+                fast_action_tokens=full_fast_tokens,
+                fast_action_masks=full_fast_masks,
+            )
+            full_embs = self._match_model_precision(full_embs)
+            full_position_ids = torch.cumsum(full_pad_masks, dim=1) - 1
+            full_att_4d = self.model._prepare_attention_masks_4d(full_att_masks, dtype=full_embs.dtype)
+            (full_out, _), past_key_values = self._forward_prefix_language_model(
+                attention_mask=full_att_4d,
+                position_ids=full_position_ids,
+                past_key_values=None,
+                inputs_embeds=full_embs,
+                use_cache=True,
+                cache_position=torch.arange(full_embs.shape[1], device=device, dtype=torch.long),
+            )
+            current_pad_mask = full_pad_masks
+            target_forwards += 1
+            resync_forwards += 1
+            return lm_head(full_out[:, -1:, :])
+
+        def verify_candidate_batch(
+            candidate_rows: list[list[int]],
+            *,
+            prepend_prev_logits: bool,
+        ) -> tuple[torch.Tensor, Any, torch.Tensor, list[int]]:
+            nonlocal target_forwards, verify_forwards, tree_verifies, tree_candidates
+            if not candidate_rows:
+                raise ValueError("verify_candidate_batch requires at least one candidate")
+            lengths = [len(row) for row in candidate_rows]
+            max_len = max(lengths)
+            batch_candidates = len(candidate_rows)
+            padded_rows = [row + [row[-1]] * (max_len - len(row)) for row in candidate_rows]
+            candidate_tensor = torch.tensor(padded_rows, dtype=torch.long, device=device)
+            old_mask_len = current_pad_mask.shape[1]
+            verify_past_key_values = repeat_kv_batch(past_key_values, batch_candidates)
+            candidate_embs = self._embed_decode_language_tokens(candidate_tensor)
+            candidate_embs = candidate_embs.to(dtype=prefix_embs.dtype)
+            verify_pad_mask = torch.cat(
+                [
+                    current_pad_mask.repeat(batch_candidates, 1),
+                    torch.ones((batch_candidates, max_len), dtype=torch.bool, device=device),
+                ],
+                dim=1,
+            )
+            verify_mask = torch.zeros(
+                (batch_candidates, max_len, old_mask_len + max_len),
+                dtype=torch.bool,
+                device=device,
+            )
+            for row in range(max_len):
+                verify_mask[:, row, : old_mask_len + row + 1] = verify_pad_mask[:, : old_mask_len + row + 1]
+            verify_att_mask = self.model._prepare_attention_masks_4d(verify_mask, dtype=candidate_embs.dtype)
+            position_start = int(torch.sum(current_pad_mask, dim=1).item())
+            verify_position_ids = torch.arange(
+                position_start,
+                position_start + max_len,
+                device=device,
+                dtype=torch.long,
+            ).unsqueeze(0).repeat(batch_candidates, 1)
+            (verify_out, _), verify_kv = self._forward_prefix_language_model(
+                attention_mask=verify_att_mask,
+                position_ids=verify_position_ids,
+                past_key_values=verify_past_key_values,
+                inputs_embeds=candidate_embs,
+                use_cache=True,
+                cache_position=verify_position_ids[0],
+            )
+            verify_logits = lm_head(verify_out)
+            target_forwards += 1
+            verify_forwards += 1
+            tree_verifies += 1
+            tree_candidates += batch_candidates
+            if prepend_prev_logits:
+                return torch.cat([prev_logits.repeat(batch_candidates, 1, 1), verify_logits], dim=1), verify_kv, verify_pad_mask, lengths
+            return verify_logits, verify_kv, verify_pad_mask, lengths
+
+        if hasattr(drafter, "reset_source_feedback"):
+            drafter.reset_source_feedback()
+
         while len(generated_tokens) < max_decoding_steps:
             remaining = max_decoding_steps - len(generated_tokens)
+            block_lookahead = current_lookahead if dynamic_lookahead else max_lookahead
+            block_lookahead = max(1, min(int(block_lookahead), remaining))
+            lookahead_values.append(block_lookahead)
+            block_tree_width = current_tree_width if dynamic_tree_width else max_tree_width
+            block_tree_width = max(1, min(max_tree_width, int(block_tree_width)))
+            tree_width_values.append(block_tree_width)
+            if pending_unprocessed_token is not None:
+                if action_end_token_id is not None and int(pending_unprocessed_token.item()) == action_end_token_id:
+                    break
+                if block_tree_width > 1 and hasattr(drafter, "draft_many"):
+                    raw_future_rows = drafter.draft_many(
+                        generated_tokens,
+                        lookahead=block_lookahead,
+                        max_candidates=block_tree_width,
+                        branch_width=max_tree_branch_width,
+                    )
+                    raw_future_sources = last_many_sources()
+                    future_rows: list[list[int]] = []
+                    future_sources: list[list[str]] = []
+                    for row_idx, row in enumerate(raw_future_rows):
+                        if not row:
+                            continue
+                        future_rows.append([int(token) for token in row[:remaining]])
+                        sources = raw_future_sources[row_idx] if row_idx < len(raw_future_sources) else []
+                        future_sources.append(sources[: len(future_rows[-1])])
+                    if not future_rows:
+                        update_dynamic_lookahead(accepted=0, drafted=0, miss=True)
+                        if dynamic_tree_width:
+                            current_tree_width = max(
+                                1,
+                                current_tree_width - max(int(tree_width_shrink), 1),
+                            )
+                        record_source_miss()
+                        prev_logits = process_pending_one()
+                        continue
+
+                    pending_value = int(pending_unprocessed_token.item())
+                    candidate_rows = [[pending_value, *future] for future in future_rows]
+                    drafted_tokens += sum(len(future) for future in future_rows)
+                    second_order_action_extrapolation_drafted_tokens += sum(
+                        source_count(sources, "second_order_action_extrapolation")
+                        for sources in future_sources
+                    )
+                    previous_chunk_position_drafted_tokens += sum(
+                        source_count(sources, "previous_chunk_position") for sources in future_sources
+                    )
+                    chunk_prefix_retrieval_drafted_tokens += sum(
+                        source_count(sources, "chunk_prefix_retrieval") for sources in future_sources
+                    )
+                    chunk_length_stop_drafted_tokens += sum(
+                        source_count(sources, "chunk_length_stop") for sources in future_sources
+                    )
+                    position_mode_histogram_drafted_tokens += sum(
+                        source_count(sources, "position_mode_histogram") for sources in future_sources
+                    )
+                    global_position_mode_drafted_tokens += sum(
+                        source_count(sources, "global_position_mode") for sources in future_sources
+                    )
+                    action_dimension_mode_drafted_tokens += sum(
+                        source_count(sources, "action_dimension_mode") for sources in future_sources
+                    )
+                    hold_action_token_drafted_tokens += sum(
+                        source_count(sources, "hold_action_token") for sources in future_sources
+                    )
+                    ngram_continuation_drafted_tokens += sum(
+                        source_count(sources, "ngram_continuation") for sources in future_sources
+                    )
+                    source_agreement_drafted_tokens += sum(
+                        source_count(sources, "source_agreement") for sources in future_sources
+                    )
+                    action_trend_regression_drafted_tokens += sum(
+                        source_count(sources, "action_trend_regression") for sources in future_sources
+                    )
+                    action_prefix_lookup_drafted_tokens += sum(
+                        source_count(sources, "action_prefix_lookup") for sources in future_sources
+                    )
+                    action_vector_transition_drafted_tokens += sum(
+                        source_count(sources, "action_vector_transition") for sources in future_sources
+                    )
+                    action_repeat_vector_drafted_tokens += sum(
+                        source_count(sources, "action_repeat_vector") for sources in future_sources
+                    )
+                    action_token_neighborhood_drafted_tokens += sum(
+                        source_count(sources, "action_token_neighborhood") for sources in future_sources
+                    )
+                    action_context_tree_drafted_tokens += sum(
+                        source_count(sources, "action_context_tree") for sources in future_sources
+                    )
+                    action_transition_histogram_drafted_tokens += sum(
+                        source_count(sources, "action_transition_histogram") for sources in future_sources
+                    )
+                    action_delta_histogram_drafted_tokens += sum(
+                        source_count(sources, "action_delta_histogram") for sources in future_sources
+                    )
+                    action_delta_ngram_drafted_tokens += sum(
+                        source_count(sources, "action_delta_ngram") for sources in future_sources
+                    )
+                    chunk_position_delta_drafted_tokens += sum(
+                        source_count(sources, "chunk_position_delta") for sources in future_sources
+                    )
+                    chunk_delta_template_drafted_tokens += sum(
+                        source_count(sources, "chunk_delta_template") for sources in future_sources
+                    )
+                    old_mask_len = current_pad_mask.shape[1]
+                    future_logits_all, verify_kv, verify_pad_mask, _candidate_lengths = verify_candidate_batch(
+                        candidate_rows,
+                        prepend_prev_logits=False,
+                    )
+                    pending_verifies += 1
+
+                    best_idx = 0
+                    future_accepted = -1
+                    for row_idx, future_candidate in enumerate(future_rows):
+                        accepted = 0
+                        for idx, token in enumerate(future_candidate):
+                            predicted_future = int(
+                                torch.argmax(
+                                    future_logits_all[row_idx : row_idx + 1, idx : idx + 1, :][:, -1],
+                                    dim=-1,
+                                ).item()
+                            )
+                            if predicted_future != int(token):
+                                break
+                            accepted += 1
+                        if accepted > future_accepted:
+                            best_idx = row_idx
+                            future_accepted = accepted
+                            if accepted == len(future_candidate):
+                                break
+
+                    future = future_rows[best_idx]
+                    future_logits_all = future_logits_all[best_idx : best_idx + 1]
+                    verify_kv = select_kv_batch(verify_kv, best_idx)
+                    verify_pad_mask = verify_pad_mask[best_idx : best_idx + 1]
+                    future_accepted = max(future_accepted, 0)
+                    if len(debug_events) < 64:
+                        debug_events.append(
+                            {
+                                "pos": len(generated_tokens),
+                                "kind": "pending_tree_verify",
+                                "candidates": len(future_rows),
+                                "future_len": len(future),
+                                "accepted": future_accepted,
+                            }
+                        )
+                    accepted_emit = future_accepted
+                    if action_end_token_id is not None:
+                        for idx in range(future_accepted):
+                            if int(future[idx]) == action_end_token_id:
+                                accepted_emit = idx + 1
+                                break
+                    for idx in range(accepted_emit):
+                        logits_for_token = future_logits_all[:, idx : idx + 1, :]
+                        logits_by_step.append(logits_for_token)
+                        generated_tokens.append(int(future[idx]))
+                    accepted_tokens += accepted_emit
+                    tree_accepted_tokens += accepted_emit
+                    if best_idx < len(future_sources):
+                        record_source_feedback(future_sources[best_idx], future_accepted)
+                        second_order_action_extrapolation_accepted_tokens += source_count(
+                            future_sources[best_idx],
+                            "second_order_action_extrapolation",
+                            accepted_emit,
+                        )
+                        previous_chunk_position_accepted_tokens += source_count(
+                            future_sources[best_idx],
+                            "previous_chunk_position",
+                            accepted_emit,
+                        )
+                        chunk_prefix_retrieval_accepted_tokens += source_count(
+                            future_sources[best_idx],
+                            "chunk_prefix_retrieval",
+                            accepted_emit,
+                        )
+                        chunk_length_stop_accepted_tokens += source_count(
+                            future_sources[best_idx],
+                            "chunk_length_stop",
+                            accepted_emit,
+                        )
+                        position_mode_histogram_accepted_tokens += source_count(
+                            future_sources[best_idx],
+                            "position_mode_histogram",
+                            accepted_emit,
+                        )
+                        global_position_mode_accepted_tokens += source_count(
+                            future_sources[best_idx],
+                            "global_position_mode",
+                            accepted_emit,
+                        )
+                        action_dimension_mode_accepted_tokens += source_count(
+                            future_sources[best_idx],
+                            "action_dimension_mode",
+                            accepted_emit,
+                        )
+                        hold_action_token_accepted_tokens += source_count(
+                            future_sources[best_idx],
+                            "hold_action_token",
+                            accepted_emit,
+                        )
+                        ngram_continuation_accepted_tokens += source_count(
+                            future_sources[best_idx],
+                            "ngram_continuation",
+                            accepted_emit,
+                        )
+                        source_agreement_accepted_tokens += source_count(
+                            future_sources[best_idx],
+                            "source_agreement",
+                            accepted_emit,
+                        )
+                        action_trend_regression_accepted_tokens += source_count(
+                            future_sources[best_idx],
+                            "action_trend_regression",
+                            accepted_emit,
+                        )
+                        action_prefix_lookup_accepted_tokens += source_count(
+                            future_sources[best_idx],
+                            "action_prefix_lookup",
+                            accepted_emit,
+                        )
+                        action_vector_transition_accepted_tokens += source_count(
+                            future_sources[best_idx],
+                            "action_vector_transition",
+                            accepted_emit,
+                        )
+                        action_repeat_vector_accepted_tokens += source_count(
+                            future_sources[best_idx],
+                            "action_repeat_vector",
+                            accepted_emit,
+                        )
+                        action_token_neighborhood_accepted_tokens += source_count(
+                            future_sources[best_idx],
+                            "action_token_neighborhood",
+                            accepted_emit,
+                        )
+                        action_context_tree_accepted_tokens += source_count(
+                            future_sources[best_idx],
+                            "action_context_tree",
+                            accepted_emit,
+                        )
+                        action_transition_histogram_accepted_tokens += source_count(
+                            future_sources[best_idx],
+                            "action_transition_histogram",
+                            accepted_emit,
+                        )
+                        action_delta_histogram_accepted_tokens += source_count(
+                            future_sources[best_idx],
+                            "action_delta_histogram",
+                            accepted_emit,
+                        )
+                        action_delta_ngram_accepted_tokens += source_count(
+                            future_sources[best_idx],
+                            "action_delta_ngram",
+                            accepted_emit,
+                        )
+                        chunk_position_delta_accepted_tokens += source_count(
+                            future_sources[best_idx],
+                            "chunk_position_delta",
+                            accepted_emit,
+                        )
+                        chunk_delta_template_accepted_tokens += source_count(
+                            future_sources[best_idx],
+                            "chunk_delta_template",
+                            accepted_emit,
+                        )
+                    else:
+                        record_source_miss()
+                    update_dynamic_lookahead(accepted=future_accepted, drafted=len(future))
+                    if dynamic_tree_width:
+                        if future_accepted == len(future):
+                            current_tree_width = min(
+                                max_tree_width,
+                                current_tree_width + max(int(tree_width_growth), 1),
+                            )
+                        else:
+                            current_tree_width = max(
+                                1,
+                                current_tree_width - max(int(tree_width_shrink), 1),
+                            )
+
+                    keep_len = old_mask_len + 1 + accepted_emit
+                    past_key_values = trim_kv(verify_kv, keep_len)
+                    current_pad_mask = verify_pad_mask[:, :keep_len].contiguous()
+                    pending_unprocessed_token = None
+
+                    if len(generated_tokens) >= max_decoding_steps:
+                        break
+                    if action_end_token_id is not None and generated_tokens and generated_tokens[-1] == action_end_token_id:
+                        break
+                    if future_accepted == len(future):
+                        full_block_reuses += 1
+                        bonus_logits = future_logits_all[:, len(future) : len(future) + 1, :]
+                        if emit_bonus_token and bonus_logits.shape[1] == 1 and len(generated_tokens) < max_decoding_steps:
+                            bonus_token = torch.argmax(bonus_logits[:, -1], dim=-1, keepdim=True)
+                            logits_by_step.append(bonus_logits)
+                            generated_tokens.append(int(bonus_token.item()))
+                            bonus_tokens += 1
+                            pending_unprocessed_token = bonus_token
+                            prev_logits = bonus_logits
+                            if action_end_token_id is not None and int(bonus_token.item()) == action_end_token_id:
+                                break
+                        else:
+                            prev_logits = bonus_logits
+                    else:
+                        correction_logits = future_logits_all[:, future_accepted : future_accepted + 1, :]
+                        correction_token = torch.argmax(correction_logits[:, -1], dim=-1, keepdim=True)
+                        logits_by_step.append(correction_logits)
+                        generated_tokens.append(int(correction_token.item()))
+                        pending_corrections += 1
+                        pending_unprocessed_token = correction_token
+                        prev_logits = correction_logits
+                        if action_end_token_id is not None and int(correction_token.item()) == action_end_token_id:
+                            break
+                    continue
+                future = drafter.draft(generated_tokens, lookahead=block_lookahead)
+                future_sources = last_draft_sources()
+                future = future[:remaining]
+                future_sources = future_sources[: len(future)]
+                if not future:
+                    update_dynamic_lookahead(accepted=0, drafted=0, miss=True)
+                    record_source_miss()
+                    prev_logits = process_pending_one()
+                    continue
+
+                candidate = [int(pending_unprocessed_token.item()), *[int(token) for token in future]]
+                candidate_tensor = torch.tensor([candidate], dtype=torch.long, device=device)
+                drafted_tokens += len(future)
+                second_order_action_extrapolation_drafted_tokens += source_count(
+                    future_sources,
+                    "second_order_action_extrapolation",
+                )
+                previous_chunk_position_drafted_tokens += source_count(
+                    future_sources,
+                    "previous_chunk_position",
+                )
+                chunk_prefix_retrieval_drafted_tokens += source_count(
+                    future_sources,
+                    "chunk_prefix_retrieval",
+                )
+                chunk_length_stop_drafted_tokens += source_count(
+                    future_sources,
+                    "chunk_length_stop",
+                )
+                position_mode_histogram_drafted_tokens += source_count(
+                    future_sources,
+                    "position_mode_histogram",
+                )
+                global_position_mode_drafted_tokens += source_count(
+                    future_sources,
+                    "global_position_mode",
+                )
+                action_dimension_mode_drafted_tokens += source_count(
+                    future_sources,
+                    "action_dimension_mode",
+                )
+                hold_action_token_drafted_tokens += source_count(
+                    future_sources,
+                    "hold_action_token",
+                )
+                ngram_continuation_drafted_tokens += source_count(
+                    future_sources,
+                    "ngram_continuation",
+                )
+                source_agreement_drafted_tokens += source_count(
+                    future_sources,
+                    "source_agreement",
+                )
+                action_trend_regression_drafted_tokens += source_count(
+                    future_sources,
+                    "action_trend_regression",
+                )
+                action_prefix_lookup_drafted_tokens += source_count(
+                    future_sources,
+                    "action_prefix_lookup",
+                )
+                action_vector_transition_drafted_tokens += source_count(
+                    future_sources,
+                    "action_vector_transition",
+                )
+                action_repeat_vector_drafted_tokens += source_count(
+                    future_sources,
+                    "action_repeat_vector",
+                )
+                action_token_neighborhood_drafted_tokens += source_count(
+                    future_sources,
+                    "action_token_neighborhood",
+                )
+                action_context_tree_drafted_tokens += source_count(
+                    future_sources,
+                    "action_context_tree",
+                )
+                action_transition_histogram_drafted_tokens += source_count(
+                    future_sources,
+                    "action_transition_histogram",
+                )
+                action_delta_histogram_drafted_tokens += source_count(
+                    future_sources,
+                    "action_delta_histogram",
+                )
+                action_delta_ngram_drafted_tokens += source_count(
+                    future_sources,
+                    "action_delta_ngram",
+                )
+                chunk_position_delta_drafted_tokens += source_count(
+                    future_sources,
+                    "chunk_position_delta",
+                )
+                chunk_delta_template_drafted_tokens += source_count(
+                    future_sources,
+                    "chunk_delta_template",
+                )
+                old_mask_len = current_pad_mask.shape[1]
+                if verify_from_scratch:
+                    full_fast_tokens = torch.tensor(
+                        [generated_tokens + [int(token) for token in future]],
+                        dtype=torch.long,
+                        device=device,
+                    )
+                    full_fast_masks = torch.ones_like(full_fast_tokens, dtype=torch.bool)
+                    full_embs, full_pad_masks, full_att_masks, _total_t_images, num_fast_embs = self.model.embed_prefix_fast(
+                        images,
+                        img_masks,
+                        tokens,
+                        masks,
+                        fast_action_tokens=full_fast_tokens,
+                        fast_action_masks=full_fast_masks,
+                    )
+                    full_embs = self._match_model_precision(full_embs)
+                    full_position_ids = torch.cumsum(full_pad_masks, dim=1) - 1
+                    full_att_4d = self.model._prepare_attention_masks_4d(full_att_masks, dtype=full_embs.dtype)
+                    (verify_out, _), verify_kv = self._forward_prefix_language_model(
+                        attention_mask=full_att_4d,
+                        position_ids=full_position_ids,
+                        past_key_values=None,
+                        inputs_embeds=full_embs,
+                        use_cache=True,
+                        cache_position=torch.arange(full_embs.shape[1], device=device, dtype=torch.long),
+                    )
+                    bos_hidden_idx = verify_out.shape[1] - num_fast_embs - 1
+                    start = bos_hidden_idx + len(generated_tokens)
+                    future_logits_all = lm_head(verify_out[:, start : start + len(future) + 1, :])
+                    verify_pad_mask = full_pad_masks
+                else:
+                    verify_past_key_values = clone_kv(past_key_values)
+                    candidate_embs = self._embed_decode_language_tokens(candidate_tensor)
+                    candidate_embs = candidate_embs.to(dtype=prefix_embs.dtype)
+                    verify_pad_mask = torch.cat(
+                        [current_pad_mask, torch.ones((bsize, len(candidate)), dtype=torch.bool, device=device)],
+                        dim=1,
+                    )
+                    verify_mask = torch.zeros(
+                        (bsize, len(candidate), old_mask_len + len(candidate)),
+                        dtype=torch.bool,
+                        device=device,
+                    )
+                    for row in range(len(candidate)):
+                        verify_mask[:, row, : old_mask_len + row + 1] = verify_pad_mask[:, : old_mask_len + row + 1]
+                    verify_att_mask = self.model._prepare_attention_masks_4d(verify_mask, dtype=candidate_embs.dtype)
+                    position_start = int(torch.sum(current_pad_mask, dim=1).item())
+                    verify_position_ids = torch.arange(
+                        position_start,
+                        position_start + len(candidate),
+                        device=device,
+                        dtype=torch.long,
+                    ).unsqueeze(0)
+                    (verify_out, _), verify_kv = self._forward_prefix_language_model(
+                        attention_mask=verify_att_mask,
+                        position_ids=verify_position_ids,
+                        past_key_values=verify_past_key_values,
+                        inputs_embeds=candidate_embs,
+                        use_cache=True,
+                        cache_position=verify_position_ids.squeeze(0),
+                    )
+                    future_logits_all = lm_head(verify_out)
+                target_forwards += 1
+                verify_forwards += 1
+                pending_verifies += 1
+
+                future_accepted = 0
+                for idx, token in enumerate(future):
+                    predicted_future = int(torch.argmax(future_logits_all[:, idx : idx + 1, :][:, -1], dim=-1).item())
+                    if predicted_future != int(token):
+                        break
+                    future_accepted += 1
+                if len(debug_events) < 64:
+                    debug_events.append(
+                        {
+                            "pos": len(generated_tokens),
+                            "kind": "pending_verify",
+                            "future_len": len(future),
+                            "accepted": future_accepted,
+                        }
+                    )
+                accepted_emit = future_accepted
+                if action_end_token_id is not None:
+                    for idx in range(future_accepted):
+                        if int(future[idx]) == action_end_token_id:
+                            accepted_emit = idx + 1
+                            break
+                for idx in range(accepted_emit):
+                    logits_for_token = future_logits_all[:, idx : idx + 1, :]
+                    logits_by_step.append(logits_for_token)
+                    generated_tokens.append(int(future[idx]))
+                accepted_tokens += accepted_emit
+                record_source_feedback(future_sources, future_accepted)
+                second_order_action_extrapolation_accepted_tokens += source_count(
+                    future_sources,
+                    "second_order_action_extrapolation",
+                    accepted_emit,
+                )
+                previous_chunk_position_accepted_tokens += source_count(
+                    future_sources,
+                    "previous_chunk_position",
+                    accepted_emit,
+                )
+                chunk_prefix_retrieval_accepted_tokens += source_count(
+                    future_sources,
+                    "chunk_prefix_retrieval",
+                    accepted_emit,
+                )
+                chunk_length_stop_accepted_tokens += source_count(
+                    future_sources,
+                    "chunk_length_stop",
+                    accepted_emit,
+                )
+                position_mode_histogram_accepted_tokens += source_count(
+                    future_sources,
+                    "position_mode_histogram",
+                    accepted_emit,
+                )
+                global_position_mode_accepted_tokens += source_count(
+                    future_sources,
+                    "global_position_mode",
+                    accepted_emit,
+                )
+                action_dimension_mode_accepted_tokens += source_count(
+                    future_sources,
+                    "action_dimension_mode",
+                    accepted_emit,
+                )
+                hold_action_token_accepted_tokens += source_count(
+                    future_sources,
+                    "hold_action_token",
+                    accepted_emit,
+                )
+                ngram_continuation_accepted_tokens += source_count(
+                    future_sources,
+                    "ngram_continuation",
+                    accepted_emit,
+                )
+                source_agreement_accepted_tokens += source_count(
+                    future_sources,
+                    "source_agreement",
+                    accepted_emit,
+                )
+                action_trend_regression_accepted_tokens += source_count(
+                    future_sources,
+                    "action_trend_regression",
+                    accepted_emit,
+                )
+                action_prefix_lookup_accepted_tokens += source_count(
+                    future_sources,
+                    "action_prefix_lookup",
+                    accepted_emit,
+                )
+                action_vector_transition_accepted_tokens += source_count(
+                    future_sources,
+                    "action_vector_transition",
+                    accepted_emit,
+                )
+                action_repeat_vector_accepted_tokens += source_count(
+                    future_sources,
+                    "action_repeat_vector",
+                    accepted_emit,
+                )
+                action_token_neighborhood_accepted_tokens += source_count(
+                    future_sources,
+                    "action_token_neighborhood",
+                    accepted_emit,
+                )
+                action_context_tree_accepted_tokens += source_count(
+                    future_sources,
+                    "action_context_tree",
+                    accepted_emit,
+                )
+                action_transition_histogram_accepted_tokens += source_count(
+                    future_sources,
+                    "action_transition_histogram",
+                    accepted_emit,
+                )
+                action_delta_histogram_accepted_tokens += source_count(
+                    future_sources,
+                    "action_delta_histogram",
+                    accepted_emit,
+                )
+                action_delta_ngram_accepted_tokens += source_count(
+                    future_sources,
+                    "action_delta_ngram",
+                    accepted_emit,
+                )
+                chunk_position_delta_accepted_tokens += source_count(
+                    future_sources,
+                    "chunk_position_delta",
+                    accepted_emit,
+                )
+                chunk_delta_template_accepted_tokens += source_count(
+                    future_sources,
+                    "chunk_delta_template",
+                    accepted_emit,
+                )
+                update_dynamic_lookahead(accepted=future_accepted, drafted=len(future))
+
+                keep_len = old_mask_len + 1 + accepted_emit
+                past_key_values = trim_kv(verify_kv, keep_len)
+                current_pad_mask = verify_pad_mask[:, :keep_len].contiguous()
+                pending_unprocessed_token = None
+
+                if len(generated_tokens) >= max_decoding_steps:
+                    break
+                if action_end_token_id is not None and generated_tokens and generated_tokens[-1] == action_end_token_id:
+                    break
+                if future_accepted == len(future):
+                    full_block_reuses += 1
+                    bonus_logits = future_logits_all[:, len(future) : len(future) + 1, :]
+                    if emit_bonus_token and bonus_logits.shape[1] == 1 and len(generated_tokens) < max_decoding_steps:
+                        bonus_token = torch.argmax(bonus_logits[:, -1], dim=-1, keepdim=True)
+                        logits_by_step.append(bonus_logits)
+                        generated_tokens.append(int(bonus_token.item()))
+                        bonus_tokens += 1
+                        pending_unprocessed_token = bonus_token
+                        prev_logits = bonus_logits
+                        if action_end_token_id is not None and int(bonus_token.item()) == action_end_token_id:
+                            break
+                    else:
+                        prev_logits = bonus_logits
+                else:
+                    correction_logits = future_logits_all[:, future_accepted : future_accepted + 1, :]
+                    correction_token = torch.argmax(correction_logits[:, -1], dim=-1, keepdim=True)
+                    logits_by_step.append(correction_logits)
+                    generated_tokens.append(int(correction_token.item()))
+                    pending_corrections += 1
+                    pending_unprocessed_token = correction_token
+                    prev_logits = correction_logits
+                    if action_end_token_id is not None and int(correction_token.item()) == action_end_token_id:
+                        break
+                continue
+
             target_next = torch.argmax(prev_logits[:, -1], dim=-1, keepdim=True)
             if action_end_token_id is not None and int(target_next.item()) == action_end_token_id:
                 logits_by_step.append(prev_logits)
                 generated_tokens.append(int(target_next.item()))
+                pending_unprocessed_token = target_next
                 if len(debug_events) < 64:
                     debug_events.append(
                         {
@@ -1239,9 +3855,707 @@ class PI0FastTokenLogitAdapter:
                             "kind": "action_end",
                             "token": int(target_next.item()),
                         }
-                    )
+                )
                 break
-            draft = drafter.draft(generated_tokens, lookahead=min(lookahead, remaining))
+            if block_tree_width > 1 and hasattr(drafter, "draft_many"):
+                target_token_value = int(target_next.item())
+                force_anchor = bool(
+                    tree_anchor_target_continuation and remaining > 1 and block_lookahead > 1
+                )
+                if force_anchor:
+                    raw_draft_rows = [[target_token_value + 1]]
+                    raw_draft_sources = [[]]
+                else:
+                    raw_draft_rows = drafter.draft_many(
+                        generated_tokens,
+                        lookahead=block_lookahead,
+                        max_candidates=block_tree_width,
+                        branch_width=max_tree_branch_width,
+                    )
+                    raw_draft_sources = last_many_sources()
+                if raw_draft_rows and not force_anchor:
+                    tree_first_token_checks += 1
+                draft_rows: list[list[int]] = []
+                draft_sources: list[list[str]] = []
+                for row_idx, row in enumerate(raw_draft_rows):
+                    if not row or int(row[0]) != target_token_value:
+                        continue
+                    draft_rows.append([int(token) for token in row[:remaining]])
+                    sources = raw_draft_sources[row_idx] if row_idx < len(raw_draft_sources) else []
+                    draft_sources.append(sources[: len(draft_rows[-1])])
+                if not draft_rows:
+                    if raw_draft_rows and not force_anchor:
+                        tree_first_token_misses += 1
+                    if (
+                        (tree_anchor_target_token or force_anchor)
+                        and raw_draft_rows
+                        and remaining > 1
+                        and block_lookahead > 1
+                    ):
+                        anchor_lookahead = max(1, min(block_lookahead - 1, remaining - 1))
+                        anchor_prefix = [*generated_tokens, target_token_value]
+                        raw_anchor_rows = drafter.draft_many(
+                            anchor_prefix,
+                            lookahead=anchor_lookahead,
+                            max_candidates=block_tree_width,
+                            branch_width=max_tree_branch_width,
+                        )
+                        raw_anchor_sources = last_many_sources()
+                        anchor_future_rows: list[list[int]] = []
+                        anchor_future_sources: list[list[str]] = []
+                        for row_idx, row in enumerate(raw_anchor_rows):
+                            future = [int(token) for token in row[: remaining - 1]]
+                            if not future:
+                                continue
+                            anchor_future_rows.append(future)
+                            sources = raw_anchor_sources[row_idx] if row_idx < len(raw_anchor_sources) else []
+                            anchor_future_sources.append(sources[: len(future)])
+                        if anchor_future_rows:
+                            if raw_draft_sources:
+                                record_source_feedback(raw_draft_sources[0], 0)
+                            drafted_tokens += sum(len(row) for row in anchor_future_rows)
+                            second_order_action_extrapolation_drafted_tokens += sum(
+                                source_count(sources, "second_order_action_extrapolation")
+                                for sources in anchor_future_sources
+                            )
+                            previous_chunk_position_drafted_tokens += sum(
+                                source_count(sources, "previous_chunk_position")
+                                for sources in anchor_future_sources
+                            )
+                            chunk_prefix_retrieval_drafted_tokens += sum(
+                                source_count(sources, "chunk_prefix_retrieval")
+                                for sources in anchor_future_sources
+                            )
+                            chunk_length_stop_drafted_tokens += sum(
+                                source_count(sources, "chunk_length_stop")
+                                for sources in anchor_future_sources
+                            )
+                            position_mode_histogram_drafted_tokens += sum(
+                                source_count(sources, "position_mode_histogram")
+                                for sources in anchor_future_sources
+                            )
+                            global_position_mode_drafted_tokens += sum(
+                                source_count(sources, "global_position_mode")
+                                for sources in anchor_future_sources
+                            )
+                            action_dimension_mode_drafted_tokens += sum(
+                                source_count(sources, "action_dimension_mode")
+                                for sources in anchor_future_sources
+                            )
+                            hold_action_token_drafted_tokens += sum(
+                                source_count(sources, "hold_action_token") for sources in anchor_future_sources
+                            )
+                            ngram_continuation_drafted_tokens += sum(
+                                source_count(sources, "ngram_continuation") for sources in anchor_future_sources
+                            )
+                            source_agreement_drafted_tokens += sum(
+                                source_count(sources, "source_agreement") for sources in anchor_future_sources
+                            )
+                            action_trend_regression_drafted_tokens += sum(
+                                source_count(sources, "action_trend_regression")
+                                for sources in anchor_future_sources
+                            )
+                            action_prefix_lookup_drafted_tokens += sum(
+                                source_count(sources, "action_prefix_lookup")
+                                for sources in anchor_future_sources
+                            )
+                            action_vector_transition_drafted_tokens += sum(
+                                source_count(sources, "action_vector_transition")
+                                for sources in anchor_future_sources
+                            )
+                            action_repeat_vector_drafted_tokens += sum(
+                                source_count(sources, "action_repeat_vector")
+                                for sources in anchor_future_sources
+                            )
+                            action_token_neighborhood_drafted_tokens += sum(
+                                source_count(sources, "action_token_neighborhood")
+                                for sources in anchor_future_sources
+                            )
+                            action_context_tree_drafted_tokens += sum(
+                                source_count(sources, "action_context_tree") for sources in anchor_future_sources
+                            )
+                            action_transition_histogram_drafted_tokens += sum(
+                                source_count(sources, "action_transition_histogram")
+                                for sources in anchor_future_sources
+                            )
+                            action_delta_histogram_drafted_tokens += sum(
+                                source_count(sources, "action_delta_histogram")
+                                for sources in anchor_future_sources
+                            )
+                            action_delta_ngram_drafted_tokens += sum(
+                                source_count(sources, "action_delta_ngram")
+                                for sources in anchor_future_sources
+                            )
+                            chunk_position_delta_drafted_tokens += sum(
+                                source_count(sources, "chunk_position_delta")
+                                for sources in anchor_future_sources
+                            )
+                            chunk_delta_template_drafted_tokens += sum(
+                                source_count(sources, "chunk_delta_template")
+                                for sources in anchor_future_sources
+                            )
+                            old_mask_len = current_pad_mask.shape[1]
+                            anchor_rows = [[target_token_value, *future] for future in anchor_future_rows]
+                            verify_logits_all, verify_kv, verify_pad_mask, _candidate_lengths = verify_candidate_batch(
+                                anchor_rows,
+                                prepend_prev_logits=True,
+                            )
+                            tree_anchor_verifies += 1
+                            tree_anchor_candidates += len(anchor_future_rows)
+                            best_idx = 0
+                            future_accepted = -1
+                            for row_idx, future in enumerate(anchor_future_rows):
+                                accepted_prefix = 0
+                                for idx, token in enumerate(future):
+                                    logits_for_candidate = verify_logits_all[
+                                        row_idx : row_idx + 1,
+                                        idx + 1 : idx + 2,
+                                        :,
+                                    ]
+                                    predicted_candidate = int(
+                                        torch.argmax(logits_for_candidate[:, -1], dim=-1).item()
+                                    )
+                                    if predicted_candidate != int(token):
+                                        break
+                                    accepted_prefix += 1
+                                if accepted_prefix > future_accepted:
+                                    best_idx = row_idx
+                                    future_accepted = accepted_prefix
+                                    if accepted_prefix == len(future):
+                                        break
+
+                            future = anchor_future_rows[best_idx]
+                            future_source_row = (
+                                anchor_future_sources[best_idx] if best_idx < len(anchor_future_sources) else []
+                            )
+                            verify_logits_all = verify_logits_all[best_idx : best_idx + 1]
+                            verify_kv = select_kv_batch(verify_kv, best_idx)
+                            verify_pad_mask = verify_pad_mask[best_idx : best_idx + 1]
+                            future_accepted = max(future_accepted, 0)
+                            if len(debug_events) < 64:
+                                debug_events.append(
+                                    {
+                                        "pos": len(generated_tokens),
+                                        "kind": "tree_anchor_verify",
+                                        "candidates": len(anchor_future_rows),
+                                        "future_len": len(future),
+                                        "accepted": future_accepted,
+                                    }
+                                )
+
+                            logits_by_step.append(verify_logits_all[:, 0:1, :])
+                            generated_tokens.append(target_token_value)
+                            accepted_emit = future_accepted
+                            if action_end_token_id is not None:
+                                for idx in range(future_accepted):
+                                    if int(future[idx]) == action_end_token_id:
+                                        accepted_emit = idx + 1
+                                        break
+                            for idx in range(accepted_emit):
+                                logits_for_token = verify_logits_all[:, idx + 1 : idx + 2, :]
+                                logits_by_step.append(logits_for_token)
+                                generated_tokens.append(int(future[idx]))
+
+                            keep_len = old_mask_len + 1 + accepted_emit
+                            past_key_values = trim_kv(verify_kv, keep_len)
+                            current_pad_mask = verify_pad_mask[:, :keep_len].contiguous()
+                            accepted_tokens += accepted_emit
+                            tree_accepted_tokens += accepted_emit
+                            tree_anchor_accepted_tokens += accepted_emit
+                            record_source_feedback(future_source_row, future_accepted)
+                            second_order_action_extrapolation_accepted_tokens += source_count(
+                                future_source_row,
+                                "second_order_action_extrapolation",
+                                accepted_emit,
+                            )
+                            previous_chunk_position_accepted_tokens += source_count(
+                                future_source_row,
+                                "previous_chunk_position",
+                                accepted_emit,
+                            )
+                            chunk_prefix_retrieval_accepted_tokens += source_count(
+                                future_source_row,
+                                "chunk_prefix_retrieval",
+                                accepted_emit,
+                            )
+                            chunk_length_stop_accepted_tokens += source_count(
+                                future_source_row,
+                                "chunk_length_stop",
+                                accepted_emit,
+                            )
+                            position_mode_histogram_accepted_tokens += source_count(
+                                future_source_row,
+                                "position_mode_histogram",
+                                accepted_emit,
+                            )
+                            global_position_mode_accepted_tokens += source_count(
+                                future_source_row,
+                                "global_position_mode",
+                                accepted_emit,
+                            )
+                            action_dimension_mode_accepted_tokens += source_count(
+                                future_source_row,
+                                "action_dimension_mode",
+                                accepted_emit,
+                            )
+                            hold_action_token_accepted_tokens += source_count(
+                                future_source_row,
+                                "hold_action_token",
+                                accepted_emit,
+                            )
+                            ngram_continuation_accepted_tokens += source_count(
+                                future_source_row,
+                                "ngram_continuation",
+                                accepted_emit,
+                            )
+                            source_agreement_accepted_tokens += source_count(
+                                future_source_row,
+                                "source_agreement",
+                                accepted_emit,
+                            )
+                            action_trend_regression_accepted_tokens += source_count(
+                                future_source_row,
+                                "action_trend_regression",
+                                accepted_emit,
+                            )
+                            action_prefix_lookup_accepted_tokens += source_count(
+                                future_source_row,
+                                "action_prefix_lookup",
+                                accepted_emit,
+                            )
+                            action_vector_transition_accepted_tokens += source_count(
+                                future_source_row,
+                                "action_vector_transition",
+                                accepted_emit,
+                            )
+                            action_repeat_vector_accepted_tokens += source_count(
+                                future_source_row,
+                                "action_repeat_vector",
+                                accepted_emit,
+                            )
+                            action_token_neighborhood_accepted_tokens += source_count(
+                                future_source_row,
+                                "action_token_neighborhood",
+                                accepted_emit,
+                            )
+                            action_context_tree_accepted_tokens += source_count(
+                                future_source_row,
+                                "action_context_tree",
+                                accepted_emit,
+                            )
+                            action_transition_histogram_accepted_tokens += source_count(
+                                future_source_row,
+                                "action_transition_histogram",
+                                accepted_emit,
+                            )
+                            action_delta_histogram_accepted_tokens += source_count(
+                                future_source_row,
+                                "action_delta_histogram",
+                                accepted_emit,
+                            )
+                            action_delta_ngram_accepted_tokens += source_count(
+                                future_source_row,
+                                "action_delta_ngram",
+                                accepted_emit,
+                            )
+                            chunk_position_delta_accepted_tokens += source_count(
+                                future_source_row,
+                                "chunk_position_delta",
+                                accepted_emit,
+                            )
+                            chunk_delta_template_accepted_tokens += source_count(
+                                future_source_row,
+                                "chunk_delta_template",
+                                accepted_emit,
+                            )
+                            update_dynamic_lookahead(accepted=future_accepted, drafted=len(future))
+                            if dynamic_tree_width:
+                                if future_accepted == len(future):
+                                    current_tree_width = min(
+                                        max_tree_width,
+                                        current_tree_width + max(int(tree_width_growth), 1),
+                                    )
+                                else:
+                                    current_tree_width = max(
+                                        1,
+                                        current_tree_width - max(int(tree_width_shrink), 1),
+                                    )
+                            pending_unprocessed_token = None
+                            if len(generated_tokens) >= max_decoding_steps:
+                                break
+                            if (
+                                action_end_token_id is not None
+                                and generated_tokens
+                                and generated_tokens[-1] == action_end_token_id
+                            ):
+                                break
+                            if future_accepted == len(future):
+                                full_block_reuses += 1
+                                bonus_logits = verify_logits_all[
+                                    :,
+                                    1 + future_accepted : 2 + future_accepted,
+                                    :,
+                                ]
+                                if (
+                                    emit_bonus_token
+                                    and bonus_logits.shape[1] == 1
+                                    and len(generated_tokens) < max_decoding_steps
+                                ):
+                                    bonus_token = torch.argmax(bonus_logits[:, -1], dim=-1, keepdim=True)
+                                    logits_by_step.append(bonus_logits)
+                                    generated_tokens.append(int(bonus_token.item()))
+                                    bonus_tokens += 1
+                                    pending_unprocessed_token = bonus_token
+                                    prev_logits = bonus_logits
+                                    if action_end_token_id is not None and int(bonus_token.item()) == action_end_token_id:
+                                        break
+                                else:
+                                    prev_logits = bonus_logits
+                            else:
+                                correction_logits = verify_logits_all[
+                                    :,
+                                    1 + future_accepted : 2 + future_accepted,
+                                    :,
+                                ]
+                                correction_token = torch.argmax(correction_logits[:, -1], dim=-1, keepdim=True)
+                                if (
+                                    future_accepted < len(future)
+                                    and int(correction_token.item()) == int(future[future_accepted])
+                                ):
+                                    raise RuntimeError(
+                                        "Internal SD invariant failed: anchored prefix stopped before matching token"
+                                    )
+                                logits_by_step.append(correction_logits)
+                                generated_tokens.append(int(correction_token.item()))
+                                pending_corrections += 1
+                                pending_unprocessed_token = correction_token
+                                prev_logits = correction_logits
+                                if action_end_token_id is not None and int(correction_token.item()) == action_end_token_id:
+                                    break
+                            continue
+                    if len(debug_events) < 64:
+                        debug_events.append(
+                            {
+                                "pos": len(generated_tokens),
+                                "kind": "tree_fallback",
+                                "token": target_token_value,
+                            }
+                    )
+                    update_dynamic_lookahead(accepted=0, drafted=0, miss=True)
+                    if dynamic_tree_width:
+                        current_tree_width = max(1, current_tree_width - max(int(tree_width_shrink), 1))
+                    if raw_draft_sources:
+                        record_source_feedback(raw_draft_sources[0], 0)
+                    else:
+                        record_source_miss()
+                    prev_logits = advance_one(target_next, prev_logits, fallback=True)
+                    continue
+
+                drafted_tokens += sum(len(row) for row in draft_rows)
+                second_order_action_extrapolation_drafted_tokens += sum(
+                    source_count(sources, "second_order_action_extrapolation") for sources in draft_sources
+                )
+                previous_chunk_position_drafted_tokens += sum(
+                    source_count(sources, "previous_chunk_position") for sources in draft_sources
+                )
+                chunk_prefix_retrieval_drafted_tokens += sum(
+                    source_count(sources, "chunk_prefix_retrieval") for sources in draft_sources
+                )
+                chunk_length_stop_drafted_tokens += sum(
+                    source_count(sources, "chunk_length_stop") for sources in draft_sources
+                )
+                position_mode_histogram_drafted_tokens += sum(
+                    source_count(sources, "position_mode_histogram") for sources in draft_sources
+                )
+                global_position_mode_drafted_tokens += sum(
+                    source_count(sources, "global_position_mode") for sources in draft_sources
+                )
+                action_dimension_mode_drafted_tokens += sum(
+                    source_count(sources, "action_dimension_mode") for sources in draft_sources
+                )
+                hold_action_token_drafted_tokens += sum(
+                    source_count(sources, "hold_action_token") for sources in draft_sources
+                )
+                ngram_continuation_drafted_tokens += sum(
+                    source_count(sources, "ngram_continuation") for sources in draft_sources
+                )
+                source_agreement_drafted_tokens += sum(
+                    source_count(sources, "source_agreement") for sources in draft_sources
+                )
+                action_trend_regression_drafted_tokens += sum(
+                    source_count(sources, "action_trend_regression") for sources in draft_sources
+                )
+                action_prefix_lookup_drafted_tokens += sum(
+                    source_count(sources, "action_prefix_lookup") for sources in draft_sources
+                )
+                action_vector_transition_drafted_tokens += sum(
+                    source_count(sources, "action_vector_transition") for sources in draft_sources
+                )
+                action_repeat_vector_drafted_tokens += sum(
+                    source_count(sources, "action_repeat_vector") for sources in draft_sources
+                )
+                action_token_neighborhood_drafted_tokens += sum(
+                    source_count(sources, "action_token_neighborhood") for sources in draft_sources
+                )
+                action_context_tree_drafted_tokens += sum(
+                    source_count(sources, "action_context_tree") for sources in draft_sources
+                )
+                action_transition_histogram_drafted_tokens += sum(
+                    source_count(sources, "action_transition_histogram") for sources in draft_sources
+                )
+                action_delta_histogram_drafted_tokens += sum(
+                    source_count(sources, "action_delta_histogram") for sources in draft_sources
+                )
+                action_delta_ngram_drafted_tokens += sum(
+                    source_count(sources, "action_delta_ngram") for sources in draft_sources
+                )
+                chunk_position_delta_drafted_tokens += sum(
+                    source_count(sources, "chunk_position_delta") for sources in draft_sources
+                )
+                chunk_delta_template_drafted_tokens += sum(
+                    source_count(sources, "chunk_delta_template") for sources in draft_sources
+                )
+                old_mask_len = current_pad_mask.shape[1]
+                verify_logits_all, verify_kv, verify_pad_mask, _candidate_lengths = verify_candidate_batch(
+                    draft_rows,
+                    prepend_prev_logits=True,
+                )
+                best_idx = 0
+                block_accepted = -1
+                for row_idx, candidate in enumerate(draft_rows):
+                    accepted_prefix = 0
+                    for idx, token in enumerate(candidate):
+                        logits_for_candidate = verify_logits_all[row_idx : row_idx + 1, idx : idx + 1, :]
+                        predicted_candidate = int(torch.argmax(logits_for_candidate[:, -1], dim=-1).item())
+                        if predicted_candidate != int(token):
+                            break
+                        accepted_prefix += 1
+                    if accepted_prefix > block_accepted:
+                        best_idx = row_idx
+                        block_accepted = accepted_prefix
+                        if accepted_prefix == len(candidate):
+                            break
+
+                draft = draft_rows[best_idx]
+                draft_source_row = draft_sources[best_idx] if best_idx < len(draft_sources) else []
+                verify_logits_all = verify_logits_all[best_idx : best_idx + 1]
+                verify_kv = select_kv_batch(verify_kv, best_idx)
+                verify_pad_mask = verify_pad_mask[best_idx : best_idx + 1]
+                block_accepted = min(max(block_accepted, 0), remaining)
+                if len(debug_events) < 64:
+                    debug_events.append(
+                        {
+                            "pos": len(generated_tokens),
+                            "kind": "tree_verify",
+                            "candidates": len(draft_rows),
+                            "draft_len": len(draft),
+                            "accepted": block_accepted,
+                            "draft": [int(token) for token in draft[: min(len(draft), 12)]],
+                        }
+                    )
+                accepted = 0
+                accepted_emit = block_accepted
+                if action_end_token_id is not None:
+                    for idx in range(block_accepted):
+                        if int(draft[idx]) == action_end_token_id:
+                            accepted_emit = idx + 1
+                            break
+                if reuse_full_blocks and block_accepted == len(draft):
+                    full_block_reuses += 1
+                    for idx in range(accepted_emit):
+                        logits_for_token = verify_logits_all[:, idx : idx + 1, :]
+                        logits_by_step.append(logits_for_token)
+                        generated_tokens.append(int(draft[idx]))
+                    accepted = accepted_emit
+                    keep_len = old_mask_len + accepted
+                    past_key_values = trim_kv(verify_kv, keep_len)
+                    current_pad_mask = verify_pad_mask[:, :keep_len].contiguous()
+                    if (
+                        emit_bonus_token
+                        and accepted == len(draft)
+                        and len(generated_tokens) < max_decoding_steps
+                        and (
+                            action_end_token_id is None
+                            or not generated_tokens
+                            or generated_tokens[-1] != action_end_token_id
+                        )
+                    ):
+                        bonus_logits = verify_logits_all[:, accepted : accepted + 1, :]
+                        bonus_token = torch.argmax(bonus_logits[:, -1], dim=-1, keepdim=True)
+                        logits_by_step.append(bonus_logits)
+                        generated_tokens.append(int(bonus_token.item()))
+                        bonus_tokens += 1
+                        pending_unprocessed_token = bonus_token
+                        prev_logits = bonus_logits
+                    else:
+                        prev_logits = verify_logits_all[:, accepted : accepted + 1, :]
+                else:
+                    accepted = accepted_emit
+                    for idx in range(accepted):
+                        logits_for_token = verify_logits_all[:, idx : idx + 1, :]
+                        logits_by_step.append(logits_for_token)
+                        generated_tokens.append(int(draft[idx]))
+
+                    keep_len = old_mask_len + accepted
+                    past_key_values = trim_kv(verify_kv, keep_len)
+                    current_pad_mask = verify_pad_mask[:, :keep_len].contiguous()
+
+                    if (
+                        len(generated_tokens) < max_decoding_steps
+                        and (
+                            action_end_token_id is None
+                            or not generated_tokens
+                            or generated_tokens[-1] != action_end_token_id
+                        )
+                    ):
+                        correction_logits = verify_logits_all[:, accepted : accepted + 1, :]
+                        correction_token = torch.argmax(correction_logits[:, -1], dim=-1, keepdim=True)
+                        if accepted < len(draft) and int(correction_token.item()) == int(draft[accepted]):
+                            raise RuntimeError("Internal SD invariant failed: tree prefix stopped before matching token")
+                        if len(debug_events) < 64:
+                            debug_events.append(
+                                {
+                                    "pos": len(generated_tokens),
+                                    "kind": "tree_correction",
+                                    "accepted": accepted,
+                                    "token": int(correction_token.item()),
+                                    "rejected_draft": int(draft[accepted]) if accepted < len(draft) else None,
+                                }
+                            )
+                        if defer_correction_token:
+                            logits_by_step.append(correction_logits)
+                            generated_tokens.append(int(correction_token.item()))
+                            pending_corrections += 1
+                            pending_unprocessed_token = correction_token
+                            prev_logits = correction_logits
+                            if action_end_token_id is not None and int(correction_token.item()) == action_end_token_id:
+                                break
+                        else:
+                            prev_logits = advance_one(correction_token, correction_logits, fallback=True)
+                accepted_tokens += accepted
+                tree_accepted_tokens += accepted
+                record_source_feedback(draft_source_row, block_accepted)
+                second_order_action_extrapolation_accepted_tokens += source_count(
+                    draft_source_row,
+                    "second_order_action_extrapolation",
+                    accepted,
+                )
+                previous_chunk_position_accepted_tokens += source_count(
+                    draft_source_row,
+                    "previous_chunk_position",
+                    accepted,
+                )
+                chunk_prefix_retrieval_accepted_tokens += source_count(
+                    draft_source_row,
+                    "chunk_prefix_retrieval",
+                    accepted,
+                )
+                chunk_length_stop_accepted_tokens += source_count(
+                    draft_source_row,
+                    "chunk_length_stop",
+                    accepted,
+                )
+                position_mode_histogram_accepted_tokens += source_count(
+                    draft_source_row,
+                    "position_mode_histogram",
+                    accepted,
+                )
+                global_position_mode_accepted_tokens += source_count(
+                    draft_source_row,
+                    "global_position_mode",
+                    accepted,
+                )
+                action_dimension_mode_accepted_tokens += source_count(
+                    draft_source_row,
+                    "action_dimension_mode",
+                    accepted,
+                )
+                hold_action_token_accepted_tokens += source_count(
+                    draft_source_row,
+                    "hold_action_token",
+                    accepted,
+                )
+                ngram_continuation_accepted_tokens += source_count(
+                    draft_source_row,
+                    "ngram_continuation",
+                    accepted,
+                )
+                source_agreement_accepted_tokens += source_count(
+                    draft_source_row,
+                    "source_agreement",
+                    accepted,
+                )
+                action_trend_regression_accepted_tokens += source_count(
+                    draft_source_row,
+                    "action_trend_regression",
+                    accepted,
+                )
+                action_prefix_lookup_accepted_tokens += source_count(
+                    draft_source_row,
+                    "action_prefix_lookup",
+                    accepted,
+                )
+                action_vector_transition_accepted_tokens += source_count(
+                    draft_source_row,
+                    "action_vector_transition",
+                    accepted,
+                )
+                action_repeat_vector_accepted_tokens += source_count(
+                    draft_source_row,
+                    "action_repeat_vector",
+                    accepted,
+                )
+                action_token_neighborhood_accepted_tokens += source_count(
+                    draft_source_row,
+                    "action_token_neighborhood",
+                    accepted,
+                )
+                action_context_tree_accepted_tokens += source_count(
+                    draft_source_row,
+                    "action_context_tree",
+                    accepted,
+                )
+                action_transition_histogram_accepted_tokens += source_count(
+                    draft_source_row,
+                    "action_transition_histogram",
+                    accepted,
+                )
+                action_delta_histogram_accepted_tokens += source_count(
+                    draft_source_row,
+                    "action_delta_histogram",
+                    accepted,
+                )
+                action_delta_ngram_accepted_tokens += source_count(
+                    draft_source_row,
+                    "action_delta_ngram",
+                    accepted,
+                )
+                chunk_position_delta_accepted_tokens += source_count(
+                    draft_source_row,
+                    "chunk_position_delta",
+                    accepted,
+                )
+                chunk_delta_template_accepted_tokens += source_count(
+                    draft_source_row,
+                    "chunk_delta_template",
+                    accepted,
+                )
+                update_dynamic_lookahead(accepted=block_accepted, drafted=len(draft))
+                if dynamic_tree_width:
+                    if block_accepted == len(draft):
+                        current_tree_width = min(
+                            max_tree_width,
+                            current_tree_width + max(int(tree_width_growth), 1),
+                        )
+                    else:
+                        current_tree_width = max(1, current_tree_width - max(int(tree_width_shrink), 1))
+                if len(generated_tokens) >= max_decoding_steps:
+                    break
+                if action_end_token_id is not None and generated_tokens and generated_tokens[-1] == action_end_token_id:
+                    break
+                continue
+            draft = drafter.draft(generated_tokens, lookahead=block_lookahead)
+            draft_sources = last_draft_sources()
             if not draft or int(draft[0]) != int(target_next.item()):
                 if len(debug_events) < 64:
                     debug_events.append(
@@ -1252,12 +4566,104 @@ class PI0FastTokenLogitAdapter:
                             "draft0": int(draft[0]) if draft else None,
                         }
                     )
+                update_dynamic_lookahead(accepted=0, drafted=len(draft), miss=True)
+                if dynamic_tree_width:
+                    current_tree_width = max(1, current_tree_width - max(int(tree_width_shrink), 1))
+                if draft_sources:
+                    record_source_feedback(draft_sources, 0)
+                else:
+                    record_source_miss()
                 prev_logits = advance_one(target_next, prev_logits, fallback=True)
                 continue
 
             draft = draft[:remaining]
+            draft_sources = draft_sources[: len(draft)]
             draft_tensor = torch.tensor([draft], dtype=torch.long, device=device)
             drafted_tokens += len(draft)
+            second_order_action_extrapolation_drafted_tokens += source_count(
+                draft_sources,
+                "second_order_action_extrapolation",
+            )
+            previous_chunk_position_drafted_tokens += source_count(
+                draft_sources,
+                "previous_chunk_position",
+            )
+            chunk_prefix_retrieval_drafted_tokens += source_count(
+                draft_sources,
+                "chunk_prefix_retrieval",
+            )
+            chunk_length_stop_drafted_tokens += source_count(
+                draft_sources,
+                "chunk_length_stop",
+            )
+            position_mode_histogram_drafted_tokens += source_count(
+                draft_sources,
+                "position_mode_histogram",
+            )
+            global_position_mode_drafted_tokens += source_count(
+                draft_sources,
+                "global_position_mode",
+            )
+            action_dimension_mode_drafted_tokens += source_count(
+                draft_sources,
+                "action_dimension_mode",
+            )
+            hold_action_token_drafted_tokens += source_count(
+                draft_sources,
+                "hold_action_token",
+            )
+            ngram_continuation_drafted_tokens += source_count(
+                draft_sources,
+                "ngram_continuation",
+            )
+            source_agreement_drafted_tokens += source_count(
+                draft_sources,
+                "source_agreement",
+            )
+            action_trend_regression_drafted_tokens += source_count(
+                draft_sources,
+                "action_trend_regression",
+            )
+            action_prefix_lookup_drafted_tokens += source_count(
+                draft_sources,
+                "action_prefix_lookup",
+            )
+            action_vector_transition_drafted_tokens += source_count(
+                draft_sources,
+                "action_vector_transition",
+            )
+            action_repeat_vector_drafted_tokens += source_count(
+                draft_sources,
+                "action_repeat_vector",
+            )
+            action_token_neighborhood_drafted_tokens += source_count(
+                draft_sources,
+                "action_token_neighborhood",
+            )
+            action_context_tree_drafted_tokens += source_count(
+                draft_sources,
+                "action_context_tree",
+            )
+            action_transition_histogram_drafted_tokens += source_count(
+                draft_sources,
+                "action_transition_histogram",
+            )
+            action_delta_histogram_drafted_tokens += source_count(
+                draft_sources,
+                "action_delta_histogram",
+            )
+            action_delta_ngram_drafted_tokens += source_count(
+                draft_sources,
+                "action_delta_ngram",
+            )
+            chunk_position_delta_drafted_tokens += source_count(
+                draft_sources,
+                "chunk_position_delta",
+            )
+            chunk_delta_template_drafted_tokens += source_count(
+                draft_sources,
+                "chunk_delta_template",
+            )
             old_mask_len = current_pad_mask.shape[1]
             generated_before_verify = list(generated_tokens)
             if verify_from_scratch:
@@ -1293,8 +4699,7 @@ class PI0FastTokenLogitAdapter:
             else:
                 verify_past_key_values = clone_kv(past_key_values)
 
-                draft_embs = self.model.paligemma_with_expert.embed_language_tokens(draft_tensor)
-                draft_embs = draft_embs * math.sqrt(draft_embs.shape[-1])
+                draft_embs = self._embed_decode_language_tokens(draft_tensor)
                 draft_embs = draft_embs.to(dtype=prefix_embs.dtype)
                 verify_pad_mask = torch.cat(
                     [current_pad_mask, torch.ones((bsize, len(draft)), dtype=torch.bool, device=device)],
@@ -1328,14 +4733,100 @@ class PI0FastTokenLogitAdapter:
             target_forwards += 1
             verify_forwards += 1
 
+            diagnostic_step_accept: int | None = None
+            diagnostic_batched_pred: torch.Tensor | None = None
+            diagnostic_stepwise_pred: torch.Tensor | None = None
+            if diagnose_verify_alignment:
+                align_len = min(int(verify_logits_all.shape[1]), len(draft) + 1)
+                if align_len > 0:
+                    verify_alignment_blocks += 1
+                    verify_alignment_checks += align_len
+                    stepwise_logits_all = diagnostic_stepwise_logits(
+                        [int(token) for token in draft],
+                        align_len,
+                    )
+                    batched_pred = torch.argmax(verify_logits_all[:, :align_len, :].float(), dim=-1)
+                    stepwise_pred = torch.argmax(stepwise_logits_all[:, :align_len, :].float(), dim=-1)
+                    diagnostic_batched_pred = batched_pred
+                    diagnostic_stepwise_pred = stepwise_pred
+                    mismatch_mask = batched_pred != stepwise_pred
+                    mismatches = int(torch.sum(mismatch_mask).item())
+                    verify_alignment_argmax_mismatches += mismatches
+                    if mismatches > 0:
+                        verify_alignment_blocks_with_mismatch += 1
+                        mismatch_positions = torch.nonzero(mismatch_mask[0], as_tuple=False).flatten()
+                        first_mismatch = int(mismatch_positions[0].item())
+                        verify_alignment_first_mismatch_min = min(
+                            verify_alignment_first_mismatch_min,
+                            first_mismatch,
+                        )
+                        verify_alignment_first_mismatch_sum += first_mismatch
+                    diagnostic_step_accept = 0
+                    for idx in range(min(len(draft), align_len)):
+                        if int(stepwise_pred[0, idx].item()) != int(draft[idx]):
+                            break
+                        diagnostic_step_accept += 1
+
             block_accepted = 0
+            matched_prefix = 0
+            block_min_margin = float("inf")
+            block_margin_ok = True
+            margin_rejected_block = False
             for idx in range(len(draft)):
                 logits_for_candidate = verify_logits_all[:, idx : idx + 1, :]
-                predicted_candidate = int(torch.argmax(logits_for_candidate[:, -1], dim=-1).item())
+                candidate_logits = logits_for_candidate[:, -1, :].float()
+                top_values, _top_indices = torch.topk(candidate_logits, k=2, dim=-1)
+                predicted_candidate = int(torch.argmax(candidate_logits, dim=-1).item())
+                margin = float((top_values[:, 0] - top_values[:, 1]).item())
+                block_min_margin = min(block_min_margin, margin)
+                verify_margin_checks += 1
+                verify_margin_min = min(verify_margin_min, margin)
+                verify_margin_sum += margin
                 if predicted_candidate != int(draft[idx]):
                     break
+                matched_prefix += 1
+                if float(min_verify_margin) > 0.0 and margin < float(min_verify_margin):
+                    block_margin_ok = False
+                    break
                 block_accepted += 1
+            if float(min_verify_margin) > 0.0 and (
+                block_accepted != len(draft) or matched_prefix != len(draft) or not block_margin_ok
+            ):
+                margin_block_rejects += 1
+                margin_rejected_block = True
+                block_accepted = 0
             block_accepted = min(block_accepted, remaining)
+            if diagnostic_step_accept is not None:
+                diagnostic_step_accept = min(diagnostic_step_accept, remaining)
+                verify_alignment_batched_accept_sum += block_accepted
+                verify_alignment_step_accept_sum += diagnostic_step_accept
+                if block_accepted != diagnostic_step_accept:
+                    verify_alignment_accept_disagreements += 1
+                if block_accepted > diagnostic_step_accept:
+                    verify_alignment_false_accepts += 1
+                batched_correction_for_debug = None
+                stepwise_correction_for_debug = None
+                if diagnostic_batched_pred is not None and diagnostic_stepwise_pred is not None:
+                    correction_idx = min(block_accepted, int(diagnostic_batched_pred.shape[1]) - 1)
+                    verify_alignment_correction_checks += 1
+                    batched_correction = int(diagnostic_batched_pred[0, correction_idx].item())
+                    stepwise_correction = int(diagnostic_stepwise_pred[0, correction_idx].item())
+                    batched_correction_for_debug = batched_correction
+                    stepwise_correction_for_debug = stepwise_correction
+                    if batched_correction != stepwise_correction:
+                        verify_alignment_correction_mismatches += 1
+                if len(debug_events) < 64:
+                    debug_events.append(
+                        {
+                            "pos": len(generated_tokens),
+                            "kind": "verify_alignment",
+                            "draft_len": len(draft),
+                            "batched_accept": block_accepted,
+                            "step_accept": diagnostic_step_accept,
+                            "batched_correction": batched_correction_for_debug,
+                            "step_correction": stepwise_correction_for_debug,
+                        }
+                    )
             if len(debug_events) < 64:
                 debug_events.append(
                     {
@@ -1343,6 +4834,8 @@ class PI0FastTokenLogitAdapter:
                         "kind": "verify",
                         "draft_len": len(draft),
                         "accepted": block_accepted,
+                        "matched_prefix": matched_prefix,
+                        "min_margin": block_min_margin if block_min_margin != float("inf") else None,
                         "draft": [int(token) for token in draft[: min(len(draft), 12)]],
                     }
                 )
@@ -1353,31 +4846,74 @@ class PI0FastTokenLogitAdapter:
                     if int(draft[idx]) == action_end_token_id:
                         accepted_emit = idx + 1
                         break
-            if reuse_full_blocks and block_accepted == len(draft):
+            if reuse_full_blocks and block_accepted == len(draft) and not replay_accepted_cache:
                 full_block_reuses += 1
                 for idx in range(accepted_emit):
                     logits_for_token = verify_logits_all[:, idx : idx + 1, :]
                     logits_by_step.append(logits_for_token)
                     generated_tokens.append(int(draft[idx]))
                 accepted = accepted_emit
-                past_key_values = verify_kv
-                if accepted == len(draft):
-                    current_pad_mask = verify_pad_mask
+                if replay_accepted_cache and accepted > 0:
+                    for idx in range(accepted):
+                        token = torch.tensor([[int(draft[idx])]], dtype=torch.long, device=device)
+                        prev_logits = replay_one(token)
+                elif resync_accepted_cache and accepted > 0:
+                    prev_logits = resync_from_generated()
                 else:
-                    keep_len = old_mask_len + accepted
-                    past_key_values = trim_kv(verify_kv, keep_len)
-                    current_pad_mask = verify_pad_mask[:, :keep_len].contiguous()
-                prev_logits = verify_logits_all[:, accepted : accepted + 1, :]
+                    past_key_values = verify_kv
+                    if accepted == len(draft):
+                        current_pad_mask = verify_pad_mask
+                    else:
+                        keep_len = old_mask_len + accepted
+                        past_key_values = trim_kv(verify_kv, keep_len)
+                        current_pad_mask = verify_pad_mask[:, :keep_len].contiguous()
+                    prev_logits = verify_logits_all[:, accepted : accepted + 1, :]
+                if (
+                    emit_bonus_token
+                    and accepted == len(draft)
+                    and len(generated_tokens) < max_decoding_steps
+                    and (
+                        action_end_token_id is None
+                        or not generated_tokens
+                        or generated_tokens[-1] != action_end_token_id
+                    )
+                ):
+                    bonus_logits = prev_logits
+                    bonus_token = torch.argmax(bonus_logits[:, -1], dim=-1, keepdim=True)
+                    logits_by_step.append(bonus_logits)
+                    generated_tokens.append(int(bonus_token.item()))
+                    bonus_tokens += 1
+                    pending_unprocessed_token = bonus_token
+                    prev_logits = bonus_logits
             else:
-                accepted = accepted_emit
-                for idx in range(accepted):
-                    logits_for_token = verify_logits_all[:, idx : idx + 1, :]
-                    logits_by_step.append(logits_for_token)
-                    generated_tokens.append(int(draft[idx]))
-
-                keep_len = old_mask_len + accepted
-                past_key_values = trim_kv(verify_kv, keep_len)
-                current_pad_mask = verify_pad_mask[:, :keep_len].contiguous()
+                if replay_accepted_cache:
+                    accepted = 0
+                    for idx in range(accepted_emit):
+                        live_token = int(torch.argmax(prev_logits[:, -1], dim=-1).item())
+                        if live_token != int(draft[idx]):
+                            break
+                        logits_by_step.append(prev_logits)
+                        generated_tokens.append(int(draft[idx]))
+                        token = torch.tensor([[int(draft[idx])]], dtype=torch.long, device=device)
+                        prev_logits = replay_one(token)
+                        accepted += 1
+                    block_accepted = accepted
+                    accepted_emit = accepted
+                else:
+                    accepted = accepted_emit
+                    for idx in range(accepted):
+                        logits_for_token = verify_logits_all[:, idx : idx + 1, :]
+                        logits_by_step.append(logits_for_token)
+                        generated_tokens.append(int(draft[idx]))
+                    if resync_accepted_cache and accepted > 0:
+                        prev_logits = resync_from_generated()
+                    elif accepted > 0:
+                        keep_len = old_mask_len + accepted
+                        past_key_values = trim_kv(verify_kv, keep_len)
+                        current_pad_mask = verify_pad_mask[:, :keep_len].contiguous()
+                        prev_logits = verify_logits_all[:, accepted : accepted + 1, :]
+                    else:
+                        prev_logits = verify_logits_all[:, :1, :]
 
                 if (
                     len(generated_tokens) < max_decoding_steps
@@ -1387,10 +4923,24 @@ class PI0FastTokenLogitAdapter:
                         or generated_tokens[-1] != action_end_token_id
                     )
                 ):
-                    correction_logits = verify_logits_all[:, accepted : accepted + 1, :]
+                    correction_logits = prev_logits
                     correction_token = torch.argmax(correction_logits[:, -1], dim=-1, keepdim=True)
-                    if accepted < len(draft) and int(correction_token.item()) == int(draft[accepted]):
-                        raise RuntimeError("Internal SD invariant failed: accepted prefix stopped before matching token")
+                    if (
+                        not margin_rejected_block
+                        and accepted < len(draft)
+                        and int(correction_token.item()) == int(draft[accepted])
+                    ):
+                        debug_predictions = [
+                            int(torch.argmax(verify_logits_all[:, i : i + 1, :][:, -1], dim=-1).item())
+                            for i in range(min(len(draft), 12))
+                        ]
+                        raise RuntimeError(
+                            "Internal SD invariant failed: accepted prefix stopped before matching token "
+                            f"accepted={accepted} accepted_emit={accepted_emit} "
+                            f"block_accepted={block_accepted} matched_prefix={matched_prefix} "
+                            f"draft={ [int(token) for token in draft[: min(len(draft), 12)]] } "
+                            f"pred={debug_predictions} action_end={action_end_token_id}"
+                        )
                     if len(debug_events) < 64:
                         debug_events.append(
                             {
@@ -1401,30 +4951,323 @@ class PI0FastTokenLogitAdapter:
                                 "rejected_draft": int(draft[accepted]) if accepted < len(draft) else None,
                             }
                         )
-                    prev_logits = advance_one(correction_token, correction_logits, fallback=True)
+                    if defer_correction_token:
+                        logits_by_step.append(correction_logits)
+                        generated_tokens.append(int(correction_token.item()))
+                        pending_corrections += 1
+                        pending_unprocessed_token = correction_token
+                        prev_logits = correction_logits
+                        if action_end_token_id is not None and int(correction_token.item()) == action_end_token_id:
+                            break
+                    else:
+                        prev_logits = advance_one(correction_token, correction_logits, fallback=True)
             accepted_tokens += accepted
+            record_source_feedback(draft_sources, block_accepted)
+            second_order_action_extrapolation_accepted_tokens += source_count(
+                draft_sources,
+                "second_order_action_extrapolation",
+                accepted,
+            )
+            previous_chunk_position_accepted_tokens += source_count(
+                draft_sources,
+                "previous_chunk_position",
+                accepted,
+            )
+            chunk_prefix_retrieval_accepted_tokens += source_count(
+                draft_sources,
+                "chunk_prefix_retrieval",
+                accepted,
+            )
+            chunk_length_stop_accepted_tokens += source_count(
+                draft_sources,
+                "chunk_length_stop",
+                accepted,
+            )
+            position_mode_histogram_accepted_tokens += source_count(
+                draft_sources,
+                "position_mode_histogram",
+                accepted,
+            )
+            global_position_mode_accepted_tokens += source_count(
+                draft_sources,
+                "global_position_mode",
+                accepted,
+            )
+            action_dimension_mode_accepted_tokens += source_count(
+                draft_sources,
+                "action_dimension_mode",
+                accepted,
+            )
+            hold_action_token_accepted_tokens += source_count(
+                draft_sources,
+                "hold_action_token",
+                accepted,
+            )
+            ngram_continuation_accepted_tokens += source_count(
+                draft_sources,
+                "ngram_continuation",
+                accepted,
+            )
+            source_agreement_accepted_tokens += source_count(
+                draft_sources,
+                "source_agreement",
+                accepted,
+            )
+            action_trend_regression_accepted_tokens += source_count(
+                draft_sources,
+                "action_trend_regression",
+                accepted,
+            )
+            action_prefix_lookup_accepted_tokens += source_count(
+                draft_sources,
+                "action_prefix_lookup",
+                accepted,
+            )
+            action_vector_transition_accepted_tokens += source_count(
+                draft_sources,
+                "action_vector_transition",
+                accepted,
+            )
+            action_repeat_vector_accepted_tokens += source_count(
+                draft_sources,
+                "action_repeat_vector",
+                accepted,
+            )
+            action_token_neighborhood_accepted_tokens += source_count(
+                draft_sources,
+                "action_token_neighborhood",
+                accepted,
+            )
+            action_context_tree_accepted_tokens += source_count(
+                draft_sources,
+                "action_context_tree",
+                accepted,
+            )
+            action_transition_histogram_accepted_tokens += source_count(
+                draft_sources,
+                "action_transition_histogram",
+                accepted,
+            )
+            action_delta_histogram_accepted_tokens += source_count(
+                draft_sources,
+                "action_delta_histogram",
+                accepted,
+            )
+            action_delta_ngram_accepted_tokens += source_count(
+                draft_sources,
+                "action_delta_ngram",
+                accepted,
+            )
+            chunk_position_delta_accepted_tokens += source_count(
+                draft_sources,
+                "chunk_position_delta",
+                accepted,
+            )
+            chunk_delta_template_accepted_tokens += source_count(
+                draft_sources,
+                "chunk_delta_template",
+                accepted,
+            )
+            update_dynamic_lookahead(accepted=block_accepted, drafted=len(draft))
+            if dynamic_tree_width:
+                if block_accepted == len(draft):
+                    current_tree_width = min(max_tree_width, current_tree_width + max(int(tree_width_growth), 1))
+                else:
+                    current_tree_width = max(1, current_tree_width - max(int(tree_width_shrink), 1))
             if len(generated_tokens) >= max_decoding_steps:
                 break
             if action_end_token_id is not None and generated_tokens and generated_tokens[-1] == action_end_token_id:
                 break
 
+        if len(logits_by_step) != len(generated_tokens):
+            raise RuntimeError(
+                "Internal SD invariant failed: logits/token length mismatch "
+                f"({len(logits_by_step)} logits for {len(generated_tokens)} tokens)"
+            )
+        cached_generated_tokens = len(generated_tokens) - (1 if pending_unprocessed_token is not None else 0)
+        expected_mask_len = prefix_pad_masks.shape[1] + cached_generated_tokens
+        if current_pad_mask.shape[1] != expected_mask_len:
+            raise RuntimeError(
+                "Internal SD invariant failed: cache mask/token length mismatch "
+                f"({current_pad_mask.shape[1]} mask positions, expected {expected_mask_len})"
+            )
+
         generated = torch.tensor([generated_tokens[:max_decoding_steps]], dtype=torch.long, device=device)
+        logits = torch.cat(logits_by_step, dim=1)
+        if logits.shape[1] != generated.shape[1]:
+            raise RuntimeError(
+                "Internal SD invariant failed: returned logits/generated length mismatch "
+                f"({logits.shape[1]} logits for {generated.shape[1]} tokens)"
+            )
         stats = {
             "prefix_hidden": prefix_out[:, -1, :].detach().float(),
             "target_forwards": target_forwards,
             "verify_forwards": verify_forwards,
             "fallback_forwards": fallback_forwards,
             "replay_forwards": replay_forwards,
+            "resync_forwards": resync_forwards,
             "full_block_reuses": full_block_reuses,
+            "bonus_tokens": bonus_tokens,
+            "pending_verifies": pending_verifies,
+            "pending_corrections": pending_corrections,
+            "pending_processes": pending_processes,
+            "pending_token_at_return": pending_unprocessed_token is not None,
             "reuse_full_blocks": reuse_full_blocks,
+            "replay_accepted_cache": replay_accepted_cache,
+            "resync_accepted_cache": resync_accepted_cache,
+            "min_verify_margin": float(min_verify_margin),
+            "margin_block_rejects": margin_block_rejects,
+            "verify_margin_checks": verify_margin_checks,
+            "verify_margin_min": 0.0 if verify_margin_min == float("inf") else verify_margin_min,
+            "verify_margin_mean": verify_margin_sum / max(verify_margin_checks, 1),
             "verify_from_scratch": verify_from_scratch,
+            "emit_bonus_token": emit_bonus_token,
+            "defer_correction_token": defer_correction_token,
+            "dynamic_lookahead": dynamic_lookahead,
+            "min_lookahead": min_dynamic_lookahead,
+            "max_lookahead": max_lookahead,
+            "final_lookahead": current_lookahead,
+            "mean_lookahead": sum(lookahead_values) / max(len(lookahead_values), 1),
+            "tree_width": max_tree_width,
+            "tree_branch_width": max_tree_branch_width,
+            "dynamic_tree_width": dynamic_tree_width,
+            "min_tree_width": max(1, min(max_tree_width, int(min_tree_width))),
+            "final_tree_width": current_tree_width,
+            "tree_width_growth": max(int(tree_width_growth), 1),
+            "tree_width_shrink": max(int(tree_width_shrink), 1),
+            "tree_anchor_target_token": tree_anchor_target_token,
+            "tree_anchor_target_continuation": tree_anchor_target_continuation,
+            "mean_tree_width": sum(tree_width_values) / max(len(tree_width_values), 1),
+            "tree_verifies": tree_verifies,
+            "tree_candidates": tree_candidates,
+            "tree_accepted_tokens": tree_accepted_tokens,
+            "tree_anchor_verifies": tree_anchor_verifies,
+            "tree_anchor_candidates": tree_anchor_candidates,
+            "tree_anchor_accepted_tokens": tree_anchor_accepted_tokens,
+            "tree_anchor_acceptance_rate": tree_anchor_accepted_tokens / max(tree_anchor_candidates, 1),
+            "tree_first_token_checks": tree_first_token_checks,
+            "tree_first_token_misses": tree_first_token_misses,
+            "tree_first_token_miss_rate": tree_first_token_misses / max(tree_first_token_checks, 1),
+            "mean_tree_candidates": tree_candidates / max(tree_verifies, 1),
+            "verify_alignment_diagnostics": diagnose_verify_alignment,
+            "verify_alignment_blocks": verify_alignment_blocks,
+            "verify_alignment_checks": verify_alignment_checks,
+            "verify_alignment_argmax_mismatches": verify_alignment_argmax_mismatches,
+            "verify_alignment_blocks_with_mismatch": verify_alignment_blocks_with_mismatch,
+            "verify_alignment_false_accepts": verify_alignment_false_accepts,
+            "verify_alignment_accept_disagreements": verify_alignment_accept_disagreements,
+            "verify_alignment_first_mismatch_min": (
+                0
+                if verify_alignment_first_mismatch_min == float("inf")
+                else int(verify_alignment_first_mismatch_min)
+            ),
+            "verify_alignment_first_mismatch_mean": (
+                verify_alignment_first_mismatch_sum / max(verify_alignment_blocks_with_mismatch, 1)
+            ),
+            "verify_alignment_forwards": verify_alignment_forwards,
+            "verify_alignment_batched_accept_mean": (
+                verify_alignment_batched_accept_sum / max(verify_alignment_blocks, 1)
+            ),
+            "verify_alignment_step_accept_mean": verify_alignment_step_accept_sum / max(verify_alignment_blocks, 1),
+            "verify_alignment_correction_checks": verify_alignment_correction_checks,
+            "verify_alignment_correction_mismatches": verify_alignment_correction_mismatches,
+            "verify_alignment_correction_mismatch_rate": (
+                verify_alignment_correction_mismatches / max(verify_alignment_correction_checks, 1)
+            ),
+            "second_order_action_extrapolation_drafted_tokens": second_order_action_extrapolation_drafted_tokens,
+            "second_order_action_extrapolation_accepted_tokens": second_order_action_extrapolation_accepted_tokens,
+            "second_order_action_extrapolation_acceptance_rate": (
+                second_order_action_extrapolation_accepted_tokens
+                / max(second_order_action_extrapolation_drafted_tokens, 1)
+            ),
+            "previous_chunk_position_drafted_tokens": previous_chunk_position_drafted_tokens,
+            "previous_chunk_position_accepted_tokens": previous_chunk_position_accepted_tokens,
+            "previous_chunk_position_acceptance_rate": previous_chunk_position_accepted_tokens
+            / max(previous_chunk_position_drafted_tokens, 1),
+            "chunk_prefix_retrieval_drafted_tokens": chunk_prefix_retrieval_drafted_tokens,
+            "chunk_prefix_retrieval_accepted_tokens": chunk_prefix_retrieval_accepted_tokens,
+            "chunk_prefix_retrieval_acceptance_rate": chunk_prefix_retrieval_accepted_tokens
+            / max(chunk_prefix_retrieval_drafted_tokens, 1),
+            "chunk_length_stop_drafted_tokens": chunk_length_stop_drafted_tokens,
+            "chunk_length_stop_accepted_tokens": chunk_length_stop_accepted_tokens,
+            "chunk_length_stop_acceptance_rate": chunk_length_stop_accepted_tokens
+            / max(chunk_length_stop_drafted_tokens, 1),
+            "action_token_neighborhood_drafted_tokens": action_token_neighborhood_drafted_tokens,
+            "action_token_neighborhood_accepted_tokens": action_token_neighborhood_accepted_tokens,
+            "action_token_neighborhood_acceptance_rate": action_token_neighborhood_accepted_tokens
+            / max(action_token_neighborhood_drafted_tokens, 1),
+            "position_mode_histogram_drafted_tokens": position_mode_histogram_drafted_tokens,
+            "position_mode_histogram_accepted_tokens": position_mode_histogram_accepted_tokens,
+            "position_mode_histogram_acceptance_rate": position_mode_histogram_accepted_tokens
+            / max(position_mode_histogram_drafted_tokens, 1),
+            "global_position_mode_drafted_tokens": global_position_mode_drafted_tokens,
+            "global_position_mode_accepted_tokens": global_position_mode_accepted_tokens,
+            "global_position_mode_acceptance_rate": global_position_mode_accepted_tokens
+            / max(global_position_mode_drafted_tokens, 1),
+            "action_dimension_mode_drafted_tokens": action_dimension_mode_drafted_tokens,
+            "action_dimension_mode_accepted_tokens": action_dimension_mode_accepted_tokens,
+            "action_dimension_mode_acceptance_rate": action_dimension_mode_accepted_tokens
+            / max(action_dimension_mode_drafted_tokens, 1),
+            "hold_action_token_drafted_tokens": hold_action_token_drafted_tokens,
+            "hold_action_token_accepted_tokens": hold_action_token_accepted_tokens,
+            "hold_action_token_acceptance_rate": hold_action_token_accepted_tokens
+            / max(hold_action_token_drafted_tokens, 1),
+            "ngram_continuation_drafted_tokens": ngram_continuation_drafted_tokens,
+            "ngram_continuation_accepted_tokens": ngram_continuation_accepted_tokens,
+            "ngram_continuation_acceptance_rate": ngram_continuation_accepted_tokens
+            / max(ngram_continuation_drafted_tokens, 1),
+            "source_agreement_drafted_tokens": source_agreement_drafted_tokens,
+            "source_agreement_accepted_tokens": source_agreement_accepted_tokens,
+            "source_agreement_acceptance_rate": source_agreement_accepted_tokens
+            / max(source_agreement_drafted_tokens, 1),
+            "action_trend_regression_drafted_tokens": action_trend_regression_drafted_tokens,
+            "action_trend_regression_accepted_tokens": action_trend_regression_accepted_tokens,
+            "action_trend_regression_acceptance_rate": action_trend_regression_accepted_tokens
+            / max(action_trend_regression_drafted_tokens, 1),
+            "action_prefix_lookup_drafted_tokens": action_prefix_lookup_drafted_tokens,
+            "action_prefix_lookup_accepted_tokens": action_prefix_lookup_accepted_tokens,
+            "action_prefix_lookup_acceptance_rate": action_prefix_lookup_accepted_tokens
+            / max(action_prefix_lookup_drafted_tokens, 1),
+            "action_vector_transition_drafted_tokens": action_vector_transition_drafted_tokens,
+            "action_vector_transition_accepted_tokens": action_vector_transition_accepted_tokens,
+            "action_vector_transition_acceptance_rate": action_vector_transition_accepted_tokens
+            / max(action_vector_transition_drafted_tokens, 1),
+            "action_repeat_vector_drafted_tokens": action_repeat_vector_drafted_tokens,
+            "action_repeat_vector_accepted_tokens": action_repeat_vector_accepted_tokens,
+            "action_repeat_vector_acceptance_rate": action_repeat_vector_accepted_tokens
+            / max(action_repeat_vector_drafted_tokens, 1),
+            "action_context_tree_drafted_tokens": action_context_tree_drafted_tokens,
+            "action_context_tree_accepted_tokens": action_context_tree_accepted_tokens,
+            "action_context_tree_acceptance_rate": action_context_tree_accepted_tokens
+            / max(action_context_tree_drafted_tokens, 1),
+            "action_transition_histogram_drafted_tokens": action_transition_histogram_drafted_tokens,
+            "action_transition_histogram_accepted_tokens": action_transition_histogram_accepted_tokens,
+            "action_transition_histogram_acceptance_rate": action_transition_histogram_accepted_tokens
+            / max(action_transition_histogram_drafted_tokens, 1),
+            "action_delta_histogram_drafted_tokens": action_delta_histogram_drafted_tokens,
+            "action_delta_histogram_accepted_tokens": action_delta_histogram_accepted_tokens,
+            "action_delta_histogram_acceptance_rate": action_delta_histogram_accepted_tokens
+            / max(action_delta_histogram_drafted_tokens, 1),
+            "action_delta_ngram_drafted_tokens": action_delta_ngram_drafted_tokens,
+            "action_delta_ngram_accepted_tokens": action_delta_ngram_accepted_tokens,
+            "action_delta_ngram_acceptance_rate": action_delta_ngram_accepted_tokens
+            / max(action_delta_ngram_drafted_tokens, 1),
+            "chunk_position_delta_drafted_tokens": chunk_position_delta_drafted_tokens,
+            "chunk_position_delta_accepted_tokens": chunk_position_delta_accepted_tokens,
+            "chunk_position_delta_acceptance_rate": chunk_position_delta_accepted_tokens
+            / max(chunk_position_delta_drafted_tokens, 1),
+            "chunk_delta_template_drafted_tokens": chunk_delta_template_drafted_tokens,
+            "chunk_delta_template_accepted_tokens": chunk_delta_template_accepted_tokens,
+            "chunk_delta_template_acceptance_rate": chunk_delta_template_accepted_tokens
+            / max(chunk_delta_template_drafted_tokens, 1),
             "drafted_tokens": drafted_tokens,
             "accepted_tokens": accepted_tokens,
             "acceptance_rate": accepted_tokens / max(drafted_tokens, 1),
             "tokens_per_target_forward": len(generated_tokens) / max(target_forwards, 1),
+            **source_cooldown_stats(),
             "debug_events": debug_events,
         }
-        return generated, torch.cat(logits_by_step, dim=1), stats
+        return generated, logits, stats
 
     @torch.no_grad()
     def sample_actions_fast_medusa_speculative(
@@ -1510,8 +5353,7 @@ class PI0FastTokenLogitAdapter:
             nonlocal current_pad_mask, past_key_values, target_forwards, fallback_forwards
             logits_by_step.append(logits_for_token)
             generated_tokens.append(int(next_token.item()))
-            next_token_emb = self.model.paligemma_with_expert.embed_language_tokens(next_token)
-            next_token_emb = next_token_emb * math.sqrt(next_token_emb.shape[-1])
+            next_token_emb = self._embed_decode_language_tokens(next_token)
             next_token_emb = next_token_emb.to(dtype=prefix_embs.dtype)
             current_pad_mask = torch.cat(
                 [current_pad_mask, torch.ones((bsize, 1), dtype=torch.bool, device=device)],
@@ -1536,8 +5378,7 @@ class PI0FastTokenLogitAdapter:
 
         def replay_one(next_token: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             nonlocal current_pad_mask, past_key_values, target_forwards, replay_forwards
-            next_token_emb = self.model.paligemma_with_expert.embed_language_tokens(next_token)
-            next_token_emb = next_token_emb * math.sqrt(next_token_emb.shape[-1])
+            next_token_emb = self._embed_decode_language_tokens(next_token)
             next_token_emb = next_token_emb.to(dtype=prefix_embs.dtype)
             current_pad_mask = torch.cat(
                 [current_pad_mask, torch.ones((bsize, 1), dtype=torch.bool, device=device)],
@@ -1680,8 +5521,7 @@ class PI0FastTokenLogitAdapter:
                 verify_pad_mask = full_pad_masks
             else:
                 verify_past_key_values = clone_kv(past_key_values)
-                draft_embs = self.model.paligemma_with_expert.embed_language_tokens(draft_tensor)
-                draft_embs = draft_embs * math.sqrt(draft_embs.shape[-1])
+                draft_embs = self._embed_decode_language_tokens(draft_tensor)
                 draft_embs = draft_embs.to(dtype=prefix_embs.dtype)
                 verify_pad_mask = torch.cat(
                     [current_pad_mask, torch.ones((bsize, len(draft)), dtype=torch.bool, device=device)],
@@ -1868,8 +5708,7 @@ class PI0FastTokenLogitAdapter:
             nonlocal current_pad_mask, past_key_values, target_forwards, fallback_forwards
             logits_by_step.append(logits_for_token)
             generated_tokens.append(int(next_token.item()))
-            next_token_emb = self.model.paligemma_with_expert.embed_language_tokens(next_token)
-            next_token_emb = next_token_emb * math.sqrt(next_token_emb.shape[-1])
+            next_token_emb = self._embed_decode_language_tokens(next_token)
             next_token_emb = next_token_emb.to(dtype=prefix_embs.dtype)
             current_pad_mask = torch.cat(
                 [current_pad_mask, torch.ones((bsize, 1), dtype=torch.bool, device=device)],
@@ -1943,8 +5782,7 @@ class PI0FastTokenLogitAdapter:
             drafted_tokens += len(draft)
             old_mask_len = current_pad_mask.shape[1]
             verify_past_key_values = clone_kv(past_key_values)
-            draft_embs = self.model.paligemma_with_expert.embed_language_tokens(draft_tensor)
-            draft_embs = draft_embs * math.sqrt(draft_embs.shape[-1])
+            draft_embs = self._embed_decode_language_tokens(draft_tensor)
             draft_embs = draft_embs.to(dtype=prefix_embs.dtype)
             verify_pad_mask = torch.cat(
                 [current_pad_mask, torch.ones((bsize, len(draft)), dtype=torch.bool, device=device)],
@@ -2179,8 +6017,7 @@ class PI0FastTokenLogitAdapter:
             nonlocal current_pad_mask, past_key_values, target_forwards, fallback_forwards
             logits_by_step.append(logits_for_token)
             generated_tokens.append(int(next_token.item()))
-            next_token_emb = self.model.paligemma_with_expert.embed_language_tokens(next_token)
-            next_token_emb = next_token_emb * math.sqrt(next_token_emb.shape[-1])
+            next_token_emb = self._embed_decode_language_tokens(next_token)
             next_token_emb = next_token_emb.to(dtype=prefix_embs.dtype)
             current_pad_mask = torch.cat(
                 [current_pad_mask, torch.ones((bsize, 1), dtype=torch.bool, device=device)],
@@ -2408,8 +6245,7 @@ class PI0FastTokenLogitAdapter:
                     verify_pad_mask = full_pad_masks
                 else:
                     verify_past_key_values = clone_kv(past_key_values)
-                    draft_embs = self.model.paligemma_with_expert.embed_language_tokens(draft_tensor)
-                    draft_embs = draft_embs * math.sqrt(draft_embs.shape[-1])
+                    draft_embs = self._embed_decode_language_tokens(draft_tensor)
                     draft_embs = draft_embs.to(dtype=prefix_embs.dtype)
                     verify_pad_mask = torch.cat(
                         [current_pad_mask, torch.ones((bsize, len(candidate)), dtype=torch.bool, device=device)],
@@ -2767,8 +6603,7 @@ class PI0FastTokenLogitAdapter:
                 verify_pad_mask = full_pad_masks
             else:
                 verify_past_key_values = clone_kv(past_key_values)
-                draft_embs = self.model.paligemma_with_expert.embed_language_tokens(draft_tensor)
-                draft_embs = draft_embs * math.sqrt(draft_embs.shape[-1])
+                draft_embs = self._embed_decode_language_tokens(draft_tensor)
                 draft_embs = draft_embs.to(dtype=prefix_embs.dtype)
                 verify_pad_mask = torch.cat(
                     [current_pad_mask, torch.ones((bsize, len(candidate)), dtype=torch.bool, device=device)],
@@ -3046,25 +6881,32 @@ class PI0FastTokenLogitAdapter:
         use_cache: bool,
         cache_position: torch.Tensor | None = None,
     ) -> tuple[list[torch.Tensor | None], Any]:
-        """Run the prefix-only PaliGemma language model with explicit cache positions.
+        """Run the prefix-only PaliGemma path used by LeRobot's target decoder."""
 
-        LeRobot's ``PI0FastPaliGemma.forward`` does not expose ``cache_position``.
-        Speculative verification depends on batched cache updates after partial
-        acceptance, so we bypass the thin wrapper here and call the underlying
-        PiGemma/Gemma model directly.
-        """
-
-        language_model = self.model.paligemma_with_expert.paligemma.model.language_model
-        output = language_model.forward(
-            inputs_embeds=inputs_embeds,
+        return self.model.paligemma_with_expert.forward(
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
+            inputs_embeds=[inputs_embeds, None],
             use_cache=use_cache,
-            cache_position=cache_position,
-            adarms_cond=None,
+            adarms_cond=[None, None],
         )
-        return [output.last_hidden_state, None], output.past_key_values
+
+    def _scale_decode_token_embeddings(self) -> bool:
+        value = getattr(self, "_scale_decode_token_embeddings_cache", None)
+        if value is None:
+            # LeRobot v0.6 PI0-FAST decodes generated tokens without the Gemma
+            # sqrt(hidden_dim) embedding scale. Keep scaling opt-in for older
+            # experimental configs, but default to matching upstream.
+            value = bool(getattr(getattr(self.policy, "config", None), "scale_decode_token_embeddings", False))
+            self._scale_decode_token_embeddings_cache = value
+        return bool(value)
+
+    def _embed_decode_language_tokens(self, token_ids: torch.Tensor) -> torch.Tensor:
+        token_embs = self.model.paligemma_with_expert.embed_language_tokens(token_ids)
+        if self._scale_decode_token_embeddings():
+            token_embs = token_embs * math.sqrt(token_embs.shape[-1])
+        return token_embs
 
     @staticmethod
     def _select_next_token(logits: torch.Tensor, temperature: float) -> torch.Tensor:

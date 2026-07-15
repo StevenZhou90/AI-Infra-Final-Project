@@ -57,6 +57,407 @@ Selected-slice protocol:
 The best no-task-router configuration is the loose-smooth two-head direct chunk
 decoder: K=3 smooth head, K=2 complex head, and relaxed smooth-phase thresholds.
 
+### PI0-FAST Target-EOS Early Stop
+
+The strongest current PI0-FAST mechanism is action-end early stopping over FAST
+tokens. This compares the fixed-budget PI0-FAST decode against stopping when
+the generated action text reaches `|`; validation showed the decoded continuous
+action chunk is unchanged. It is not yet a passing final result on the strict
+120-row proof gate.
+
+Legacy 90-episode LIBERO target-eos equivalence result:
+
+| Decoder | Success | Avg ms/step | Speedup | Drop |
+| --- | ---: | ---: | ---: | ---: |
+| Fixed-budget PI0-FAST | `81/90` | `634.3` | `1.00x` | - |
+| Target-EOS early stop | `81/90` | `259.5` | `2.44x` | `0.0%` |
+
+Those rows are useful for the zero-drop early-stop claim, but they are not the
+current Hugging Face reproduction.
+
+Current HF v0.6.0 sanity check:
+
+| Path | Task slice | Success | Avg episode time | Notes |
+| --- | --- | ---: | ---: | --- |
+| Official `lerobot-eval`, `.venv-pi06`, `lerobot/pi0fast-libero` | HF task list: object/spatial/goal/10, 1 episode each | `39/40` | `110.0 s/episode` | Fixed 256-token public decode, `97.5%`, no camera `rename_map` |
+| Official `lerobot-eval`, `.venv-pi06`, `lerobot/pi0fast-libero` | `libero_object`, task 0, 1 episode | `1/1` | - | Probe row before the full run |
+
+The v0.6 run uses the current `lerobot/pi0fast-libero` checkpoint with LeRobot
+`0.6.0`, `policy.max_action_tokens=256`, bf16 on CUDA, and the default LIBERO
+camera keys expected by that checkpoint. Per-suite success was object `10/10`,
+spatial `9/10`, goal `10/10`, and `libero_10` `10/10`; the only failed task was
+`libero_spatial_5`. Artifact:
+`outputs/eval/2026-07-14/03-10-08_pi06_pi0fast_libero_full40/eval_info.json`.
+
+Historical v044/v0.4.4 sanity checks:
+
+| Path | Task slice | Success | Avg ms/step | Notes |
+| --- | --- | ---: | ---: | --- |
+| Official `lerobot-eval` + camera `rename_map` | HF task list: object/spatial/goal/10, 1 episode each | `30/40` | `139.8 s/episode` | Fixed 256-token decode, `75.0%` |
+| Official `lerobot-eval` + camera `rename_map` | `libero_object`, task 1, 2 episodes | `2/2` | `88.9 s/episode` | Fixed 256-token decode |
+| Custom runner fixed-budget baseline | `libero_object`, task 1, episode 0 | `1/1` | `602.6` | Same v044 checkpoint |
+| Custom runner `target_eos` | `libero_object`, task 1, episode 0 | `1/1` | `224.1` | `2.69x` vs fixed budget on this episode |
+| Custom runner `target_eos` | `libero_object`, tasks 0-9, episode 0 | `8/10` | `206.1` | One-init-state smoke, not full gate |
+| Custom runner `target_eos` | `libero_spatial`, tasks 0-9, episode 0 | `9/10` | `330.0` | One-init-state smoke |
+| Custom runner `target_eos` | `libero_goal`, tasks 0-9, episode 0 | `7/10` | `282.6` | One-init-state smoke |
+| Custom runner `target_eos` | object + spatial + goal, tasks 0-9, episode 0 | `24/30` | `272.9` | `80.0%` cross-suite smoke |
+| Custom runner `target_eos` | object + spatial + goal, tasks 0-9, episodes 0-3 | `93/120` | `269.2` | `77.5%` v044 extended smoke |
+| Custom runner `target_eos` | `libero_10`, tasks 0-9, episode 0 | `1/10` | `182.5` | Negative check; not the missing high-SR suite |
+| Custom runner `target_eos_validate` | `libero_object`, task 1, episode 0 | `1/1` | `674.5` | 14 exact verifies, max action diff `0.0` |
+| Custom runner `target_eos_validate` | weak `libero_goal` rows, task ids 0/6/9, episode 0 | `0/3` | `674.2` | 90 exact verifies, max action diff `0.0` |
+| Custom runner `target_eos`, absolute control | `libero_goal`, task 0, episode 0 | `0/1` | `222.0` | Negative protocol check |
+| Official `lerobot-eval`, `env.init_states=false`, seed 1000 | `libero_goal`, task 0, episode 0 | `1/1` | `95.7 s/episode` | Random-state diagnostic recovers this weak row |
+| Custom runner `target_eos`, `--no-init-states --seed 1000` | `libero_goal`, task 0, episode 0 | `1/1` | `271.2` | Same row succeeds with action-end stopping |
+| Official `lerobot-eval`, `env.init_states=false`, seed 1000 | `libero_object`, task 0, episode 0 | `1/1` | `91.1 s/episode` | Official fixed-budget row succeeds |
+| Custom runner baseline, `--no-init-states --seed 1000` | `libero_object`, task 0, episode 0 | `0/1` | `559.2` | Sentinel mismatch; custom rollout SR is not the HF-card authority |
+
+The HF model card for `lerobot/pi0fast-libero-v044` reports `82.5%` LIBERO SR.
+The official LeRobot command on this v0.4.4 install, using the carded v044
+checkpoint, the HF task list, `eval.n_episodes=1`, and the camera `rename_map`,
+lands at `30/40 = 75.0%`: object `9/10`, spatial `8/10`, goal `8/10`, and
+`libero_10` `5/10`. The failed task ids are `libero_object_0`,
+`libero_spatial_1`, `libero_spatial_9`, `libero_goal_3`, `libero_goal_9`, and
+`libero_10_{0,2,4,6,9}`. This is below the HF card's `82.5%` table, but it is
+not the old `7/120` failure mode. It was a fixed 256-token decode run, so the
+remaining accuracy gap is not caused by action-end early stopping. Artifact:
+`outputs/eval/2026-07-14/00-35-17_libero_pi0_fast/eval_info.json`.
+
+Follow-up HF/cache check: the v0.6 rerun resolved the apparent high-level
+accuracy gap. The old `7/120` row was not an out-of-the-box HF baseline. It was
+a historical custom strict run on a different stack/protocol. The current
+`lerobot/pi0fast-libero` checkpoint is also not a drop-in replacement for the
+v044 runner: it expects default LIBERO camera keys, while v044 expects
+`base_0_rgb` and `left_wrist_0_rgb` via `rename_map`.
+
+The local 30-row v044 smoke is still within the same broad regime, and the
+extended 120-row custom run lands at `93/120 = 77.5%`: object `38/40`, spatial
+`31/40`, goal `24/40`. Exact validation on representative failed goal rows
+matched the fixed 256-token decode exactly (`max_action_diff=0.0`). The lower
+custom rows should therefore be read as stricter fixed-init-state and
+custom-rollout stress tests, not as the HF card protocol. After adding the
+official camera `rename_map`, global seeding, and config-first policy load to
+the custom runner, one sentinel row still diverges: official `lerobot-eval`
+succeeds on `libero_object` task 0 seed 1000 while the custom baseline loop does
+not. Treat official `lerobot-eval` as the accuracy authority; use the custom
+runner for token-level latency/equivalence experiments until that rollout
+mismatch is fully reconciled.
+
+LeRobot's PI0-FAST action path does not call Hugging Face `generate()` for
+actions. It uses a hand-written loop in `sample_actions_fast` /
+`sample_actions_fast_kv_cache` that iterates to `max_decoding_steps=256` and
+then detokenizes. Action-end stopping is therefore a real latency optimization
+for this policy path, not a generic built-in EOS option that was already active.
+
+Current v0.6 non-quantized serving-component result after fixing the adapter to
+match LeRobot v0.6 token embedding semantics and enabling the constrained
+FAST/text candidate head:
+
+| Path | Chunk mean | Per request | Per action | Notes |
+| --- | ---: | ---: | ---: | --- |
+| Public fixed decode probe | `4557.2 ms` | `4557.2 ms` | `455.7 ms` | LeRobot public path, 256 FAST tokens |
+| Single constrained `action_end` request | `507.7 ms` | `507.7 ms` | `50.8 ms` | Mean `28.0` FAST tokens, actions match public decode |
+| Replicated batch 8 constrained `action_end` | `717.5 ms` | `89.7 ms` | `9.0 ms` | 6.18x throughput speedup; throughput-only, not single isolated-request latency |
+
+This is model-serving time, not full LIBERO rollout wall time. Full simulator
+rollout rows still include OSMesa/LIBERO stepping and image observation
+formatting overhead. The fixed public decode probe and corrected action-end
+probe on the same observation matched exactly (`max_abs_vs_public=0.0`) while
+reducing token generation from 256 tokens to 32 tokens on that row; aggregate
+benchmark artifact:
+`outputs/pi0fast_system_components/pi06_pi0fast_libero_action_end_constrained_task1_steps5.json`.
+
+Follow-up exact single-request probes on the current v0.6 stack:
+
+| Probe | Mean | Result |
+| --- | ---: | --- |
+| OSMesa real LIBERO constrained `action_end`, 3 measured steps | `507.7 ms` | Exact stop-token path, artifact `outputs/pi0fast_system_components/pi06_pi0fast_libero_action_end_constrained_task1_osmesa_steps3_warm1.json` |
+| OSMesa real LIBERO constrained char-stop, 3 measured steps | `513.7 ms` | Local FAST-character early stop did not reduce token count enough; artifact `outputs/pi0fast_system_components/pi06_pi0fast_libero_action_end_charstop_constrained_task1_osmesa_steps3_warm1.json` |
+| Synthetic no-env constrained `action_end`, SDPA | `464.0 ms` | No simulator/preprocess overhead, mean `23` FAST tokens, artifact `outputs/pi0fast_system_components/pi06_pi0fast_synthetic_default_noprofile_cap64_step5.json` |
+| `torch.compile` language-model forward, same real observations | `252.8 ms` | About `2.1x` faster but not exact: `1/3` token-equal, max action diff `0.533`; artifact `outputs/pi0fast_system_components/pi06_pi0fast_libero_compile_compare_task1_osmesa_steps3.json` |
+| `torch.compile` with margin recording, same real observations | `276.5 ms` | Not safely gateable by top-2 margin: `3/8` token-equal, max action diff `0.937`; artifact `outputs/pi0fast_system_components/pi06_pi0fast_libero_compile_compare_margin_task1_osmesa_steps8.json` |
+| Approx FAST-char early stop sweep, same real observations | best `169.7 ms` | Target 4 decoded FAST chars emits mean `7` tokens but has large action error, mean max diff `1.08`; artifact `outputs/pi0fast_system_components/pi06_pi0fast_libero_early_stop_target_chars_task1_osmesa_steps3.json` |
+| Approx FAST-char early stop + prefixed action-token prefill, same real observations | best `119.7 ms` | Target 4 decoded FAST chars emits mean `7` tokens but has large action error, mean max diff `1.08`; full-target prefill is still not exact, mean max diff `0.278`; artifact `outputs/pi0fast_system_components/pi06_pi0fast_libero_early_stop_prefill_prefix_target_chars_task1_osmesa_steps3.json` |
+| Profiled OSMesa real LIBERO constrained `action_end`, 3 measured steps | `518.4 ms` | Decode LM forwards dominate: `352-479 ms` across `22-30` decode forwards, about `16 ms/token`; prefix embed+prefill is about `62 ms`; constrained head is only `2-3 ms`; artifact `outputs/pi0fast_system_components/pi06_pi0fast_libero_profile_exact_task1_osmesa_steps3.json` |
+| Stock Pi0.5 public path, `10` flow steps, same A100, warmed compiler cache | `84.6 ms` inference | Meets a model-only `100 ms` single-request target; preprocessing adds `25.9 ms`, so preprocess+inference+postprocess is about `110.6 ms`; artifact `outputs/pi0fast_system_components/pi05_libero_public_steps10_1_task1_osmesa_steps5_warm3.json` |
+| Stock Pi0.5 public path + fast LIBERO image preprocessing, `10` flow steps | `86.4 ms` full request | Preprocess `1.9 ms`, inference `84.3 ms`, postprocess `0.2 ms`; full-request p95 `86.7 ms`; artifact `outputs/pi0fast_system_components/pi05_libero_public_steps10_fastpreprocess_fullrequest_task1_osmesa_steps10_warm8.json` |
+
+The current non-quantized exact single-request path therefore does not meet a
+100 ms isolated-request target. Public and local evidence point to model/runtime
+changes for that target: flow-action distillation such as SnapFlow for PI0.5,
+approximate FAST/DCT early decoding with a new success-rate validation, or a
+custom FP8/CUDA-graph runtime rather than stock PyTorch exact decoding.
+The prefixed action-token prefill experiment is kept opt-in because it changes
+the generated action even when the decoded FAST-character target is long enough
+to emit the full action.
+FlashRT's public Pi0-FAST docs report the same shape of bottleneck:
+autoregressive latency is `prefill + N * per_token_decode`, with about
+`480 ms` for 50 tokens by default and about `447 ms` with decode CUDA Graph.
+That is faster than this stock PyTorch path but still not a 100 ms exact
+Pi0-FAST route. The local sub-100 full-request result is the stock Pi0.5
+flow path with GPU-side LIBERO image preprocessing above, not the
+autoregressive FAST-token path.
+
+Historical strict 120-row artifact from an older custom
+`lerobot/pi0fast-libero` stack/protocol. The 120 rows are `libero_object`,
+`libero_spatial`, and `libero_goal`, 10 task ids each, 4 episode/init-state ids
+each:
+
+| Decoder | Success | Avg ms/step | Speedup | Drop |
+| --- | ---: | ---: | ---: | ---: |
+| Fixed-budget PI0-FAST | `7/120` | `607.9` | `1.00x` | - |
+| Target-EOS early stop | `7/120` | `339.8` | `1.789x` | `0.0%` |
+
+That strict row should not be read as an HF v044 accuracy baseline. It used a
+different checkpoint and is only useful as a historical latency/equivalence
+artifact. For v044 accuracy reproduction, use `lerobot/pi0fast-libero-v044` and
+map the default LIBERO camera keys to the v044 policy keys when running the
+official LeRobot CLI:
+
+```bash
+MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa .venv-pi/bin/lerobot-eval \
+  --policy.path=lerobot/pi0fast-libero-v044 \
+  --env.type=libero \
+  --env.task=libero_object \
+  --env.task_ids='[1]' \
+  --env.init_states=true \
+  --eval.batch_size=1 \
+  --eval.n_episodes=2 \
+  --policy.device=cuda \
+  --policy.dtype=bfloat16 \
+  --policy.gradient_checkpointing=false \
+  --rename_map='{"observation.images.image":"observation.images.base_0_rgb","observation.images.image2":"observation.images.left_wrist_0_rgb"}'
+```
+
+On this LeRobot v0.4.4 install, omitting the `rename_map` fails before rollout
+because the v044 checkpoint expects `base_0_rgb` and `left_wrist_0_rgb`, while
+the default LIBERO env exposes `image` and `image2`.
+
+For the random-state diagnostic protocol, use `--env.init_states=false` in
+`lerobot-eval`, or `--no-init-states` in `scripts/run_pi0fast_chunk_eval.py`.
+
+For the stricter 120 matched-eval gate, use
+`scripts/run_robotics_spec_120_proof.py` to launch the canonical proof wrapper,
+or call `scripts/run_pi0fast_100_eval_gate.py` /
+`scripts/gate_pi0fast_target_eos.py` directly with the protocol in
+`docs/pi0fast_target_eos.md`.
+
+There is also a CPU-only synthetic check for the underlying draft-verify idea
+in `docs/robotics_spec_decode_synthetic.md`; it is useful for CI but does not
+replace the real LIBERO gate. Use `scripts/audit_robotics_spec_goal.py` to
+check both artifacts before making the final claim.
+
+For a no-checkpoint speculative candidate on the real PI0-FAST model, evaluate
+`pattern_sd_direct` with `target_eos` included as the early-stop reference. This
+candidate drafts from narrow robot action-token regularities and still verifies
+tokens with PI0-FAST before emission. Use
+`scripts/sweep_pi0fast_pattern_offline.py` or
+`scripts/eval_pi0fast_pattern_offline.py` on saved FAST-token traces to screen
+pattern settings before launching the simulator gate. Pass the selected sweep
+JSON via `scripts/run_pi0fast_100_eval_gate.py --pattern-sweep-json` so the
+manifest records the chosen row; `scripts/pattern_sweep_to_eval_args.py` is
+available for manual shell-arg extraction. The pattern sweep includes exact
+full-block KV reuse, bonus-token emission, dynamic lookahead, and guarded
+second-order action-token extrapolation options so the real run can evaluate
+recent speculative-decoding ideas without changing target-token outputs. It can
+also test a previous-chunk position prior, which drafts token `i` from token `i`
+of recent verified chunks in the same episode and still requires PI0-FAST to
+verify every emitted token. `--position-mode-histogram` adds a related
+per-position modal-token prior over recent verified chunks that share the current
+prefix; it is still exact because the target model verifies each emitted token.
+`--global-position-mode` is a more aggressive variant for the smaller robotics
+output distribution: it proposes modal tokens at the same absolute FAST position
+from bounded recent history even when the current prefix differs, and still relies
+on exact target verification before emission.
+It can also test prompt-lookup n-gram continuation with `--ngram-continuation`,
+which drafts from suffix matches in already verified FAST tokens and recent
+verified chunks. It can test an
+action-transition-histogram prior with `--action-transition-histogram`, which
+learns same-dimension token transitions from verified prefixes and recent
+chunks. It can also test an action-delta-histogram prior with
+`--action-delta-histogram`, which proposes tokens from frequent recent
+per-action-dimension FAST-token deltas in the current prefix and recent
+verified chunks. `--chunk-position-delta` tests a per-absolute-position delta
+mode over recent verified chunks; the high-level candidate pipeline sweeps
+`--action-delta-min-counts 1,2` and
+`--chunk-position-delta-min-counts 1,2` so repeated deltas can be preferred over
+single recent observations. `--action-trend-regression` fits a short regression line over
+the verified tokens for the current action dimension and drafts the projected
+next token; PI0-FAST still verifies it before emission.
+`--action-prefix-lookup` drafts later dimensions of the current action vector
+from prior verified actions that share the already-emitted intra-action prefix,
+which exploits low-entropy robot action structure without changing exact
+verification.
+`--action-vector-suffix-lookup` is a stricter full-vector variant: once some
+dimensions of the current action are verified, it proposes the remaining suffix
+from prior full action vectors with the same prefix, and PI0-FAST still verifies
+every token.
+`--chunk-length-stop` drafts the FAST stop token when recent verified chunks
+ended at the same token length, which targets the final `target_eos` verifier
+step without changing exactness.
+`--action-token-neighborhood` adds a
+small numeric neighborhood around smooth extrapolations, recent verified chunk
+positions, and other enabled robot-prior centers; this is intended for exact
+tree verification, where `x`, `x-1`, and `x+1` style candidates can be checked
+in one target pass.
+`--action-context-tree` adds a
+same-action-dimension context-tree histogram: it learns short verified
+same-dimension token histories and backs off by depth before the target model
+verifies the proposed continuation. `--action-dimension-mode` drafts the
+most common verified token for the current action dimension from the prefix and
+recent chunks, which targets held joints and gripper states without using an
+unverified model. `--hold-action-token` is the lower-latency version of that
+idea: it drafts the previous token from the same action dimension and lets the
+target model verify it. It can also test source-agreement
+drafting with `--min-source-agreements 1,2`, where threshold `2` prefers a token
+only when at least two configured cheap priors propose it. `--source-cooldown`
+screens an acceptance-aware source scheduler: after a source's verified token is
+rejected, the drafter temporarily skips that source and falls back to the next
+configured cheap prior. This is still exact because the target model verifies
+all emitted tokens.
+Offline scoring resets history on `(task, task_id, seed)` changes when trace
+shards include suite/task names, falling back to `(task_id, seed)` for older
+shards. Use the per-task sweep thresholds when
+passing a sweep JSON to avoid choosing a setting that only wins on aggregate
+trace statistics; use heldout sweep thresholds when the sweep was run with
+`--heldout-split task` for the canonical proof path. `task_seed` is still useful
+for episode-style previous-chunk experiments, but it can leave the same task in
+both ranking and heldout groups when several seeds are present. Sweep JSON now
+records rank/heldout task-key overlap so proof wrappers can require task-disjoint
+heldout evidence. Automatic grouped splits use
+`--heldout-val-fraction` as a fraction of task, seed, or task/seed groups.
+For source-specific priors, add `--pattern-min-metric NAME=VALUE` and
+`--pattern-min-heldout-metric NAME=VALUE`, for example
+`ngram_continuation_accepted_tokens=1`,
+`action_context_tree_accepted_tokens=1`,
+`action_transition_histogram_accepted_tokens=1`,
+`action_delta_histogram_accepted_tokens=1`,
+`chunk_position_delta_accepted_tokens=1`,
+`action_prefix_lookup_accepted_tokens=1`,
+`action_vector_suffix_lookup_accepted_tokens=1`,
+`action_vector_transition_accepted_tokens=1`,
+`action_repeat_vector_accepted_tokens=1`,
+`chunk_length_stop_accepted_tokens=1`,
+`action_token_neighborhood_accepted_tokens=1`,
+`position_mode_histogram_accepted_tokens=1`,
+`global_position_mode_accepted_tokens=1`,
+`action_dimension_mode_accepted_tokens=1`,
+`hold_action_token_accepted_tokens=1`, or
+`source_agreement_accepted_tokens=1`, so the selected row must show accepted
+tokens from the enabled prior before the real simulator gate starts. Prefer
+`min_task_*` source metrics, such as
+`min_task_ngram_continuation_accepted_tokens=1`,
+`min_task_action_context_tree_accepted_tokens=1`,
+`min_task_action_transition_histogram_accepted_tokens=1`,
+`min_task_action_delta_histogram_accepted_tokens=1`,
+`min_task_chunk_position_delta_accepted_tokens=1`,
+`min_task_action_prefix_lookup_accepted_tokens=1`,
+`min_task_action_vector_suffix_lookup_accepted_tokens=1`,
+`min_task_action_vector_transition_accepted_tokens=1`,
+`min_task_action_repeat_vector_accepted_tokens=1`,
+`min_task_chunk_length_stop_accepted_tokens=1`,
+`min_task_action_token_neighborhood_accepted_tokens=1`,
+`min_task_position_mode_histogram_accepted_tokens=1`,
+`min_task_global_position_mode_accepted_tokens=1`,
+`min_task_action_dimension_mode_accepted_tokens=1`,
+`min_task_hold_action_token_accepted_tokens=1`, or
+`min_task_source_agreement_accepted_tokens=1`, when the prior should work on
+every task in the offline split.
+With `--pattern-sweep-json`, `--pattern-auto-source-min-metrics` derives these
+accepted-token checks from the selected row's enabled optional sources and also
+requires matching heldout metrics when the row contains heldout data. Target
+anchored tree modes are held to the same standard with
+`tree_anchor_accepted_tokens=1` and
+`min_task_tree_anchor_accepted_tokens=1`. The candidate pipeline passes this
+gate-runner flag by default.
+When `--run-final-audit` is enabled, the 120-eval wrapper also passes
+`run_manifest.json` to the final audit. For sweep-selected pattern candidates
+the audit requires positive
+`pattern_sweep_selection.required_source_counts` for every required source, so
+capped sweeps cannot become final evidence if they skipped an enabled source
+family.
+The sweep grid is conditional: when an optional source is disabled, its
+history/top-k/context knobs are collapsed to the first provided value instead
+of creating duplicate equivalent rows. This keeps heldout ranking from being
+biased by repeated disabled-source configs and makes the default pipeline sweep
+more practical.
+Use `--source-priority-modes default,lookup_first,smooth_first` to let heldout
+sweeps choose whether prompt-lookup/previous-chunk priors or smooth action-token
+extrapolation should propose first; the selected row is replayed online via
+`--pattern-source-priority`.
+
+To collect fresh early-stop traces and stage the candidate gate in one command,
+use `scripts/run_pi0fast_pattern_candidate_pipeline.py`. It writes lightweight
+`target_eos` token trace shards, sweeps exact pattern settings with a heldout
+split, and invokes the 120-task wrapper with `--reference-mode target_eos` by
+default in gate dry-run mode. Trace shards record the resolved FAST action-end
+token, and offline sweeps infer it unless `--stop-token-ids` is supplied, so
+stop-aware priors are ranked against the same early-stop token used online.
+PI0.5 is not supported by this token-trace pipeline until a PI0.5-specific
+token/stop adapter exists.
+The pipeline also bounds the default offline search with
+`--max-enabled-sources 4` and `--max-sweep-configs 4096`. The sweep prunes
+over-budget source combinations before evaluation and varies source settings
+fastest, so the cap covers many robot-prior ideas before deeper runtime variants.
+Sweep JSON records `evaluated_source_counts`, `evaluated_source_coverage`, and
+`evaluated_enabled_source_count_histogram`; inspect those fields before
+promoting a capped sweep row so the selected run did not accidentally skip an
+intended source family.
+The pipeline defaults `--pattern-required-source-coverage auto`, deriving the
+required families from enabled sweep modes and forwarding them to the gate
+runner. A capped sweep that never evaluated an enabled source family is rejected
+before the 120-task simulator run is staged.
+It also derives the pattern sweep train and heldout task-count gates from the
+planned suite/task-id coverage unless explicit `--pattern-min-task-count` or
+`--pattern-min-heldout-task-count` overrides are provided.
+Pattern proof runs additionally require the sweep heldout split to cover every
+requested suite, using `selection.heldout_suite_keys` in the sweep JSON and
+saved run manifest.
+The candidate gate defaults `--pattern-sweep-rank` to `0`, which auto-selects
+the first ranked sweep row that passes those train, heldout, and source-usage
+thresholds and records the actual selected rank in the manifest.
+
+For speculative PI0-FAST candidates, the wrapper defaults reference thresholds
+to the main gate thresholds, so a candidate must also meet the speedup,
+success-drop, and regression requirements versus `target_eos` early stop.
+
+The offline sweep also has an explicit `--tree-widths` knob for testing
+tree-style candidate verification inspired by newer traversal/tree
+speculative-decoding work. The candidate pipeline's default sweep is compact
+but includes `--tree-widths 1,4`, `--dynamic-tree-width both`, and
+`--tree-anchor-target-token both` plus
+`--tree-anchor-target-continuation both`; pass `--tree-widths 1` when selecting
+args for the lowest-risk chain verifier only. Rows with `tree_width > 1` now
+convert to `--pattern-tree-width` and use the online exact tree verifier, which
+batches several robot-prior candidates in one target pass and commits only the
+target-matching selected prefix. The continuation anchor always starts from the
+already-produced target greedy token and verifies only drafted futures after it.
+Treat this as experimental until the full 120-task gate validates it. The
+default sweep also includes
+`--action-trend-regression both`, `--action-delta-ngram both`,
+`--action-delta-min-counts 1,2`, and `--chunk-delta-template both` to test
+velocity-space prompt lookup over recent verified robot chunks, and
+`--chunk-prefix-retrieval both` for near-repeated verified chunks with small
+bounded prefix mismatches, and `--source-acceptance-bias both` to reorder cheap
+sources using recent verifier acceptance within the current decode.
+`--dynamic-tree-width both` adapts the number of
+verified tree candidates from recent target acceptance, following the lossless
+dynamic-draft-tree idea in EAGLE-2 but using observed verifier acceptance
+instead of learned confidence. Add
+`--action-token-neighborhood both` with `--tree-widths` greater than 1 to screen
+nearby quantized FAST-token candidates around smooth, recent-chunk, and
+enabled-prior centers. When a tree
+width greater than 1 is selected or
+passed manually, the wrapper auto-adds gate checks that require the selected
+tree width, nonzero tree verification, and zero unverified pattern-token
+shortcuts in candidate `trace_stats`.
+
+PI0.5 is currently supported in this repo as a flow-action rollout/serving
+baseline, not through the PI0-FAST FAST-token speculative modes. The
+`target_eos`, `target_cutoff`, and `pattern_sd` paths require PI0-FAST token
+decode hooks and now fail early when launched with `--policy-kind pi05`. A
+PI0.5 speculative result should only be compared against a PI0.5 stop-token
+reference after a PI0.5-specific token/stop adapter has been added.
+
 ### Multi-GPU Serving Validation
 
 Local hardware check:
@@ -143,6 +544,37 @@ and speculative inference is slightly faster per control step, but the current
 R2 trajectory head is not quality-preserving on this smoke. Use the serving
 router/load-test numbers for the multi-GPU platform claim, and use this smoke as
 evidence that the real LIBERO runner is operational with honest gating.
+
+For any renewed OpenVLA/SpecVLA attempt, gate final artifacts with
+`scripts/gate_openvla_specvla.py`. It pairs AR and speculative rows by suite,
+task, trial, and seed, then requires the same strict result shape as the PI0
+gate: 120 matched evals, at least `2.0x` speedup, zero success drop, and zero
+baseline-success regressions. `scripts/audit_robotics_spec_goal.py` accepts that
+gate through `--openvla-gate`, so either a PI0-FAST gate or an OpenVLA gate can
+satisfy the real-robotics half of the objective.
+
+The OpenVLA 120-task wrapper enables matched-step and strict `spec_stats` checks
+by default. A final claim cannot rely on different control-step counts,
+`fast_draft_only`, chunk-buffer hits, relaxed fast-draft acceptances, or
+approximate tree depth greater than 1.
+`--allow-unverified-spec-shortcuts` is research-only and the wrapper requires
+`--skip-audit --skip-result-card` when it is used, so relaxed artifacts cannot
+be promoted into final objective evidence by accident.
+The final objective audit also requires those strict OpenVLA thresholds and
+zero shortcut counters by default when `--openvla-gate` is supplied.
+
+To launch or gate the OpenVLA path with the same artifact layout, use:
+
+```bash
+python scripts/run_openvla_120_eval_gate.py \
+  --config configs/libero_specvla_distributed.yaml \
+  --run-id openvla_specvla_120 \
+  --mode full \
+  --min-pairs 120 \
+  --min-speedup 2.0 \
+  --max-success-drop 0.0 \
+  --max-baseline-success-regressions 0
+```
 
 ## Quick Start
 
@@ -285,12 +717,13 @@ python -m venv --system-site-packages .venv-pi
 .venv-pi/bin/python -m pip install -e . --no-deps
 .venv-pi/bin/python -m pip install "lerobot[pi] @ git+https://github.com/huggingface/lerobot.git@v0.4.4"
 .venv-pi/bin/python -m pip install hf-libero==0.1.3 --no-deps
-.venv-pi/bin/python -m pip install hydra-core robomimic==0.2.0 robosuite==1.4.0 bddl==1.0.1 easydict thop mujoco tensorboardX imageio-ffmpeg egl_probe numba jupytext pytest
+sudo apt-get install -y libosmesa6 libegl1 libgl1-mesa-dri libglx-mesa0
+.venv-pi/bin/python -m pip install hydra-core robomimic==0.2.0 robosuite==1.4.0 bddl==1.0.1 easydict thop mujoco==2.3.7 "networkx>=3.2,<4" tensorboardX imageio-ffmpeg egl_probe numba jupytext pytest
 .venv-pi/bin/python -m pip install "numpy<2" "opencv-python<4.12" "opencv-python-headless<4.12" "matplotlib>=3.5.3" hf-egl-probe
 
-CUDA_VISIBLE_DEVICES=0 HF_HOME=.hf_cache MPLCONFIGDIR=/tmp/matplotlib-cache MUJOCO_GL=egl \
+CUDA_VISIBLE_DEVICES=0 HF_HOME=.hf_cache MPLCONFIGDIR=/tmp/matplotlib-cache MUJOCO_GL=osmesa \
 .venv-pi/bin/python scripts/run_pi0fast_chunk_eval.py \
-  --policy lerobot/pi0fast-libero \
+  --policy lerobot/pi0fast-libero-v044 \
   --task libero_object \
   --task-id 0 \
   --episodes 3 \
@@ -356,6 +789,9 @@ Suite orchestration:
 - `scripts/run_published_sweep.py`: published-evaluation-style sweeps.
 - `scripts/run_libero_specvla_mirror.py`: SpecVLA-style LIBERO benchmark.
 - `scripts/run_libero_specvla_distributed.py`: multi-GPU LIBERO runner.
+- `scripts/gate_openvla_specvla.py`: strict matched AR-vs-SpecVLA gate.
+- `scripts/run_robotics_spec_120_proof.py`: canonical PI0/PI0.5/OpenVLA 120-task proof launcher.
+- `scripts/run_openvla_120_eval_gate.py`: OpenVLA run/gate/audit wrapper.
 - `scripts/run_pi0fast_chunk_eval.py`: pi0-FAST LIBERO chunk experiments.
 - `scripts/benchmark_pi0fast_serving_runtime.py`: pi0-FAST runtime benchmark.
 - `scripts/load_pi05_grpc.py`: gRPC service load test.
