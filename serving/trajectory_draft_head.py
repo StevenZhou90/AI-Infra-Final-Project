@@ -23,6 +23,9 @@ class TrajectoryHeadConfig:
     use_prefill_hidden: bool = False
     llm_hidden_size: int = 4096
     hidden_fusion_dim: int = 256
+    # When True, predict chunk steps sequentially, conditioning each future
+    # action on the previous predicted action rather than independent heads.
+    dependent_horizon: bool = False
 
 
 class TinyTrajectoryHead(nn.Module):
@@ -48,21 +51,42 @@ class TinyTrajectoryHead(nn.Module):
             self.hidden_proj = None
             in_dim = hist_flat
 
-        layers: list[nn.Module] = []
-        dim = in_dim
-        for _ in range(c.num_layers):
-            layers.extend(
-                [
-                    nn.Linear(dim, c.hidden_dim),
-                    nn.GELU(),
-                    nn.Dropout(c.dropout),
-                ]
-            )
-            dim = c.hidden_dim
-        layers.append(nn.Linear(dim, c.action_horizon * c.action_dim * c.n_bins))
-        self.net = nn.Sequential(*layers)
+        if c.dependent_horizon:
+            context_layers: list[nn.Module] = []
+            dim = in_dim
+            for _ in range(c.num_layers):
+                context_layers.extend([nn.Linear(dim, c.hidden_dim), nn.GELU(), nn.Dropout(c.dropout)])
+                dim = c.hidden_dim
+            self.context_net: nn.Module | None = nn.Sequential(*context_layers)
+            self.prev_proj: nn.Linear | None = nn.Linear(c.action_dim * c.embed_dim, c.hidden_dim)
+            self.step_cell: nn.GRUCell | None = nn.GRUCell(c.hidden_dim, c.hidden_dim)
+            self.step_out: nn.Linear | None = nn.Linear(c.hidden_dim, c.action_dim * c.n_bins)
+            self.net: nn.Module | None = None
+        else:
+            layers: list[nn.Module] = []
+            dim = in_dim
+            for _ in range(c.num_layers):
+                layers.extend(
+                    [
+                        nn.Linear(dim, c.hidden_dim),
+                        nn.GELU(),
+                        nn.Dropout(c.dropout),
+                    ]
+                )
+                dim = c.hidden_dim
+            layers.append(nn.Linear(dim, c.action_horizon * c.action_dim * c.n_bins))
+            self.net = nn.Sequential(*layers)
+            self.context_net = None
+            self.prev_proj = None
+            self.step_cell = None
+            self.step_out = None
 
-    def forward(self, history_bins: torch.Tensor, prefill_hidden: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        history_bins: torch.Tensor,
+        prefill_hidden: torch.Tensor | None = None,
+        target_bins: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Return action-bin logits.
 
         For legacy one-step heads, returns ``[batch, action_dim, n_bins]``.
@@ -93,6 +117,32 @@ class TinyTrajectoryHead(nn.Module):
                     ph = ph.unsqueeze(0)
                 fused = self.hidden_proj(ph.float()).to(dtype=emb.dtype)
             emb = torch.cat([emb, fused], dim=-1)
+        if c.dependent_horizon:
+            assert self.context_net is not None
+            assert self.prev_proj is not None
+            assert self.step_cell is not None
+            assert self.step_out is not None
+            context = self.context_net(emb)
+            state = context
+            prev_bins = history_bins[:, -1, :]
+            if target_bins is not None and target_bins.dim() == 2:
+                target_bins = target_bins.unsqueeze(1)
+            outputs = []
+            for step_idx in range(c.action_horizon):
+                prev_emb = self.embed(prev_bins.clamp(0, c.n_bins - 1).long()).flatten(start_dim=1)
+                state = self.step_cell(self.prev_proj(prev_emb), state)
+                step_logits = self.step_out(state).view(-1, c.action_dim, c.n_bins)
+                outputs.append(step_logits)
+                if self.training and target_bins is not None and step_idx < target_bins.shape[1]:
+                    prev_bins = target_bins[:, step_idx, :]
+                else:
+                    prev_bins = step_logits.argmax(dim=-1).detach()
+            logits = torch.stack(outputs, dim=1)
+            if c.action_horizon == 1:
+                return logits[:, 0]
+            return logits
+
+        assert self.net is not None
         logits = self.net(emb)
         logits = logits.view(-1, c.action_horizon, c.action_dim, c.n_bins)
         if c.action_horizon == 1:
